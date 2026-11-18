@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
 import { Store } from "../store/store.ts";
+import { migrations } from "../store/migrations.ts";
 import { routeCandidates, type Batch } from "../router/router.ts";
 import { FakeRunner } from "../worker/fake-runner.ts";
 import type { Workers } from "../worker/workers.ts";
@@ -398,8 +399,8 @@ test("first enable posts a distinct notice after an opened reply was sent before
 test("merge-enabled migration refreshes previously tracked, delivered opened replies", async () => {
   const dir = mkdtempSync(join(tmpdir(), "ostrom-merge-upgrade-"));
   const path = join(dir, "store.db");
-  // Populate the pre-enable tracking state through public methods, then reopen at migration 26
-  // so the real migration, rather than a hand-written equivalent, upgrades those durable rows.
+  // Populate the pre-enable tracking state through public methods, then apply migration 27's
+  // real SQL. Keep schema versions intact so later migrations are not replayed on existing tables.
   let now = new Date("2026-11-10T12:00:00.000Z");
   let store = Store.open(path, { now: () => now });
   const source = store.ensureSource("github", "o/r");
@@ -416,7 +417,7 @@ test("merge-enabled migration refreshes previously tracked, delivered opened rep
   assert.notEqual(store.readyReplySentAt(assignment), null);
   store.close();
   const upgrade = new DatabaseSync(path);
-  upgrade.prepare("DELETE FROM schema_version WHERE version >= 27").run();
+  upgrade.exec(migrations[26]!);
   upgrade.close();
   store = Store.open(path, { now: () => now });
   try {
