@@ -2,7 +2,7 @@ import { strict as assert } from "node:assert";
 import { test } from "node:test";
 import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 import type { Codex, ThreadEvent } from "@openai/codex-sdk";
-import { claudeRunner, codexRunner, codexWorkerConfigOverrides } from "./runner.ts";
+import { claudeRunner, codexRunner, codexWorkerConfigOverrides, TurnError } from "./runner.ts";
 import { sessionConfig } from "./config.ts";
 
 test("Claude resumes the same session with the explicit model", async () => {
@@ -18,6 +18,53 @@ test("Claude resumes the same session with the explicit model", async () => {
   await session.send("again");
   assert.deepEqual(ids, ["session"]);
   assert.deepEqual(calls, [{ model: "haiku", permissionMode: "bypassPermissions", allowDangerouslySkipPermissions: true }, { model: "haiku", resume: "session", permissionMode: "bypassPermissions", allowDangerouslySkipPermissions: true }]);
+});
+
+test("Claude changes effort on the same session and rejects unsupported efforts", async () => {
+  const calls: unknown[] = [];
+  const run = async function* (input: Parameters<typeof import("@anthropic-ai/claude-agent-sdk").query>[0]): AsyncGenerator<SDKMessage> {
+    calls.push({ effort: input.options?.effort, resume: input.options?.resume });
+    yield { type: "system", subtype: "init", session_id: "session", model: "gateway-haiku" } as SDKMessage;
+    yield { type: "result", subtype: "success", session_id: "session", result: "ok", is_error: false, modelUsage: {}, usage: { input_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, output_tokens: 0 } } as unknown as SDKMessage;
+  };
+  const session = claudeRunner({}, run).start({ cwd: "/tmp", model: "haiku" });
+  assert.equal((await session.send("first", undefined, "low")).model, "gateway-haiku");
+  await session.send("second", undefined, "max");
+  for (const effort of ["minimal", "xhigh"] as const) await assert.rejects(session.send("invalid", undefined, effort), /Claude does not support/);
+  await session.send("third", undefined, "medium");
+  assert.deepEqual(calls, [
+    { effort: "low", resume: undefined }, { effort: "max", resume: "session" }, { effort: "medium", resume: "session" },
+  ]);
+});
+
+test("Claude retains its observed model when a turn fails", async () => {
+  const run = async function* (): AsyncGenerator<SDKMessage> {
+    yield { type: "system", subtype: "init", session_id: "session", model: "gateway-haiku" } as SDKMessage;
+    throw new Error("provider failed");
+  };
+  await assert.rejects(claudeRunner({}, run).start({ cwd: "/tmp", model: "haiku" }).send("work"), (error: unknown) => {
+    assert.ok(error instanceof TurnError);
+    assert.equal(error.message, "provider failed");
+    assert.equal(error.model, "gateway-haiku");
+    return true;
+  });
+});
+
+test("Codex changes thread effort by resuming the same native session", async () => {
+  const calls: unknown[] = [];
+  const thread = { runStreamed: async () => ({ events: (async function* (): AsyncGenerator<ThreadEvent> {
+    yield { type: "thread.started", thread_id: "same-id" };
+    yield { type: "turn.completed", usage: { input_tokens: 0, cached_input_tokens: 0, cache_write_input_tokens: 0, output_tokens: 0, reasoning_output_tokens: 0 } };
+  })() }) };
+  const client = {
+    startThread: (options: unknown) => { calls.push({ start: options }); return thread; },
+    resumeThread: (id: string, options: unknown) => { calls.push({ id, resume: options }); return thread; },
+  } as unknown as Pick<Codex, "startThread" | "resumeThread">;
+  const session = codexRunner({}, () => client).start({ cwd: "/tmp", model: "luna" });
+  await session.send("first", undefined, "low");
+  await session.send("second", undefined, "xhigh");
+  const base = { workingDirectory: "/tmp", model: "luna", sandboxMode: "workspace-write", networkAccessEnabled: true, approvalPolicy: "never" };
+  assert.deepEqual(calls, [{ start: { ...base, modelReasoningEffort: "low" } }, { id: "same-id", resume: { ...base, modelReasoningEffort: "xhigh" } }]);
 });
 
 test("Codex worker profile explicitly grants only commit metadata paths", () => {

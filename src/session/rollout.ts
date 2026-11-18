@@ -13,6 +13,10 @@ export const codexSessionsDir = (): string => join(homedir(), ".codex", "session
  * names no model: an unreadable record is unverified, never assumed correct.
  */
 export function rolloutModel(root: string, threadId: string): string {
+  return rolloutTurn(root, threadId).model;
+}
+
+export function rolloutTurn(root: string, threadId: string): { model: string; effort: string | null } {
   const path = findRollout(root, threadId);
   const fd = openSync(path, "r");
   let text: string;
@@ -25,10 +29,16 @@ export function rolloutModel(root: string, threadId: string): string {
   } finally {
     closeSync(fd);
   }
-  let model: string | undefined;
-  for (const match of text.matchAll(/"type":"turn_context","payload":\{[^]*?"model":"([^"]+)"/g)) model = match[1];
-  if (model === undefined) throw new Error(`rollout ${path} records no turn model`);
-  return model;
+  let context: { model?: unknown; effort?: unknown } | undefined;
+  for (const line of text.split("\n")) {
+    // The bounded tail may begin inside a record. Only complete JSONL records are candidates.
+    if (!line.startsWith("{")) continue;
+    let record: { type?: string; payload?: typeof context };
+    try { record = JSON.parse(line) as typeof record; } catch { continue; }
+    if (record.type === "turn_context") context = record.payload;
+  }
+  if (typeof context?.model !== "string" || context.model === "") throw new Error(`rollout ${path} records no turn model`);
+  return { model: context.model, effort: typeof context.effort === "string" ? context.effort : null };
 }
 
 function findRollout(root: string, threadId: string): string {

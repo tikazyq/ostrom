@@ -7,8 +7,8 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { promisify } from "node:util";
 import { test } from "node:test";
-import type { SDKResultSuccess, SDKSystemMessage } from "@anthropic-ai/claude-agent-sdk";
-import type { AgentMessageItem, ItemCompletedEvent, ThreadStartedEvent, TurnCompletedEvent } from "@openai/codex-sdk";
+import type { Options, SDKResultSuccess, SDKSystemMessage } from "@anthropic-ai/claude-agent-sdk";
+import type { AgentMessageItem, ItemCompletedEvent, ThreadOptions, ThreadStartedEvent, TurnCompletedEvent } from "@openai/codex-sdk";
 
 // The fixture projections are the fields the runner reads. Referencing SDK types
 // here makes removal or type changes in those fields a compile-time failure.
@@ -37,6 +37,19 @@ test("pinned Codex CLI recognizes App shell controls as booleans", async () => {
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
+test("pinned SDKs expose the per-turn effort option shapes", () => {
+  const claude: Pick<Options, "effort">[] = [
+    { effort: "low" }, { effort: "medium" }, { effort: "high" }, { effort: "max" },
+  ];
+  const codex: ThreadOptions[] = [
+    { modelReasoningEffort: "minimal" }, { modelReasoningEffort: "low" },
+    { modelReasoningEffort: "medium" }, { modelReasoningEffort: "high" },
+    { modelReasoningEffort: "xhigh" }, { modelReasoningEffort: "max" },
+  ];
+  assert.deepEqual(claude.map((options) => options.effort), ["low", "medium", "high", "max"]);
+  assert.deepEqual(codex.map((options) => options.modelReasoningEffort), ["minimal", "low", "medium", "high", "xhigh", "max"]);
+});
+
 function fixture(name: string): unknown {
   return JSON.parse(readFileSync(new URL(`./fixtures/${name}.json`, import.meta.url), "utf8"));
 }
@@ -51,6 +64,13 @@ test("recorded Claude events retain the fields consumed by the runner", () => {
   assert.equal(typeof result.usage.input_tokens, "number"); assert.equal(typeof result.usage.output_tokens, "number");
   assert.equal(typeof result.usage.cache_read_input_tokens, "number"); assert.equal(typeof result.usage.cache_creation_input_tokens, "number");
   assert.ok(Object.keys(result.modelUsage).length > 0);
+});
+
+test("Codex rollout context retains the model and effort fields consumed by Workers", () => {
+  const context = fixture("codex-turn-context") as { type: string; payload: { model: string; effort: string } };
+  assert.equal(context.type, "turn_context");
+  assert.equal(context.payload.model, "gpt-6-luna");
+  assert.equal(context.payload.effort, "high");
 });
 
 test("recorded Codex events retain the fields consumed by the runner", () => {

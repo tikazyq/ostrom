@@ -1,6 +1,8 @@
 import { query, type SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 import { Codex, type CodexOptions, type ThreadEvent } from "@openai/codex-sdk";
 
+export type ReasoningEffort = "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+
 export interface TurnResult {
   sessionId: string | null;
   text: string;
@@ -11,8 +13,17 @@ export interface TurnResult {
   modelUsage?: Record<string, unknown>;
 }
 
+export class TurnError extends Error {
+  readonly model: string | null;
+  constructor(error: unknown, model: string | null) {
+    super(error instanceof Error ? error.message : String(error), { cause: error });
+    this.model = model;
+  }
+}
+
 export interface Session {
-  send(prompt: string, signal?: AbortSignal): Promise<TurnResult>;
+  /** Effort applies to this turn; omitting it retains the harness default. */
+  send(prompt: string, signal?: AbortSignal, effort?: ReasoningEffort): Promise<TurnResult>;
 }
 
 export interface SessionOptions {
@@ -59,9 +70,13 @@ export function claudeRunner(env: Record<string, string | undefined>, run: Claud
     requireOptions(options);
     let id = options.sessionId ?? null;
     let busy = false;
-    return { async send(prompt, signal) {
+    return { async send(prompt, signal, effort) {
       if (busy) throw new Error("session already has a running turn");
       busy = true;
+      if (effort === "minimal" || effort === "xhigh") {
+        busy = false;
+        throw new Error(`Claude does not support reasoning effort ${effort}`);
+      }
       const abortController = new AbortController();
       const abort = () => abortController.abort();
       signal?.addEventListener("abort", abort, { once: true });
@@ -71,6 +86,7 @@ export function claudeRunner(env: Record<string, string | undefined>, run: Claud
         if (signal?.aborted) return { sessionId: id, text: "", status: "cancelled", usage: null, model };
         for await (const message of run({ prompt, options: {
           cwd: options.cwd, model: options.model, env, abortController,
+          ...(effort === undefined ? {} : { effort }),
           ...(options.sandbox === "read-only"
             ? { permissionMode: "plan" as const, disallowedTools: ["Bash", "Edit", "Write"] }
             : { permissionMode: "bypassPermissions" as const, allowDangerouslySkipPermissions: true }),
@@ -91,7 +107,7 @@ export function claudeRunner(env: Record<string, string | undefined>, run: Claud
         throw new Error("Claude ended without a result");
       } catch (error) {
         if (signal?.aborted) return { sessionId: id, text: "", status: "cancelled", usage: null, model };
-        throw error;
+        throw new TurnError(error, model);
       } finally {
         signal?.removeEventListener("abort", abort);
         busy = false;
@@ -121,14 +137,15 @@ export function codexRunner(config: CodexOptions, makeClient: CodexClientFactory
       // A read-only session (the Router) runs in a scratch directory that is not a Git repository.
       ...(options.sandbox === "read-only" ? { skipGitRepoCheck: true } : {}),
     };
-    const thread: CodexThread = id === null ? codex.startThread(threadOptions) : codex.resumeThread(id, threadOptions);
-    return { async send(prompt, signal) {
+    return { async send(prompt, signal, effort) {
       if (busy) throw new Error("session already has a running turn");
       busy = true;
       let text = "";
       let lastNotice: string | null = null;
       try {
         if (signal?.aborted) return { sessionId: id, text, status: "cancelled", usage: null, model: null };
+        const turnOptions = { ...threadOptions, ...(effort === undefined ? {} : { modelReasoningEffort: effort }) };
+        const thread: CodexThread = id === null ? codex.startThread(turnOptions) : codex.resumeThread(id, turnOptions);
         const { events } = await thread.runStreamed(prompt, signal ? { signal } : {});
         for await (const event of events) {
           if (event.type === "thread.started") {

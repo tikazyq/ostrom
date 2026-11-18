@@ -192,6 +192,11 @@ function show(ticket: OperatorTicketDetail): void {
   for (const decision of ticket.decisions) process.stdout.write(`decision ${decision.id}  ${decision.verdict}  ${decision.reason}\n`);
   for (const trigger of ticket.triggers) process.stdout.write(`trigger ${trigger.id}  ${trigger.kind}  ${trigger.url}\n`);
   for (const assignment of ticket.assignments) process.stdout.write(`assignment ${assignment.id}  ${assignment.state}  ${assignment.outcome ?? "-"}\n`);
+  for (const turn of ticket.turns) {
+    process.stdout.write(`turn ${turn.id}  assignment ${turn.assignmentId}  ${turn.kind}  ${turn.status}  ${turn.startedAt} → ${turn.endedAt ?? "running"}\n`);
+    process.stdout.write(`  ${turn.harness}  requested ${turn.requestedModel}/${turn.requestedEffort ?? "default"}  observed ${turn.observedModel ?? "unverified"}/${turn.observedEffort ?? "unverified"}\n`);
+    if (turn.result !== null) process.stdout.write(`  result ${turn.result}\n`);
+  }
   for (const reply of ticket.outbox) process.stdout.write(`outbox ${reply.id}  ${reply.kind}  ${reply.sentAt === null ? "pending" : "sent"}\n`);
 }
 

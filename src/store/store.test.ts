@@ -65,6 +65,46 @@ test("migrations apply once and record their version", () => {
   );
 });
 
+test("turn migration upgrades the prior schema without inventing historical turns", () => {
+  const db = database();
+  db.exec("CREATE TABLE schema_version (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL) STRICT");
+  for (const [index, sql] of migrations.slice(0, 29).entries()) {
+    db.exec(sql);
+    db.prepare("INSERT INTO schema_version VALUES (?, ?)").run(index + 1, "2026-11-10T00:00:00Z");
+  }
+  assert.equal(migrate(db), migrations.length);
+  assert.deepEqual(db.prepare("SELECT * FROM turn").all(), []);
+  assert.equal(db.prepare("PRAGMA foreign_key_check").get(), undefined);
+});
+
+test("turn records preserve settings, timestamps and usage across terminal states", () => {
+  const { store, accept, advance } = fixture();
+  const ticket = accept();
+  const assignment = store.createAssignment(ticket);
+  store.configureNativeAssignment(assignment, { harness: "codex", model: "luna", worktree: "/w", branch: "b", machine: "h" });
+  store.startNativeAssignment(assignment, "session");
+  store.startWorkerTurn(assignment, "dispatch", "medium");
+  assert.equal(store.ticketTurns(ticket)[0]!.endedAt, null);
+  assert.throws(() => store.startWorkerTurn(assignment, "review", "high"), /UNIQUE constraint/);
+  advance(1000);
+  store.finishWorkerTurn(assignment, "completed", "done", "luna", "medium", { inputTokens: 4, cachedInputTokens: 3, outputTokens: 2 });
+  const turn = store.ticketTurns(ticket)[0]!;
+  assert.deepEqual(turn, {
+    id: 1, assignmentId: assignment, ticketId: ticket, startedAt: "2026-11-09T12:00:00.000Z", endedAt: "2026-11-09T12:00:01.000Z",
+    harness: "codex", requestedModel: "luna", requestedEffort: "medium", observedModel: "luna", observedEffort: "medium",
+    kind: "dispatch", status: "completed", result: "done", inputTokens: 4, cachedInputTokens: 3, outputTokens: 2,
+  });
+  // Repeated finalization must not overwrite the original result or its observations.
+  store.finishWorkerTurn(assignment, "failed", "late failure");
+  assert.deepEqual(store.ticketTurns(ticket)[0], turn);
+  for (const status of ["cancelled", "failed", "interrupted"] as const) {
+    store.startWorkerTurn(assignment, "recovery", null);
+    advance(1000);
+    store.finishWorkerTurn(assignment, status, status);
+  }
+  assert.deepEqual(store.operatorTicket(ticket).turns.map((record) => record.status), ["completed", "cancelled", "failed", "interrupted"]);
+});
+
 test("queued-turn migration preserves every prior state and supports honest cancellation", () => {
   const db = database();
   // Build through migration 27, then migrate real queued/running/finished rows through 28.

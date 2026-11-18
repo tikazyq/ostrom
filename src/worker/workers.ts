@@ -11,8 +11,8 @@ import { ghGet, type GhRunner } from "../github/gh.ts";
 import { renderReviewReply } from "../github/review-reply.ts";
 import { parseStuckReply, renderStuckReply } from "../watchdog/stuck.ts";
 import type { WorkerConfig } from "../ostromd/config.ts";
-import { rolloutModel } from "../session/rollout.ts";
-import type { Runner, Session, TurnResult } from "../session/runner.ts";
+import { rolloutTurn } from "../session/rollout.ts";
+import { TurnError, type ReasoningEffort, type Runner, type Session, type TurnResult } from "../session/runner.ts";
 import { createWorktree } from "../session/worktree.ts";
 import type { Assignment, AssignmentOutcome, QueuedTurnKind, Store } from "../store/store.ts";
 import { workerBrief } from "./dispatch.ts";
@@ -46,6 +46,9 @@ export function gitDirs(repo: string, worktree: string): string[] {
     join(git, "worktrees", basename(worktree)),
   ];
 }
+
+// Selection comes in step 3; until then every Worker turn requests a moderate effort.
+const WORKER_EFFORT: ReasoningEffort = "medium";
 
 /** Turns that run even on a paused ticket: those that pause it, and those that stop it. */
 const RUNS_WHILE_PAUSED = ["budget-pause-", "stuck-", "operator-pause-", "operator-stop-", "pause-", "stop-", "close-issue-"];
@@ -184,6 +187,7 @@ export class Workers {
     const { store } = this.#deps;
     const pass = { resumed: [] as number[], interrupted: [] as number[], abandoned: [] as number[] };
     for (const pending of store.pendingAssignments()) {
+      store.finishWorkerTurn(pending.id, "interrupted", "ostromd stopped before the session started");
       store.abandonAssignment(pending.id, "ostromd stopped before the session started");
       pass.abandoned.push(pending.id);
     }
@@ -194,6 +198,7 @@ export class Workers {
       if (assignment.turnStartedAt !== null) {
         const turnId = `${assignment.sessionId}:${assignment.turns}`;
         const reviews = store.reviewDeliveries(assignment.id, turnId);
+        store.finishWorkerTurn(assignment.id, "interrupted", "ostromd stopped during the turn");
         store.recordInterruption(assignment.id);
         store.finishRunningTurns(assignment.id);
         store.endTurn(assignment.id, null);
@@ -351,13 +356,16 @@ export class Workers {
     this.#inFlight.set(id, controller);
     let result: TurnResult;
     try {
-      result = await session.send(prompt, controller.signal);
+      store.startWorkerTurn(id, "dispatch", WORKER_EFFORT);
+      result = await session.send(prompt, controller.signal, WORKER_EFFORT);
     } catch (error) {
       if (this.#stopping) return;
       if (controller.signal.aborted) {
+        store.finishWorkerTurn(id, "cancelled", null);
         store.endTurn(id, null);
         store.clearTurnError(id);
       } else if (store.getAssignment(id).state === "pending") {
+        store.finishWorkerTurn(id, "failed", error instanceof Error ? error.message : String(error));
         store.abandonAssignment(id, error instanceof Error ? error.message : String(error));
       } else {
         this.#failed(id, error);
@@ -397,11 +405,13 @@ export class Workers {
     this.#inFlight.set(id, controller);
     let result: TurnResult;
     try {
-      result = await session.send(workerTurnPrompt(queued.prompt), controller.signal);
+      store.startWorkerTurn(id, key.startsWith("redirect-") ? "redirect" : queued.kind, WORKER_EFFORT);
+      result = await session.send(workerTurnPrompt(queued.prompt), controller.signal, WORKER_EFFORT);
     } catch (error) {
       if (this.#stopping) return;
       store.finishQueuedTurn(id, key);
       if (controller.signal.aborted) {
+        store.finishWorkerTurn(id, "cancelled", null);
         store.endTurn(id, null);
         store.clearTurnError(id);
       } else {
@@ -422,6 +432,17 @@ export class Workers {
   #failed(id: number, error: unknown): void {
     const message = error instanceof Error ? error.message : String(error);
     this.#deps.log?.(`assignment ${id}: turn failed: ${message}`);
+    const assignment = this.#deps.store.getAssignment(id);
+    let model = error instanceof TurnError ? error.model : null;
+    let effort: string | null = null;
+    if (assignment.harness === "codex" && this.#deps.codexSessions !== undefined) {
+      try {
+        const observed = rolloutTurn(this.#deps.codexSessions, assignment.sessionId!);
+        model = observed.model;
+        effort = observed.effort;
+      } catch { /* The SDK failure remains the result when its rollout is unavailable. */ }
+    }
+    this.#deps.store.finishWorkerTurn(id, "failed", message, model, effort);
     this.#deps.store.endTurn(id, null);
     this.#deps.store.recordTurnError(id, message);
     this.#mark(id, "failed");
@@ -430,10 +451,32 @@ export class Workers {
 
   #finished(id: number, result: TurnResult): void {
     const { store } = this.#deps;
+    const assignment = store.getAssignment(id);
+    let model = result.model;
+    let effort: string | null = null;
+    let problem: string | null = null;
+    if (assignment.harness === "codex" && this.#deps.codexSessions !== undefined) {
+      try {
+        const observed = rolloutTurn(this.#deps.codexSessions, assignment.sessionId!);
+        model = observed.model;
+        effort = observed.effort;
+        if (result.status === "completed" && model !== assignment.model) {
+          problem = `model mismatch: asked for ${assignment.model}, ran ${model}`;
+        }
+      } catch (error) {
+        if (result.status === "completed") problem = `model unverified: ${error instanceof Error ? error.message : String(error)}`;
+      }
+    }
+    store.finishWorkerTurn(id, problem === null ? result.status : "failed", problem ?? result.text, model, effort, result.usage);
     // A late result still counts its usage, but cannot clear a failure or act for an ended assignment.
     store.endTurn(id, result.usage);
-    const assignment = store.getAssignment(id);
     if (assignment.state !== "running" || assignment.outcome === "failed") return;
+    if (problem !== null) {
+      this.#deps.log?.(`assignment ${id}: ended: ${problem}`);
+      store.endAssignment(id, problem);
+      queueStatusCard(store, assignment.ticketId);
+      return;
+    }
     store.clearTurnError(id);
     // A cancelled turn still counts toward the turn and token limits.
     const reached = turnBudgetReached(store.ticketBudget(assignment.ticketId), new Date());
@@ -454,14 +497,6 @@ export class Workers {
       queueStatusCard(store, assignment.ticketId);
       return;
     }
-    if (assignment.harness === "codex" && this.#deps.codexSessions !== undefined) {
-      const reason = this.#modelProblem(assignment, this.#deps.codexSessions);
-      if (reason !== null) {
-        this.#deps.log?.(`assignment ${id}: ended: ${reason}`);
-        store.endAssignment(id, reason);
-        return;
-      }
-    }
     // Ostrom only aborts a turn to replace it. That cancellation is bookkeeping, not a terminal
     // Worker outcome: the next queued turn must still run on this assignment.
     this.#mark(id, null);
@@ -471,16 +506,6 @@ export class Workers {
   /** Records an outcome unless the Router ended the assignment while the turn ran. */
   #mark(id: number, outcome: AssignmentOutcome | null): void {
     if (this.#deps.store.getAssignment(id).state === "running") this.#deps.store.recordOutcome(id, outcome);
-  }
-
-  #modelProblem(assignment: Assignment, root: string): string | null {
-    let model: string;
-    try {
-      model = rolloutModel(root, assignment.sessionId!);
-    } catch (error) {
-      return `model unverified: ${error instanceof Error ? error.message : String(error)}`;
-    }
-    return model === assignment.model ? null : `model mismatch: asked for ${assignment.model}, ran ${model}`;
   }
 }
 

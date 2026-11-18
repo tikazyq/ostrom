@@ -1,6 +1,6 @@
 # Model selection
 
-Status: accepted, 2026-11-17. This is a design; none of it exists yet. The operator asked for
+Status: accepted, 2026-11-17. Step 1 is implemented; steps 2–5 remain planned. The operator asked for
 selection that is smarter than a fixed tier table, optimised for the operator's experience. On
 2026-11-17 they chose: **the lowest cost that still merges** as the default objective, **escalation
 within one harness** at first, allowed models **selected by an admin from those the harnesses
@@ -145,7 +145,13 @@ Each PR is reviewed and merged on green CI before the next starts.
 
 1. **Effort reaches the SDKs.** The runner passes an effort to both SDKs, covered by agreement
    tests. Turns record model and effort in a new `turn` table. Ostrom checks each turn's real model
-   from the native session record.
+   from the native session record. Implemented: `Session.send` accepts an optional effort per turn;
+   Workers request `medium` until step 3 adds selection. Codex resumes the same native thread with
+   the new effort and reads observed model/effort from its latest rollout context. An unverified or
+   mismatched Codex model ends the assignment. Claude records its observed model without comparing
+   alias/gateway names; observed effort stays unknown because the SDK does not report it. The `turn`
+   table and `ostrom show` retain requested/observed settings, lifecycle, usage and result, including
+   failures, cancellations and interrupted turns. SDK option shapes are pinned by agreement tests.
 2. **Discovery and selection.** Both harnesses' model lists with agreement tests, the cached list
    and the operator's selections in the store, and `ostrom models` with `allow`, `remove`, the
    per-model settings, `export` and `import`.
