@@ -65,6 +65,17 @@ test("migrations apply once and record their version", () => {
   );
 });
 
+test("the merge candidate migration adds ownership and ready-delivery references", () => {
+  const db = database();
+  migrate(db);
+  const keys = db.prepare("PRAGMA foreign_key_list(merge_candidate)").all();
+  assert.deepEqual(keys.map((key) => [key["from"], key["table"], key["to"]]).sort(), [
+    ["assignment_id", "assignment", "id"],
+    ["pr_thread_id", "thread", "id"],
+    ["ready_reply_id", "outbox", "id"],
+  ]);
+});
+
 test("a database newer than the code is refused", () => {
   const db = database();
   migrate(db);

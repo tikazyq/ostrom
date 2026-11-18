@@ -25,6 +25,16 @@ The operator uses `ostrom status`, `tickets`, `show`, `pause`, `resume`, `stop`,
 read-only commands can inspect `OSTROM_DB` directly while the daemon is down;
 mutating controls require the daemon.
 
+`ostrom preview` reports merge evidence for PRs the daemon has observed on live Worker tickets.
+For the live GitHub section while the daemon is down, set `OSTROM_REPO` and `OSTROM_WORKER_BASE`
+in the CLI environment. The report includes ticket pause and budget state. Issue state, pending
+stop, quiet window and Worker idle state are not yet tracked for eligibility. A pass in the preview
+means the available checks passed. This release only reads merge evidence.
+
+`OSTROM_MERGE_STRATEGY` defaults to `unattended`. Set it to `human` or `approvals` to preview
+those policies. `approvals` requires a positive `OSTROM_MERGE_APPROVALS` count and accepts an
+optional comma-separated `OSTROM_MERGE_APPROVERS` allowlist.
+
 Developer-only one-shot passes remain available as `ostromd dev <pass>`:
 `poll`, `send`, `dispatch <ticket>`, `observe`, `commands`, `route`, `watchdog`,
 `route-candidates`, and `tick`. They are retained for their existing tests and

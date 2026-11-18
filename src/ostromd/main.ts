@@ -4,7 +4,7 @@
 
 import { defaultSocketPath, localApi } from "../api/server.ts";
 import { operatorControls, routeCommands } from "../commands/commands.ts";
-import { renderPreview } from "../github/preview.ts";
+import { renderMergePreview } from "../github/preview.ts";
 import { execGh, type GhRunner } from "../github/gh.ts";
 import { sendDueReplies } from "../github/outbox.ts";
 import { processRunner, type ProcessRunner } from "../process.ts";
@@ -143,13 +143,15 @@ async function run(intervalSeconds: number, deps: MainDeps): Promise<number> {
   }
   let code = 0;
   const owned = openWorkers(deps);
-  const controls = operatorControls(owned.store, owned.workers, deps.gh, loadConfig(deps.env).repo);
+  const { repo, mergePolicy } = loadConfig(deps.env);
+  const { base } = loadWorkerConfig(deps.env);
+  const controls = operatorControls(owned.store, owned.workers, deps.gh, repo);
   const api = localApi(owned.store, {
     socketPath: defaultSocketPath(deps.env),
     control: {
       ...controls,
       extend: async (ticketId, increases) => { owned.store.extendTicketBudget(ticketId, increases); },
-      preview: async () => renderPreview(owned.store),
+      preview: () => renderMergePreview(owned.store, deps.gh, repo, base, mergePolicy),
     },
   });
   logRecovery(owned.workers.recover(), deps);

@@ -414,6 +414,24 @@ export const migrations: readonly string[] = [
   `
   CREATE INDEX delivery_by_assignment_turn ON delivery (assignment_id, turn_id);
   `,
+
+  // 23: A candidate binds the observed PR to its Worker and captures what resets the quiet window.
+  `
+  CREATE TABLE merge_candidate (
+    assignment_id        INTEGER NOT NULL REFERENCES assignment (id),
+    pr_thread_id         INTEGER NOT NULL REFERENCES thread (id),
+    head_sha             TEXT NOT NULL,
+    base_sha             TEXT NOT NULL,
+    policy_snapshot      TEXT NOT NULL,
+    activity_fingerprint TEXT,
+    activity_at          TEXT,
+    ready_reply_id       TEXT REFERENCES outbox (id),
+    ready_sent_at        TEXT,
+    quiet_deadline       TEXT,
+    blocking_reason      TEXT,
+    PRIMARY KEY (assignment_id, pr_thread_id)
+  ) STRICT, WITHOUT ROWID;
+  `,
 ];
 
 /** Applies every migration newer than the database's version. Returns the resulting version. */

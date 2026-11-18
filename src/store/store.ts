@@ -835,6 +835,17 @@ export class Store {
     return row === undefined ? null : this.getThread(row["id"] as number);
   }
 
+  /** Pull requests already observed on the ticket, for the read-only merge preview. */
+  ticketPullRequests(ticketId: number, repo: string): Thread[] {
+    return this.#all(
+      `SELECT thread.id FROM subscription JOIN thread ON thread.id = subscription.thread_id
+       JOIN source ON source.id = thread.source_id
+       WHERE subscription.ticket_id = ? AND thread.kind = 'pull_request' AND source.name = ? COLLATE NOCASE
+       ORDER BY thread.number`,
+      ticketId, repo,
+    ).map((row) => this.getThread(row["id"] as number));
+  }
+
   /** Removes subscriptions after a PR attempt closes, so later issue discussion asks the Router again. */
   unsubscribeTicket(ticketId: number): void {
     this.#run("DELETE FROM subscription WHERE ticket_id = ?", ticketId);

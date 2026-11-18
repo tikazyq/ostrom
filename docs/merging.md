@@ -1,8 +1,8 @@
 # Merging
 
 Status: proposed, 2026-11-10. Milestone 2. The operator chose unattended merging by default,
-with policy options ([direction.md, question 4](direction.md#open-questions)). This is a design;
-none of the merge pass or configuration below exists yet.
+with policy options ([direction.md, question 4](direction.md#open-questions)). The evidence reader,
+policy configuration and preview are implemented. The merge pass is still proposed.
 
 ## Starting point
 

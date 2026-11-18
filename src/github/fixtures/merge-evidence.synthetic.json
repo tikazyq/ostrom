@@ -1,0 +1,60 @@
+{
+  "pull": {
+    "number": 5,
+    "state": "open",
+    "draft": false,
+    "mergeable": true,
+    "head": { "ref": "ostrom/ticket-3-3", "sha": "head-sha", "repo": { "full_name": "example/sandbox" } },
+    "base": { "ref": "main", "sha": "base-sha", "repo": { "full_name": "example/sandbox" } },
+    "user": { "login": "worker", "node_id": "worker-id" },
+    "merged_at": null,
+    "merged_by": null,
+    "merge_commit_sha": null
+  },
+  "repository": { "allow_squash_merge": true },
+  "protection": { "url": "https://api.github.com/repos/example/sandbox/branches/main/protection" },
+  "denied": {
+    "message": "Resource not accessible by integration",
+    "documentation_url": "https://docs.github.com/rest/branches/branch-protection#get-branch-protection",
+    "status": "403"
+  },
+  "rules": [[]],
+  "graphql": {
+    "data": {
+      "repository": {
+        "pullRequest": {
+          "id": "pr-5",
+          "headRefOid": "head-sha",
+          "baseRefOid": "base-sha",
+          "mergeable": "MERGEABLE",
+          "mergeStateStatus": "CLEAN",
+          "reviewDecision": null,
+          "reviews": {
+            "pageInfo": { "hasNextPage": false, "endCursor": "review-end" },
+            "nodes": [{ "id": "review-1", "state": "APPROVED", "submittedAt": "2026-11-09T15:14:00Z", "commit": { "oid": "head-sha" }, "author": { "__typename": "User", "login": "reviewer", "id": "user-1" } }]
+          },
+          "reviewThreads": {
+            "pageInfo": { "hasNextPage": false, "endCursor": "thread-end" },
+            "nodes": [{ "id": "thread-1", "isResolved": true }]
+          },
+          "commits": {
+            "nodes": [{ "commit": {
+              "oid": "head-sha",
+              "statusCheckRollup": {
+                "state": "SUCCESS",
+                "contexts": {
+                  "pageInfo": { "hasNextPage": false, "endCursor": "check-end" },
+                  "nodes": [{ "__typename": "CheckRun", "id": "check-1", "name": "test", "status": "COMPLETED", "conclusion": "SUCCESS", "checkSuite": { "id": "suite-1", "app": { "databaseId": 15368 } } }]
+                }
+              },
+              "checkSuites": {
+                "pageInfo": { "hasNextPage": false, "endCursor": "suite-end" },
+                "nodes": [{ "id": "suite-1", "status": "COMPLETED", "repository": { "nameWithOwner": "example/sandbox" }, "conclusion": "SUCCESS", "workflowRun": { "id": "run-1", "event": "pull_request", "runNumber": 1, "runAttempt": 1, "workflow": { "id": "workflow-1" } }, "matchingPullRequests": { "pageInfo": { "hasNextPage": false, "endCursor": "match-end" }, "nodes": [{ "id": "pr-5" }] } }]
+              }
+            } }]
+          }
+        }
+      }
+    }
+  }
+}
