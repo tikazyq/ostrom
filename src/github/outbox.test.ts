@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { DatabaseSync } from "node:sqlite";
 import { afterEach, test } from "node:test";
 import { Store } from "../store/store.ts";
 import { FakeGitHub } from "./fake-github.ts";
@@ -32,6 +33,47 @@ function fixture() {
   const reply = (id: string) => store.dueReplies().find((r) => r.id === id);
   return { store, github, thread, send, posts, reply, advance: (ms: number) => (now = new Date(now.getTime() + ms)) };
 }
+
+test("ready delivery is tracked only after posting or marker recovery, including batched replies", async () => {
+  for (const recover of [false, true]) {
+    let now = new Date(T0);
+    const db = new DatabaseSync(":memory:", { enableForeignKeyConstraints: true });
+    const store = new Store(db, { now: () => now });
+    stores.push(store);
+    const github = new FakeGitHub(() => now);
+    github.issue(7);
+    const source = store.ensureSource("github", github.repo);
+    const threadId = store.ensureThread({ sourceId: source.id, kind: "issue", number: 7, url: "https://example.test/7" });
+    const triggerId = store.insertTrigger({ sourceId: source.id, threadId, sourceEventId: "accept", kind: "issue_comment",
+      actor: "alice", url: "https://example.test/comment", occurredAt: now }).id;
+    const ticketId = store.recordDecision({ threadId, triggerIds: [triggerId], verdict: "accept", reason: "work" }).ticketId!;
+    const assignmentId = store.createAssignment(ticketId);
+    db.prepare(`INSERT INTO merge_candidate (assignment_id, repository, pr_number, head_sha, base_sha, policy)
+      VALUES (?, ?, 12, 'head', 'base', 'unattended')`).run(assignmentId, github.repo);
+    store.enqueueReply({ id: "ready", threadId, body: "Ready for review." });
+    store.enqueueReply({ id: "other", threadId, body: "Update." });
+    store.trackReadyReply(1, "ready");
+    const sentAt = () => db.prepare("SELECT ready_sent_at FROM merge_candidate WHERE id = 1").get()!["ready_sent_at"];
+    const send = () => sendDueReplies({ store, gh: github.gh, repo: github.repo, now: () => now, batchWindowMs: 600_000 });
+    await send();
+    assert.equal(sentAt(), null, "enqueueing and batching do not confirm delivery");
+    now = new Date(T0 + 600_000);
+    if (recover) github.comment(7, { login: "operator", body: `Ready for review.\n\n${replyMarker("ready")}`, at: now });
+    if (!recover) {
+      github.failWhen = (args) => args[2] === "POST" ? new Error("HTTP 502") : undefined;
+      assert.ok((await send()).failed.some((item) => item.id === "ready"));
+      assert.equal(sentAt(), null, "a failed post does not confirm readiness");
+      github.failWhen = undefined;
+      now = new Date(now.getTime() + defaultBackoffMs(0));
+    }
+    const result = await send();
+    assert.ok((recover ? result.found : result.sent).includes("ready"));
+    assert.equal(sentAt(), now.toISOString());
+    assert.equal(store.replySentAt("ready"), now.toISOString());
+    store.trackReadyReply(1, "ready");
+    assert.equal(sentAt(), now.toISOString(), "late binding retains the confirmed delivery");
+  }
+});
 
 test("a due reply is posted once, with its marker, and marked sent", async () => {
   const { store, github, thread, send, posts } = fixture();

@@ -45,16 +45,15 @@ export async function renderMergeEligibilityPreview(
         evidence, policy, expected: { head: evidence.pr.head.sha, base: evidence.pr.base.sha },
         local: {
           issueOpen: true, ticketOpen: ticket.state === "open",
-          pausedOrStopping: ticket.state === "paused", // stop requests arrive with PR 2's durable state.
+          pausedOrStopping: ticket.state === "paused" || store.stopRequested(ticket.id),
           stalledOrFailed: ticket.assignment.outcome === "failed" || ticket.assignment.stallRecoveryAttempts > 0,
           budgetReached: budgetReached(ticket.budget, now) !== null,
-          workerIdle: ticket.assignment.turnStartedAt === null,
+          workerIdle: store.workerIdle(ticket.assignment.id),
           readyReplySent: false, quietUntil: null, now,
         },
       });
       const untracked = [
-        "issue open state not tracked yet", "stop-request state not tracked yet",
-        "quiet window not tracked yet", "durable queued-work idle state not tracked yet",
+        "issue open state not tracked yet", "quiet window not tracked yet",
       ];
       reports.push(`## Ticket ${ticket.id}, PR #${pr.number}\n\n${result.eligible ? "observed eligible on tracked evidence" : `blocked: ${result.reason}`}\n\n${untracked.join("; ")}.`);
     } catch (error) {

@@ -11,12 +11,14 @@ export function queueStatusCard(store: Store, ticketId: number, now = new Date()
   const assignment = store.latestAssignment(ticketId);
   if (assignment === null || assignment.harness === null || assignment.model === null) return;
   const openStall = store.unansweredStalls().find((stall) => stall.assignmentId === assignment.id);
+  const mergeWait = store.mergeWaitCard(assignment.id);
   const state: StatusCardState =
     ticket.state === "ended" ? (assignment.endReason === null ? "done" : "stopped") :
       openStall !== undefined && openStall.publicAt !== null ? "stuck" :
         openStall !== undefined ? "recovering" :
           ticket.state === "paused" ? "paused" :
-            assignment.outcome === "failed" ? "stuck" : "working";
+            assignment.outcome === "failed" ? "stuck" :
+              store.stopRequested(ticketId) || !store.workerIdle(assignment.id) ? "working" : mergeWait?.state ?? "working";
   const budget = store.ticketBudget(ticketId);
   const warning = budgetWarning(budget, now);
   const pullRequest = store.ticketPullRequest(ticketId);
@@ -25,6 +27,7 @@ export function queueStatusCard(store: Store, ticketId: number, now = new Date()
     context.thread.id,
     renderStatusCard({
       state,
+      ...(state === "waiting_for_human_merge" || state === "waiting_to_merge" ? { mergeWait: mergeWait! } : {}),
       ...(assignment.endReason === "issue closed" ? { stoppedReason: "issue closed" as const } : {}),
       ...(pullRequest === null ? {} : { pullRequest: pullRequest.url }),
       ...(warning === null ? {} : { budgetWarning: warning }),

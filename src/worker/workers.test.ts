@@ -204,8 +204,113 @@ test("a stop cuts off the running turn, starts no queued one, and leaves the tur
   const restarted = make();
   assert.deepEqual(restarted.recover().interrupted, [1]);
   await restarted.drain();
-  assert.deepEqual(runner.sessions.at(-1)!.prompts, [INTERRUPTED_PROMPT]);
+  assert.deepEqual(runner.sessions.at(-1)!.prompts, [INTERRUPTED_PROMPT, "next"]);
   assert.equal(store.getAssignment(1).turnStartedAt, null);
+});
+
+test("queued turns survive closing and reopening the SQLite database", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "queued-turns-"));
+  const path = join(dir, "store.sqlite");
+  let store = Store.open(path);
+  try {
+    const source = store.ensureSource("github", REPO);
+    const threadId = store.ensureThread({ sourceId: source.id, kind: "issue", number: 7, url: `https://github.com/${REPO}/issues/7` });
+    const triggerId = store.insertTrigger({ sourceId: source.id, threadId, sourceEventId: "accepted", kind: "issue_comment",
+      actor: "alice", url: "https://example.test/comment", occurredAt: new Date() }).id;
+    const ticketId = store.recordDecision({ threadId, triggerIds: [triggerId], verdict: "accept", reason: "work" }).ticketId!;
+    const id = store.createAssignment(ticketId);
+    store.configureNativeAssignment(id, { harness: "codex", model: "gpt-6-luna", worktree: "/wt", branch: "b", machine: "host" });
+    store.startNativeAssignment(id, "durable-session");
+    store.pauseTicket(ticketId);
+    const runner = new FakeRunner();
+    const workers = new Workers({ store, config, runners: { claude: runner, codex: runner } });
+    workers.deliver(id, "disk-queue", "persisted prompt", () => {}, undefined, { reviewReply: { id: "review-disk", threadId } });
+    await workers.drain();
+    store.close();
+    store = Store.open(path);
+    store.resumeTicket(ticketId);
+    const restarted = new Workers({ store, config, runners: { claude: runner, codex: runner } });
+    restarted.recover();
+    await restarted.drain();
+    assert.deepEqual(runner.sessions[0]!.prompts, ["persisted prompt"]);
+    assert.equal(store.hasReply("review-disk"), true);
+    assert.equal(store.workerIdle(id), true);
+  } finally {
+    store.close();
+    rmSync(dir, { recursive: true });
+  }
+});
+
+test("deferred turns retain their live start and completion callbacks", async () => {
+  const { store, ticketId, workers } = fixture();
+  await workers.dispatch(ticketId);
+  await workers.drain();
+  store.pauseTicket(ticketId);
+  const effects: string[] = [];
+  workers.deliver(1, "deferred", "do it", () => { effects.push("start"); }, () => { effects.push("complete"); });
+  await workers.drain();
+  assert.deepEqual(effects, []);
+  assert.equal(store.queuedTurns(1).length, 1);
+  store.resumeTicket(ticketId);
+  assert.equal(workers.deliver(1, "deferred", "do it", () => { throw new Error("replaced callback"); }), false);
+  await workers.drain();
+  assert.deepEqual(effects, ["start", "complete"]);
+  assert.deepEqual(store.queuedTurns(1), []);
+});
+
+test("restart retries persisted completion effects without rerunning the Worker", async () => {
+  const { store, runner, ticketId, workers, make } = fixture();
+  await workers.dispatch(ticketId);
+  await workers.drain();
+  const threadId = store.ticketContext(ticketId).thread.id;
+  workers.deliver(1, "completion", "finish", () => {}, () => { throw new Error("outbox unavailable"); },
+    { reviewReply: { id: "review-retry", threadId } });
+  await workers.drain();
+  assert.equal(store.queuedTurns(1)[0]!.state, "completed");
+  assert.equal(store.getAssignment(1).turnStartedAt, null);
+  const restarted = make();
+  assert.deepEqual(restarted.recover().interrupted, []);
+  await restarted.drain();
+  assert.deepEqual(runner.sessions.at(-1)!.prompts, []);
+  assert.equal(store.hasReply("review-retry"), true);
+  assert.deepEqual(store.queuedTurns(1), []);
+});
+
+test("a merge reservation survives restart and prevents queued turns from starting", async () => {
+  const { store, runner, ticketId, workers, make } = fixture();
+  await workers.dispatch(ticketId);
+  await workers.drain();
+  assert.equal(store.reserveMerge(1), true);
+  workers.deliver(1, "waiting", "later", () => {});
+  await workers.drain();
+  const restarted = make();
+  restarted.recover();
+  await restarted.drain();
+  assert.equal(store.mergeReserved(1), true);
+  assert.deepEqual(runner.sessions.at(-1)!.prompts, []);
+  assert.equal(store.workerIdle(1), false);
+  store.releaseMerge(1);
+  restarted.schedule(1);
+  await restarted.drain();
+  assert.deepEqual(runner.sessions.at(-1)!.prompts, ["later"]);
+});
+
+test("an interrupted queued turn is replayed after recovery with its durable completion", async () => {
+  const { store, runner, ticketId, workers, make } = fixture();
+  await workers.dispatch(ticketId);
+  await workers.drain();
+  runner.sessions[0]!.auto = false;
+  const threadId = store.ticketContext(ticketId).thread.id;
+  workers.deliver(1, "review", "address review", () => {}, undefined, { reviewReply: { id: "review-durable", threadId } });
+  await new Promise((resolve) => setImmediate(resolve));
+  workers.stop();
+  await workers.drain();
+  const restarted = make();
+  restarted.recover();
+  await restarted.drain();
+  assert.deepEqual(runner.sessions.at(-1)!.prompts, [INTERRUPTED_PROMPT, "address review"]);
+  assert.equal(store.hasReply("review-durable"), true);
+  assert.deepEqual(store.queuedTurns(1), []);
 });
 
 function rollout(model: string | null, thread = "sess-1") {

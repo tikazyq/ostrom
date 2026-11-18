@@ -144,6 +144,30 @@ test("a restart during a review turn posts its one reply when recovery completes
   );
 });
 
+test("a queued review restores delivery reactions and its reply after restart", async () => {
+  const { store, runner, workers, pr, trigger, assignmentId } = fixture();
+  runner.hold = true;
+  workers.deliver(assignmentId, "busy", "existing work", () => {});
+  await tick();
+  trigger(pr, "pull_request_review", { reviewId: "45", body: "Please revise." });
+  const inline = trigger(pr, "pull_request_review_comment", { reviewId: "45", body: "Rename.", path: "src/a.ts", line: 1 });
+  routeFollowUps(store, workers);
+  workers.stop();
+  await workers.drain();
+  assert.equal(store.pendingDeliveries().length, 2);
+  runner.hold = false;
+  const restarted = new Workers({ store,
+    config: { repo: "/repo", base: "main", worktrees: "/wt", harness: "codex", model: "gpt-6-luna", machine: "host" },
+    runners: { claude: runner, codex: runner },
+  });
+  restarted.recover();
+  await restarted.drain();
+  assert.deepEqual(store.pendingDeliveries(), []);
+  assert.ok(store.dueReplies().some((reply) => reply.id === `received-${inline}` && reply.reaction === "eyes"));
+  assert.ok(store.dueReplies().some((reply) => reply.id === "review-1-45" && reply.body === "ok"));
+  assert.deepEqual(routeFollowUps(store, restarted), { queued: [], failed: [] });
+});
+
 test("the follow-up is a summary plus a pointer to the trigger", () => {
   const { store, pr, trigger, ticketId } = fixture();
   const id = trigger(pr, "pull_request_review");

@@ -4,11 +4,12 @@
 import { controlsLine } from "../commands/table.ts";
 import { replyMarker } from "./marker.ts";
 
-export type StatusCardState = "working" | "recovering" | "paused" | "stuck" | "done" | "stopped";
+export type StatusCardState = "working" | "recovering" | "paused" | "stuck" | "done" | "stopped" | "waiting_for_human_merge" | "waiting_to_merge";
 
 export interface StatusCard {
   state: StatusCardState;
   stoppedReason?: "issue closed";
+  mergeWait?: { policy: string; headSha: string; blockingReason: string | null; earliestMergeAt: string | null };
   budgetWarning?: string;
   pauseCause?: string;
   /** The Worker's newest known checklist, in its order. Omit when it has not published one. */
@@ -29,6 +30,8 @@ const STATE_LABEL: Record<StatusCardState, string> = {
   stuck: "Stuck",
   done: "Done",
   stopped: "Stopped",
+  waiting_for_human_merge: "Waiting for a human merge",
+  waiting_to_merge: "Waiting to merge",
 };
 
 /** Renders the exact Markdown stored in and edited on the GitHub status-card comment. */
@@ -38,6 +41,11 @@ export function renderStatusCard(card: StatusCard): string {
     lines.push("", "### Plan", ...card.plan.map((item) => `- [ ] ${item}`));
   }
   if (card.pullRequest !== undefined) lines.push("", `PR: ${card.pullRequest}`);
+  if (card.mergeWait !== undefined) {
+    lines.push("", `Merge policy: ${card.mergeWait.policy}`, `Head: \`${card.mergeWait.headSha}\``);
+    if (card.mergeWait.blockingReason !== null) lines.push(`Waiting: ${card.mergeWait.blockingReason}`);
+    if (card.mergeWait.earliestMergeAt !== null) lines.push(`Earliest merge: ${utcMinute(new Date(card.mergeWait.earliestMergeAt))}`);
+  }
   if (card.budgetWarning !== undefined) lines.push("", `Warning: budget at 80% — ${card.budgetWarning}`);
   if (card.pauseCause !== undefined) lines.push("", `Paused: ${card.pauseCause}`);
   lines.push(

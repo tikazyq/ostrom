@@ -54,6 +54,30 @@ function fixture() {
   };
 }
 
+test("merge inhibition and wait snapshots survive a new Store on the same database", () => {
+  const db = database({ enableForeignKeyConstraints: true });
+  const store = new Store(db);
+  const source = store.ensureSource("github", "onsager-ai/ostrom");
+  const threadId = store.ensureThread({ sourceId: source.id, kind: "issue", number: 7, url: "https://example.test/7" });
+  const triggerId = store.insertTrigger({ sourceId: source.id, threadId, sourceEventId: "accepted", kind: "issue_comment",
+    actor: "alice", url: "https://example.test/comment", occurredAt: new Date() }).id;
+  const ticketId = store.recordDecision({ threadId, triggerIds: [triggerId], verdict: "accept", reason: "work" }).ticketId!;
+  const id = store.createAssignment(ticketId);
+  store.configureNativeAssignment(id, { harness: "codex", model: "m", worktree: "/w", branch: "b", machine: "h" });
+  store.startNativeAssignment(id, "session");
+  assert.equal(store.workerIdle(id), true);
+  assert.equal(store.reserveMerge(id), true);
+  store.requestStop(ticketId);
+  const card = { state: "waiting_to_merge" as const, policy: "unattended", headSha: "head", blockingReason: null, earliestMergeAt: "2026-11-09T12:30:00Z" };
+  store.setMergeWaitCard(id, card);
+  const reopened = new Store(db);
+  assert.equal(reopened.mergeReserved(id), true);
+  assert.equal(reopened.stopRequested(ticketId), true);
+  assert.equal(reopened.workerIdle(id), false);
+  assert.equal(reopened.reserveMerge(id), false);
+  assert.deepEqual(reopened.mergeWaitCard(id), card);
+});
+
 test("migrations apply once and record their version", () => {
   const db = database();
   assert.equal(migrate(db), migrations.length);

@@ -102,5 +102,6 @@ async function publish(store: Store, workers: Workers, stall: Stall): Promise<vo
       store.enqueueReply({ id: `stuck-${stall.id}`, threadId: context.thread.id, body: reply, blocking: true });
       queueStatusCard(store, assignment.ticketId);
     },
+    { stuckReply: { stallId: stall.id, threadId: context.thread.id, cause: stall.cause ?? stall.semonReason ?? "unknown" } },
   );
 }

@@ -2,6 +2,7 @@
 // See docs/direction.md, "Data model". Only the operations milestone 1 needs live here.
 
 import { DatabaseSync, type SQLInputValue } from "node:sqlite";
+import type { TurnResult } from "../session/runner.ts";
 import type { BudgetDefaults } from "../budget/budgets.ts";
 import { migrate } from "./migrations.ts";
 
@@ -12,6 +13,31 @@ export type TicketState = "open" | "paused" | "ended";
 export type AssignmentState = "pending" | "running" | "ended";
 /** What the last observation of a running Worker found worth flagging. */
 export type AssignmentOutcome = "waiting" | "failed" | "cancelled";
+
+export interface TurnEffects {
+  deliveries?: { triggerIds: number[]; reactions: NewReply[] };
+  reviewReply?: { id: string; threadId: number };
+  stop?: { reason: string; replyId: string; threadId: number };
+  stuckReply?: { stallId: number; threadId: number; cause: string };
+}
+
+export interface QueuedTurn {
+  id: number;
+  assignmentId: number;
+  key: string;
+  prompt: string;
+  effects: TurnEffects;
+  state: "queued" | "running" | "completed";
+  result: TurnResult | null;
+}
+
+export interface MergeWaitCard {
+  state: "waiting_for_human_merge" | "waiting_to_merge";
+  policy: string;
+  headSha: string;
+  blockingReason: string | null;
+  earliestMergeAt: string | null;
+}
 
 export interface Source {
   id: number;
@@ -1087,6 +1113,125 @@ export class Store {
     });
   }
 
+  // --- durable Worker work and merge inhibition ----------------------------------------------
+
+  queueTurn(assignmentId: number, key: string, prompt: string, effects: TurnEffects): QueuedTurn | null {
+    const { changes } = this.#run(
+      "INSERT INTO queued_turn (assignment_id, key, prompt, effects) VALUES (?, ?, ?, ?) ON CONFLICT DO NOTHING",
+      assignmentId, key, prompt, JSON.stringify(effects),
+    );
+    if (Number(changes) === 0) return null;
+    return this.queuedTurns(assignmentId).find((turn) => turn.key === key)!;
+  }
+
+  queuedAssignmentIds(): number[] {
+    return this.#all("SELECT DISTINCT assignment_id FROM queued_turn ORDER BY assignment_id").map((row) => row["assignment_id"] as number);
+  }
+
+  queuedTurns(assignmentId: number): QueuedTurn[] {
+    return this.#all("SELECT * FROM queued_turn WHERE assignment_id = ? ORDER BY id", assignmentId).map((row) => ({
+      id: row["id"] as number, assignmentId, key: row["key"] as string, prompt: row["prompt"] as string,
+      effects: JSON.parse(row["effects"] as string) as TurnEffects, state: row["state"] as QueuedTurn["state"],
+      result: row["result"] === null ? null : JSON.parse(row["result"] as string) as TurnResult,
+    }));
+  }
+
+  startQueuedTurn(id: number): void {
+    this.#run("UPDATE queued_turn SET state = 'running' WHERE id = ?", id);
+  }
+
+  rescheduleTurn(id: number): void {
+    this.#run("UPDATE queued_turn SET state = 'queued' WHERE id = ? AND state = 'running'", id);
+  }
+
+  completeQueuedTurn(id: number, assignmentId: number, result: TurnResult): void {
+    this.#transaction(() => {
+      this.#run("UPDATE queued_turn SET state = 'completed', result = ? WHERE id = ?", JSON.stringify(result), id);
+      this.endTurn(assignmentId, result.usage);
+    });
+  }
+
+  finishQueuedTurn(id: number): void {
+    this.#run("DELETE FROM queued_turn WHERE id = ?", id);
+  }
+
+  requestStop(ticketId: number): void {
+    this.#run("UPDATE ticket SET stop_requested_at = COALESCE(stop_requested_at, ?) WHERE id = ?", this.#stamp(), ticketId);
+  }
+
+  stopRequested(ticketId: number): boolean {
+    return this.#get("SELECT stop_requested_at FROM ticket WHERE id = ?", ticketId)?.["stop_requested_at"] != null;
+  }
+
+  /** Includes owed work that has not yet been routed, not just the current native turn. */
+  workerIdle(assignmentId: number): boolean {
+    const assignment = this.getAssignment(assignmentId);
+    return assignment.state === "running" && assignment.turnStartedAt === null && assignment.outcome !== "failed" &&
+      this.getTicket(assignment.ticketId).state === "open" &&
+      !this.stopRequested(assignment.ticketId) && !this.mergeReserved(assignmentId) &&
+      this.queuedTurns(assignmentId).length === 0 &&
+      !this.pendingDeliveries().some((item) => item.ticketId === assignment.ticketId) &&
+      !this.pendingCommands().some((item) => item.ticketId === assignment.ticketId) &&
+      !this.unansweredStalls().some((item) => item.assignmentId === assignmentId);
+  }
+
+  reserveMerge(assignmentId: number): boolean {
+    return this.#transaction(() => {
+      if (!this.workerIdle(assignmentId)) return false;
+      this.#run("UPDATE assignment SET merge_reserved_at = ? WHERE id = ?", this.#stamp(), assignmentId);
+      return true;
+    });
+  }
+
+  mergeReserved(assignmentId: number): boolean {
+    return this.#get("SELECT merge_reserved_at FROM assignment WHERE id = ?", assignmentId)?.["merge_reserved_at"] != null;
+  }
+
+  releaseMerge(assignmentId: number): void {
+    this.#run("UPDATE assignment SET merge_reserved_at = NULL WHERE id = ?", assignmentId);
+  }
+
+  setMergeWaitCard(assignmentId: number, card: MergeWaitCard): void {
+    this.#run(`INSERT INTO merge_wait_card (assignment_id, state, policy, head_sha, blocking_reason, earliest_merge_at)
+      VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (assignment_id) DO UPDATE SET state = excluded.state,
+      policy = excluded.policy, head_sha = excluded.head_sha, blocking_reason = excluded.blocking_reason,
+      earliest_merge_at = excluded.earliest_merge_at`,
+    assignmentId, card.state, card.policy, card.headSha, card.blockingReason, card.earliestMergeAt);
+  }
+
+  mergeWaitCard(assignmentId: number): MergeWaitCard | null {
+    const row = this.#get("SELECT * FROM merge_wait_card WHERE assignment_id = ?", assignmentId);
+    return row === undefined ? null : {
+      state: row["state"] as MergeWaitCard["state"], policy: row["policy"] as string, headSha: row["head_sha"] as string,
+      blockingReason: row["blocking_reason"] as string | null, earliestMergeAt: row["earliest_merge_at"] as string | null,
+    };
+  }
+
+  clearMergeWaitCard(assignmentId: number): void {
+    this.#run("DELETE FROM merge_wait_card WHERE assignment_id = ?", assignmentId);
+  }
+
+  /** End stop cleanup and enqueue its summary together, including on a repeated completion. */
+  finishStop(assignmentId: number, reason: string, reply: NewReply): void {
+    this.#transaction(() => {
+      const assignment = this.getAssignment(assignmentId);
+      if (assignment.state === "running") this.endAssignment(assignmentId, reason);
+      if (this.getTicket(assignment.ticketId).state !== "ended") this.endTicket(assignment.ticketId);
+      this.#insertReply(reply);
+    });
+  }
+
+  /** Bind the stable ready reply before sending; delivery is confirmed by markReplySent. */
+  trackReadyReply(candidateId: number, replyId: string): void {
+    if (!this.hasReply(replyId)) throw new Error(`no outbox reply ${replyId}`);
+    this.#run(`UPDATE merge_candidate SET ready_reply_id = ?, ready_sent_at = (SELECT sent_at FROM outbox WHERE id = ?)
+      WHERE id = ?`, replyId, replyId, candidateId);
+  }
+
+  replySentAt(replyId: string): string | null {
+    return this.#get("SELECT sent_at FROM outbox WHERE id = ?", replyId)?.["sent_at"] as string | null | undefined ?? null;
+  }
+
   // --- outbox --------------------------------------------------------------------------------
 
   /**
@@ -1221,12 +1366,14 @@ export class Store {
 
   /** Marks a reply sent. Marking it sent a second time throws. */
   markReplySent(replyId: string): void {
-    const { changes } = this.#run(
-      "UPDATE outbox SET sent_at = ?, attempts = attempts + 1 WHERE id = ? AND sent_at IS NULL",
-      this.#stamp(),
-      replyId,
-    );
-    if (Number(changes) !== 1) this.#unsentReplyMissing(replyId);
+    this.#transaction(() => {
+      const at = this.#stamp();
+      const { changes } = this.#run(
+        "UPDATE outbox SET sent_at = ?, attempts = attempts + 1 WHERE id = ? AND sent_at IS NULL", at, replyId,
+      );
+      if (Number(changes) !== 1) this.#unsentReplyMissing(replyId);
+      this.#run("UPDATE merge_candidate SET ready_sent_at = ? WHERE ready_reply_id = ?", at, replyId);
+    });
   }
 
   /** Records a failed send and when to try again. A sent reply cannot fail afterwards. */

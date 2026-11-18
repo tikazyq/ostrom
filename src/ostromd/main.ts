@@ -174,6 +174,7 @@ async function run(intervalSeconds: number, deps: MainDeps): Promise<number> {
 function makeWorkers(deps: MainDeps, store: Store): Workers {
   return new Workers({
     store,
+    gh: deps.gh,
     config: loadWorkerConfig(deps.env),
     runners: deps.runners ?? realRunners(deps.env),
     codexSessions: deps.codexSessions ?? codexSessionsDir(),

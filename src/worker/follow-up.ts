@@ -4,7 +4,7 @@
 
 import { queueStatusCard } from "../github/cards.ts";
 import { renderReviewReply } from "../github/review-reply.ts";
-import type { Store, Thread, Trigger } from "../store/store.ts";
+import type { NewReply, Store, Thread, Trigger } from "../store/store.ts";
 import type { Workers } from "./workers.ts";
 
 export interface Delivered {
@@ -20,6 +20,7 @@ export interface RoutePass {
 
 export function routeFollowUps(store: Store, workers: Workers): RoutePass {
   const pass: RoutePass = { queued: [], failed: [] };
+  for (const id of store.queuedAssignmentIds()) workers.schedule(id);
   const pending = store.pendingDeliveries();
   const grouped = new Set<string>();
   for (const delivery of pending) {
@@ -57,6 +58,10 @@ export function routeFollowUps(store: Store, workers: Workers): RoutePass {
             body: renderReviewReply(result.text),
           });
         },
+        {
+          deliveries: { triggerIds: review.map((item) => item.trigger.id), reactions: review.flatMap((item) => receivedReaction(item.trigger)) },
+          reviewReply: { id: `review-${assignmentId}-${trigger.reviewId}`, threadId: trigger.threadId },
+        },
       );
       if (added) pass.queued.push({ triggerId: trigger.id, ticketId, assignmentId });
       continue;
@@ -69,6 +74,8 @@ export function routeFollowUps(store: Store, workers: Workers): RoutePass {
         store.recordDelivery(trigger.id, assignmentId, turnId);
         enqueueReceivedReaction(store, trigger);
       },
+      undefined,
+      { deliveries: { triggerIds: [trigger.id], reactions: receivedReaction(trigger) } },
     );
     if (added) pass.queued.push({ triggerId: trigger.id, ticketId, assignmentId });
   }
@@ -76,15 +83,13 @@ export function routeFollowUps(store: Store, workers: Workers): RoutePass {
 }
 
 function enqueueReceivedReaction(store: Store, trigger: Trigger): void {
-  if (trigger.kind === "pull_request_review") return;
-  store.enqueueReply({
-    id: `received-${trigger.id}`,
-    threadId: trigger.threadId,
-    body: "",
-    kind: "reaction",
-    target: trigger.url,
-    reaction: "eyes",
-  });
+  for (const reply of receivedReaction(trigger)) store.enqueueReply(reply);
+}
+
+function receivedReaction(trigger: Trigger): NewReply[] {
+  return trigger.kind === "pull_request_review" ? [] : [{
+    id: `received-${trigger.id}`, threadId: trigger.threadId, body: "", kind: "reaction", target: trigger.url, reaction: "eyes",
+  }];
 }
 
 const KIND_NOUNS: Record<string, string> = {

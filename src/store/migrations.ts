@@ -437,6 +437,31 @@ export const migrations: readonly string[] = [
   ) STRICT;
   CREATE INDEX merge_candidate_assignment ON merge_candidate (assignment_id);
   `,
+
+  // 24: Worker work and merge inhibition survive daemon restarts. Reservations are released only
+  // explicitly; startup cannot know whether a merge request reached GitHub before the crash.
+  `
+  CREATE TABLE queued_turn (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    assignment_id INTEGER NOT NULL REFERENCES assignment (id),
+    key TEXT NOT NULL,
+    prompt TEXT NOT NULL,
+    effects TEXT NOT NULL,
+    state TEXT NOT NULL DEFAULT 'queued' CHECK (state IN ('queued', 'running', 'completed')),
+    result TEXT,
+    UNIQUE (assignment_id, key)
+  ) STRICT;
+  ALTER TABLE ticket ADD COLUMN stop_requested_at TEXT;
+  ALTER TABLE assignment ADD COLUMN merge_reserved_at TEXT;
+  CREATE TABLE merge_wait_card (
+    assignment_id INTEGER PRIMARY KEY REFERENCES assignment (id),
+    state TEXT NOT NULL CHECK (state IN ('waiting_for_human_merge', 'waiting_to_merge')),
+    policy TEXT NOT NULL,
+    head_sha TEXT NOT NULL,
+    blocking_reason TEXT,
+    earliest_merge_at TEXT
+  ) STRICT;
+  `,
 ];
 
 /** Applies every migration newer than the database's version. Returns the resulting version. */
