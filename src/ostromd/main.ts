@@ -4,6 +4,7 @@
 
 import { defaultSocketPath, localApi } from "../api/server.ts";
 import { operatorControls, routeCommands } from "../commands/commands.ts";
+import { queueStatusCard } from "../github/cards.ts";
 import { renderMergeEligibilityPreview } from "../github/preview.ts";
 import { mergePass } from "../github/merge-pass.ts";
 import { GitHubApp, loadAppConfig } from "../github/app.ts";
@@ -168,7 +169,12 @@ async function run(intervalSeconds: number, deps: MainDeps): Promise<number> {
     tickIntervalSeconds: intervalSeconds,
     control: {
       ...controls,
-      extend: async (ticketId, increases) => { owned.store.extendTicketBudget(ticketId, increases); },
+      extend: async (ticketId, increases) => {
+        owned.store.extendTicketBudget(ticketId, increases);
+        queueStatusCard(owned.store, ticketId);
+        const assignment = owned.store.latestAssignment(ticketId);
+        if (assignment?.state === "running" && owned.store.getTicket(ticketId).state === "open") owned.workers.wake(assignment.id);
+      },
       preview: async () => renderMergeEligibilityPreview(owned.store, deps.gh, config.repo, config.mergePolicy),
     },
   });
@@ -307,7 +313,7 @@ export async function main(argv: readonly string[], deps: MainDeps = defaults): 
       return pass.failed.length === 0 ? 0 : 1;
     }
     if (command === "commands") {
-      const pass = await routeCommands(store, workers(), deps.gh, config.repo);
+      const pass = await routeCommands(store, workers(), deps.gh, config.repo, config.allowlist);
       for (const handled of pass.handled) deps.stdout(JSON.stringify(handled));
       for (const failure of pass.failed) {
         deps.stderr(`ostromd commands: trigger ${failure.triggerId} for ticket ${failure.ticketId} failed: ${failure.error}`);
@@ -316,7 +322,7 @@ export async function main(argv: readonly string[], deps: MainDeps = defaults): 
       return pass.failed.length === 0 ? 0 : 1;
     }
     if (command === "route") {
-      const pass = routeFollowUps(store, workers());
+      const pass = routeFollowUps(store, workers(), config.allowlist);
       for (const queued of pass.queued) deps.stdout(JSON.stringify(queued));
       for (const failure of pass.failed) {
         deps.stderr(
@@ -328,7 +334,7 @@ export async function main(argv: readonly string[], deps: MainDeps = defaults): 
     }
     if (command === "watchdog") {
       const { idleMinutes } = loadWatchdogConfig(deps.env);
-      const pass = await watchdog({ store, semon: deps.semon, idleMinutes });
+      const pass = await watchdog({ store, semon: deps.semon, idleMinutes, workers: workers() });
       if (deps.watchdogHealth !== undefined && pass.failed.length > 0) deps.watchdogHealth.error = pass.failed[0]!.error.slice(0, 240);
       const ladder = await advanceStuckLadder(store, workers());
       for (const checked of pass.checked) deps.stdout(JSON.stringify(checked));

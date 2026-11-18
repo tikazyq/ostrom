@@ -158,6 +158,58 @@ test("a paused ticket can still be stopped: by command, by closing the issue, or
   }
 });
 
+test("operator CLI resume clears a public stall on paused, open and ended tickets", async () => {
+  for (const state of ["paused", "open", "ended"]) {
+    const f = fixture();
+    const stall = f.store.recordStall({ assignmentId: f.assignmentId, semonReason: "waiting-question", detail: null }).id;
+    f.store.publishStall(stall);
+    if (state === "paused") f.store.pauseTicket(f.ticketId, "stuck turn reported by the Watchdog");
+    if (state === "ended") {
+      f.store.endAssignment(f.assignmentId);
+      f.store.endTicket(f.ticketId);
+    }
+    await operatorControls(f.store, f.workers, f.github.gh, REPO).resume(f.ticketId);
+    await f.workers.drain();
+    assert.notEqual(f.store.getStall(stall).clearedAt, null);
+    assert.equal(f.store.getTicket(f.ticketId).state, state === "ended" ? "ended" : "open");
+    assert.equal(f.runner.sessions.length, state === "ended" ? 0 : 1);
+  }
+});
+
+for (const trusted of [false, true]) {
+  for (const pause of [null, "stuck turn reported by the Watchdog", "paused by the operator", "budget reached: time"]) {
+    test(`${trusted ? "trusted" : "untrusted"} issue redirect clears stalls without overriding pause ${pause}`, async () => {
+      const f = fixture();
+      const stall = f.store.recordStall({ assignmentId: f.assignmentId, semonReason: "waiting-question", detail: null }).id;
+      f.store.publishStall(stall);
+      if (pause !== null) f.store.pauseTicket(f.ticketId, pause);
+      f.comment("redirect", "alice", "try another approach");
+      const result = await routeCommands(f.store, f.workers, f.github.gh, REPO, trusted ? ["ALICE"] : []);
+      await f.workers.drain();
+      assert.deepEqual(result.failed, []);
+      assert.equal(f.store.getStall(stall).clearedAt !== null, trusted);
+      const resumes = pause === null || trusted && pause === "stuck turn reported by the Watchdog";
+      assert.equal(f.store.getTicket(f.ticketId).state, resumes ? "open" : "paused");
+      assert.equal(f.runner.sessions.length, resumes ? 1 : 0);
+      if (!resumes) assert.equal(f.store.getTicket(f.ticketId).pauseCause, pause);
+    });
+  }
+}
+
+test("a trusted issue reply clears an ended ticket's stall without delivering work", async () => {
+  const f = fixture();
+  const stall = f.store.recordStall({ assignmentId: f.assignmentId, semonReason: "waiting-question", detail: null }).id;
+  f.store.publishStall(stall);
+  f.store.endAssignment(f.assignmentId);
+  f.store.endTicket(f.ticketId);
+  f.comment("ended-redirect", "alice", "thanks");
+  assert.deepEqual((await routeCommands(f.store, f.workers, f.github.gh, REPO)).failed, []);
+  assert.equal(f.store.getStall(stall).clearedAt, null);
+  assert.deepEqual((await routeCommands(f.store, f.workers, f.github.gh, REPO, ["alice"])).failed, []);
+  assert.notEqual(f.store.getStall(stall).clearedAt, null);
+  assert.equal(f.runner.sessions.length, 0);
+});
+
 test("a reserved stop wakes on release and completes its cleanup", async () => {
   const { store, github, workers, ticketId, assignmentId } = fixture();
   assert.equal(store.reserveAssignment(assignmentId), true);

@@ -1,6 +1,6 @@
 // The Watchdog (docs/direction.md, milestone 1 step 6): a deterministic check over native
-// Workers. It records each Semon stall episode once and leaves every judgement to the Router,
-// which sees the episode in its next batch (AGENTS.md rule 3). It never ends work.
+// Workers. Budget exhaustion pauses separately; actual stalls enter the recovery ladder.
+// It records each Semon stall episode once (AGENTS.md rule 3). It never ends work.
 //
 // Semon's `stalls` read is the one Semon call Ostrom makes:
 //   semon query stalls --idle-minutes <N> --since 1d --json
@@ -10,6 +10,8 @@
 // (`ostrom/ticket-<ticket>-<assignment>-<uuid>` for new work). A failed read is reported and never clears an episode.
 
 import { watchdogBudgetReached } from "../budget/budgets.ts";
+import { queueStatusCard } from "../github/cards.ts";
+import type { Workers } from "../worker/workers.ts";
 import type { ProcessRunner } from "../process.ts";
 import type { Store } from "../store/store.ts";
 
@@ -81,6 +83,7 @@ export interface WatchdogOptions {
   store: Store;
   semon: ProcessRunner;
   idleMinutes: number;
+  workers?: Workers;
   /** Clock used for budget evaluation; injectable for deterministic checks. */
   now?: () => Date;
 }
@@ -124,13 +127,29 @@ export async function watchdog(options: WatchdogOptions): Promise<WatchdogPass> 
       newEpisode: false,
       clearedStallId: null,
     };
+    const ticket = store.getTicket(assignment.ticketId);
+    if (ticket.state !== "open") continue;
     const budget = watchdogBudgetReached(store.ticketBudget(assignment.ticketId), now());
+    if (budget !== null) {
+      store.pauseTicketForBudget(ticket.id, budget);
+      store.enqueueTurn({
+        assignmentId: assignment.id,
+        deliveryKey: `budget-pause-${ticket.id}-${budget}-${assignment.turns}`,
+        kind: "budget_pause",
+        prompt: "The ticket budget has been reached. Push your work in progress, then stop and wait for Ostrom to resume you.",
+      });
+      options.workers?.cancel(assignment.id);
+      options.workers?.wake(assignment.id);
+      queueStatusCard(store, ticket.id, now());
+      pass.checked.push(checked);
+      continue;
+    }
     const repeatedError = assignment.consecutiveErrors >= 2;
-    if (semonReason !== null || budget !== null || repeatedError) {
+    if (semonReason !== null || repeatedError) {
       const question = matched?.openQuestion ?? null;
       const detail =
         question === null ? assignment.lastError : question.length > DETAIL_CHARS ? `${question.slice(0, DETAIL_CHARS)}…` : question;
-      const cause = budget === null ? repeatedError ? "same turn error twice" : semonReason! : `budget reached: ${budget}`;
+      const cause = repeatedError ? "same turn error twice" : semonReason!;
       const recorded = store.recordStall({ assignmentId: assignment.id, semonReason, detail, cause });
       checked.stallId = recorded.id;
       checked.newEpisode = !recorded.duplicate;

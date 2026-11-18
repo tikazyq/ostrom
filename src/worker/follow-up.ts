@@ -18,18 +18,17 @@ export interface RoutePass {
   failed: { triggerId: number; ticketId: number; error: string }[];
 }
 
-export function routeFollowUps(store: Store, workers: Workers): RoutePass {
+export function routeFollowUps(store: Store, workers: Workers, allowlist: readonly string[] = []): RoutePass {
   const pass: RoutePass = { queued: [], failed: [] };
   const pending = store.pendingDeliveries();
   const grouped = new Set<string>();
   for (const delivery of pending) {
     const { trigger, ticketId, assignmentId } = delivery;
-    const cleared = assignmentId === null ? null : store.clearStallForHumanReply(assignmentId);
-    // Only the public stuck step pauses the ticket; a silent recovery leaves it open.
-    if (cleared !== null && store.getStall(cleared).publicAt !== null) {
-      store.resumeTicket(ticketId);
+    if (allowlist.some((actor) => actor.toLowerCase() === trigger.actor.toLowerCase())) {
+      store.clearTicketStallsForHumanReply(ticketId);
       queueStatusCard(store, ticketId);
     }
+    if (store.getTicket(ticketId).state !== "open") continue;
     if (assignmentId === null) {
       pass.failed.push({ triggerId: trigger.id, ticketId, error: `ticket ${ticketId} has no running Worker` });
       continue;

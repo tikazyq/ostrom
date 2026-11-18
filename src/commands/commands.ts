@@ -30,8 +30,10 @@ export function operatorControls(store: Store, workers: Workers, gh: GhRunner, r
       workers.deliver(assignment.id, `operator-pause-${ticketId}`, "Pause this ticket after the current work finishes. Push your work in progress, then stop and wait for Ostrom to resume you.", () => {});
     },
     async resume(ticketId) {
+      store.clearTicketStallsForHumanReply(ticketId);
+      if (store.getTicket(ticketId).state === "ended") return;
       const assignment = running(ticketId);
-      store.resumeTicket(ticketId);
+      if (store.getTicket(ticketId).state === "paused") store.resumeTicket(ticketId);
       queueStatusCard(store, ticketId);
       workers.wake(assignment.id);
       workers.deliver(assignment.id, `operator-resume-${ticketId}`, "This ticket has resumed. Continue your work.", () => {});
@@ -66,6 +68,7 @@ export async function routeCommands(
   workers: Workers,
   gh: GhRunner,
   repo: string,
+  allowlist: readonly string[] = [],
 ): Promise<CommandPass> {
   const pass: CommandPass = { handled: [], failed: [] };
   const permissions = new Map<string, Promise<boolean>>();
@@ -88,6 +91,12 @@ export async function routeCommands(
         store.recordCommandReceipt(pending.trigger.id, pending.ticketId, "forbidden", false);
         enqueueReaction(store, pending.trigger, "confused");
         pass.handled.push({ triggerId: pending.trigger.id, ticketId: pending.ticketId, command, allowed });
+        continue;
+      }
+      if (store.getTicket(pending.ticketId).state === "ended") {
+        if (allowlist.some((actor) => actor.toLowerCase() === pending.trigger.actor.toLowerCase())) {
+          store.clearTicketStallsForHumanReply(pending.ticketId);
+        }
         continue;
       }
       if (command === "close_pull_request") {
@@ -124,6 +133,11 @@ export async function routeCommands(
         store.recordCommandReceipt(pending.trigger.id, pending.ticketId, "close_issue", true);
         if (queued) workers.cancel(assignment.id);
       } else if (command === "redirect") {
+        if (allowlist.some((actor) => actor.toLowerCase() === pending.trigger.actor.toLowerCase())) {
+          store.clearTicketStallsForHumanReply(pending.ticketId);
+          queueStatusCard(store, pending.ticketId);
+        }
+        if (store.getTicket(pending.ticketId).state !== "open") continue;
         const assignment = store.latestAssignment(pending.ticketId);
         if (assignment?.state !== "running") throw new Error(`ticket ${pending.ticketId} has no running Worker`);
         const instruction = await collaborator(gh, repo, pending.trigger.actor, permissions);
@@ -157,7 +171,10 @@ export async function routeCommands(
       } else if (command === "resume") {
         const assignment = store.latestAssignment(pending.ticketId);
         if (assignment?.state !== "running") throw new Error(`ticket ${pending.ticketId} has no running Worker`);
-        store.resumeTicket(pending.ticketId);
+        if (allowlist.some((actor) => actor.toLowerCase() === pending.trigger.actor.toLowerCase())) {
+          store.clearTicketStallsForHumanReply(pending.ticketId);
+        }
+        if (store.getTicket(pending.ticketId).state === "paused") store.resumeTicket(pending.ticketId);
         workers.wake(assignment.id);
         workers.deliver(assignment.id, `resume-${pending.trigger.id}-${assignment.id}`, "This ticket has resumed. Continue your work.", () => {});
         store.recordCommandReceipt(pending.trigger.id, pending.ticketId, "resume", true);

@@ -279,9 +279,47 @@ test("a ticket ended while paused at public Stuck is owed no follow-up", () => {
   store.endTicket(ticketId);
   trigger(pr);
 
+  assert.equal(store.pendingDeliveries().length, 1, "the reply can clear an ended ticket's public stall");
+  assert.deepEqual(routeFollowUps(store, workers, ["alice"]), { queued: [], failed: [] });
+  assert.notEqual(store.getStall(stall.id).clearedAt, null);
   assert.deepEqual(store.pendingDeliveries(), []);
-  assert.deepEqual(routeFollowUps(store, workers), { queued: [], failed: [] });
 });
+
+test("only an allowlisted review clears an ended ticket's public stall without work", () => {
+  const f = fixture();
+  const stall = f.store.recordStall({ assignmentId: f.assignmentId, semonReason: "waiting-question", detail: null }).id;
+  f.store.publishStall(stall);
+  f.store.endAssignment(f.assignmentId);
+  f.store.endTicket(f.ticketId);
+  f.trigger(f.pr, "pull_request_review");
+  assert.deepEqual(routeFollowUps(f.store, f.workers), { queued: [], failed: [] });
+  assert.equal(f.store.getStall(stall).clearedAt, null);
+  assert.deepEqual(routeFollowUps(f.store, f.workers, ["alice"]), { queued: [], failed: [] });
+  assert.notEqual(f.store.getStall(stall).clearedAt, null);
+  assert.equal(f.runner.sessions.length, 0);
+});
+
+for (const kind of ["pull_request_review", "pull_request_review_comment"]) {
+  for (const trusted of [false, true]) {
+    for (const pause of [null, "stuck turn reported by the Watchdog", "paused by the operator", "budget reached: time"]) {
+      test(`${trusted ? "trusted" : "untrusted"} ${kind} clears only trusted stalls and preserves pause ${pause}`, async () => {
+        const f = fixture();
+        const stall = f.store.recordStall({ assignmentId: f.assignmentId, semonReason: "waiting-question", detail: null }).id;
+        f.store.publishStall(stall);
+        if (pause !== null) f.store.pauseTicket(f.ticketId, pause);
+        f.trigger(f.pr, kind);
+        const result = routeFollowUps(f.store, f.workers, trusted ? ["ALICE"] : []);
+        await f.workers.drain();
+        assert.deepEqual(result.failed, []);
+        assert.equal(f.store.getStall(stall).clearedAt !== null, trusted);
+        const resumes = pause === null || trusted && pause === "stuck turn reported by the Watchdog";
+        assert.equal(f.store.getTicket(f.ticketId).state, resumes ? "open" : "paused");
+        assert.equal(f.runner.sessions.length, resumes ? 1 : 0);
+        if (!resumes) assert.equal(f.store.getTicket(f.ticketId).pauseCause, pause);
+      });
+    }
+  }
+}
 
 test("an open ticket with no running Worker holds its follow-up and reports it", () => {
   const { store, runner, workers, pr, trigger, ticketId, assignmentId } = fixture();

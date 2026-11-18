@@ -82,7 +82,8 @@ The guarantee: no ticket goes quiet. Every stall ends in automatic recovery or i
 specific, honest reply.
 
 1. **Detect (silent).** The Watchdog spots no progress for N minutes, a repeated error loop, a
-   crash, an exhausted budget, or an unanswered question.
+   crash, or an unanswered question. Budget exhaustion pauses the ticket separately; it never starts
+   the stuck ladder.
 2. **Recover (silent).** Ostrom resumes the same session, then retries, then moves up one tier, with
    at most two attempts. The card shows "recovering".
 3. **Operator.** The stall appears in the operator's status view first. The operator can pause
@@ -154,8 +155,12 @@ estimated cost, and model escalations. Ostrom chooses each ticket's model and ea
 within the operator's limits ([model-selection.md](model-selection.md)).
 
 - At 80% of any limit, the status card and dashboard show a warning.
-- At a limit, the Worker **pauses**. It is not killed: it pushes its work in progress, and the stuck
-  ladder starts with the cause "budget reached". The operator can `ostrom extend` it or stop it.
+- At a limit, the ticket **pauses** with `budget reached: <limit>` on its status card. Ostrom queues
+  cleanup to push work in progress and wait; exhaustion never enters the stuck ladder.
+- `ostrom extend` reopens a budget pause only when every limit is clear after the increase. Raising
+  the wrong limit or adding too little leaves it paused. Extensions never reopen an operator pause.
+- Wall-clock time keeps counting from ticket creation, including time spent waiting for review or
+  paused. An extension must cover that elapsed time; it does not reset the clock.
 - Subscription plans have no per-call price, so Ostrom always enforces tokens and time, and treats
   cost as an estimate.
 

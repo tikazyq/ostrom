@@ -8,7 +8,9 @@ import { DatabaseSync } from "node:sqlite";
 import { Store } from "../store/store.ts";
 import { routeCandidates, type Batch } from "../router/router.ts";
 import { FakeRunner } from "../worker/fake-runner.ts";
-import type { Workers } from "../worker/workers.ts";
+import { Workers } from "../worker/workers.ts";
+import { watchdog } from "../watchdog/watchdog.ts";
+import { advanceStuckLadder } from "../watchdog/stuck.ts";
 import { ghHttpStatus, mergePass, type MergePassOptions } from "./merge-pass.ts";
 import type { MergePolicy } from "./merge-policy.ts";
 import type { GhRunner } from "./gh.ts";
@@ -167,6 +169,41 @@ test("one SHA-guarded squash PUT confirms an Ostrom merge and ends the ticket on
   assert.deepEqual([attempt!.state, attempt!.error, attempt!.nextRetryAt], ["confirmed", null, null]);
   done(f, "ostrom");
   assert.match(f.store.statusCardBody(f.issue)!, /Ostrom: Done/);
+});
+
+test("pilot: review wait reaches time budget, extension permits merge without a human comment", async () => {
+  const f = fixture({ strategy: "approvals", approvals: 1, approvers: [] });
+  try {
+    f.store.setTicketBudget(f.ticket, { timeMinutes: 30, idleMinutes: 30, turns: 80, tokens: 1_000_000, escalations: 0 });
+    f.remote.reviews = [];
+    await ready(f);
+    f.advance(30 * MINUTE);
+    const runner = new FakeRunner();
+    const workers = new Workers({ store: f.store,
+      config: { repo: "/repo", base: "main", worktrees: "/wt", harness: "claude", model: "m", machine: "h" },
+      runners: { claude: runner, codex: runner } });
+    const result = await watchdog({ store: f.store, workers, idleMinutes: 20, now: f.now,
+      semon: async () => ({ code: 0, stdout: JSON.stringify({ idle_minutes: 20, stalls: [] }), stderr: "" }) });
+    await workers.drain();
+    assert.deepEqual(result.failed, []);
+    assert.equal(f.store.getTicket(f.ticket).pauseCause, "budget reached: time");
+    assert.match(f.store.statusCardBody(f.issue)!, /Ostrom: Paused/);
+    assert.deepEqual(await advanceStuckLadder(f.store, workers), { recovered: [], published: [] });
+    await mergePass(f.options());
+    assert.equal(f.puts.length, 0);
+    f.store.extendTicketBudget(f.ticket, { timeMinutes: 60 });
+    assert.equal(f.store.getTicket(f.ticket).state, "open");
+    assert.deepEqual(f.store.stuckTickets(), []);
+    f.remote.reviews = [review()];
+    await mergePass(f.options());
+    f.advance(11 * MINUTE);
+    const merged = await mergePass(f.options());
+    assert.deepEqual(merged.failed, []);
+    assert.equal(f.puts.length, 1);
+    done(f, "ostrom");
+  } finally {
+    f.store.close();
+  }
 });
 
 test("human policy leaves a waiting_for_human_merge card and never sends PUT", async () => {

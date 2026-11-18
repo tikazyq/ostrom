@@ -2,7 +2,7 @@
 // See docs/direction.md, "Data model". Only the operations milestone 1 needs live here.
 
 import { DatabaseSync, type SQLInputValue } from "node:sqlite";
-import { budgetUsage, budgetWarning } from "../budget/budgets.ts";
+import { budgetReached, budgetUsage, budgetWarning } from "../budget/budgets.ts";
 import type { BudgetDefaults } from "../budget/budgets.ts";
 import { migrate } from "./migrations.ts";
 
@@ -788,12 +788,17 @@ export class Store {
     if (ticket.state !== "open" && ticket.state !== "paused") {
       throw new IllegalTransition(`ticket ${ticketId} is ${ticket.state}; it cannot be extended`);
     }
-    this.#run(
-      `UPDATE ticket SET budget_time_minutes = budget_time_minutes + ?, budget_turns = budget_turns + ?,
-       budget_tokens = budget_tokens + ?, state = CASE WHEN pause_cause LIKE 'budget reached:%' THEN 'open' ELSE state END,
-       pause_cause = CASE WHEN pause_cause LIKE 'budget reached:%' THEN NULL ELSE pause_cause END WHERE id = ?`,
-      increases.timeMinutes ?? 0, increases.turns ?? 0, increases.tokens ?? 0, ticketId,
-    );
+    this.#transaction(() => {
+      this.#run(
+        `UPDATE ticket SET budget_time_minutes = budget_time_minutes + ?, budget_turns = budget_turns + ?,
+         budget_tokens = budget_tokens + ? WHERE id = ?`,
+        increases.timeMinutes ?? 0, increases.turns ?? 0, increases.tokens ?? 0, ticketId,
+      );
+      if (ticket.state === "paused" && ticket.pauseCause?.startsWith("budget reached: ") &&
+          budgetReached(this.ticketBudget(ticketId), this.#now()) === null) {
+        this.resumeTicket(ticketId);
+      }
+    });
   }
 
   /** Returns stored limits and usage accumulated from every assignment on this ticket. */
@@ -1076,9 +1081,10 @@ export class Store {
       `SELECT t.*, ticket.id AS p_ticket_id
        FROM "trigger" AS t
        JOIN subscription ON subscription.thread_id = t.thread_id
-       JOIN ticket ON ticket.id = subscription.ticket_id AND ticket.state IN ('open', 'paused')
+       JOIN ticket ON ticket.id = subscription.ticket_id AND (ticket.state IN ('open', 'paused') OR EXISTS (
+         SELECT 1 FROM stall JOIN assignment ON assignment.id = stall.assignment_id
+         WHERE assignment.ticket_id = ticket.id AND stall.public_at IS NOT NULL AND stall.cleared_at IS NULL))
        WHERE t.kind IN ('issue_comment', 'issue_state')
-         AND (ticket.state = 'open' OR t.kind = 'issue_state' OR lower(ltrim(COALESCE(t.body, ''))) GLOB '@ostrom *')
          AND NOT EXISTS (SELECT 1 FROM decision_trigger WHERE trigger_id = t.id)
          AND NOT EXISTS (SELECT 1 FROM delivery WHERE delivery.trigger_id = t.id)
          AND NOT EXISTS (
@@ -1110,7 +1116,7 @@ export class Store {
        FROM "trigger" AS t
        JOIN subscription ON subscription.thread_id = t.thread_id
        JOIN ticket ON ticket.id = subscription.ticket_id AND (
-         ticket.state = 'open' OR ticket.state = 'paused' AND EXISTS (
+         ticket.state = 'open' OR EXISTS (
            SELECT 1 FROM stall JOIN assignment AS stalled ON stalled.id = stall.assignment_id
            WHERE stalled.ticket_id = ticket.id AND stall.public_at IS NOT NULL AND stall.cleared_at IS NULL))
        LEFT JOIN assignment AS worker ON worker.id = (
@@ -1499,6 +1505,21 @@ export class Store {
     );
     if (row === undefined) throw new IllegalTransition(`stall ${stallId} cannot be published`);
     return toStall(row);
+  }
+
+  /** Trusted replies clear all ticket episodes, resuming only a pause imposed by the stuck ladder. */
+  clearTicketStallsForHumanReply(ticketId: number): void {
+    this.#transaction(() => {
+      const assignments = this.#all(
+        `SELECT DISTINCT assignment.id FROM assignment JOIN stall ON stall.assignment_id = assignment.id
+         WHERE assignment.ticket_id = ? AND stall.cleared_at IS NULL`, ticketId,
+      );
+      for (const row of assignments) this.clearStallForHumanReply(row["id"] as number);
+      const ticket = this.getTicket(ticketId);
+      if (assignments.length > 0 && ticket.state === "paused" && ticket.pauseCause === "stuck turn reported by the Watchdog") {
+        this.resumeTicket(ticketId);
+      }
+    });
   }
 
   /** A human reply clears the open stuck state and restarts the Worker recovery ladder. */

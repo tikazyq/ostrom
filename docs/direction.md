@@ -125,8 +125,11 @@ noted.
 5. **Commands.** One command table in code for redirect, `@ostrom pause`/`resume`/`stop`, and
    closing the issue or PR, with permissions and reactions.
 6. **Budgets and the stuck ladder.** Time, idle time, turns and tokens, with pause at a limit and
-   `ostrom extend`. The Watchdog feeds the ladder (detect, recover, then the public stuck reply from
-   the fixed template).
+   `ostrom extend`. Exhaustion queues budget cleanup and pauses with `budget reached: <limit>`;
+   it never feeds the stuck ladder. An extension reopens only a budget pause with every limit clear,
+   preserving operator pauses and the wall-clock time counted since ticket creation. The Watchdog
+   feeds actual stalls into the ladder (detect, recover, then the public stuck reply from the fixed
+   template).
 7. **The `ostrom` CLI.** `status`, `tickets`, `show`, `pause`/`resume`/`stop`, `extend` and
    `preview` over `ostromd`'s local API, all with `--json`. `ostromd` keeps only `run`; a systemd
    user unit runs it, with logs in journald.

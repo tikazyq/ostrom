@@ -1,7 +1,7 @@
 // The scripted stall (docs/direction.md, milestone 1 pass criterion) only seeds a throwaway store.
 // The already-running ostromd dispatches it normally, so it owns and can cancel the hung Worker
 // turn. The ticket takes its budget from the same environment as a Router-accepted one; a short
-// OSTROM_BUDGET_IDLE_MIN makes the Watchdog flag the hung turn (see docs/watchdog.md).
+// OSTROM_BUDGET_IDLE_MIN now exercises a budget pause, not the stuck ladder (see docs/watchdog.md).
 //
 //   node src/watchdog/scripted-stall.ts <issue-number>
 //

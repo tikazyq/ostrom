@@ -4,6 +4,8 @@ import { afterEach, test } from "node:test";
 
 import type { ProcessRunner } from "../process.ts";
 import { Store } from "../store/store.ts";
+import { FakeRunner } from "../worker/fake-runner.ts";
+import { Workers } from "../worker/workers.ts";
 import { parseSemonStalls, semonStallsArgs, watchdog, type WatchdogOptions } from "./watchdog.ts";
 
 const REPO = "onsager-ai/ostrom";
@@ -112,7 +114,64 @@ test("the idle budget flags a turn that has run past it, never a Worker waiting 
   assert.equal((await watchdog(later)).checked[0]!.stallId, null, "45 minutes waiting for review is not idle");
   s.store.beginTurn(a.assignmentId);
   const hung = await watchdog(later);
-  assert.equal(s.store.getStall(hung.checked[0]!.stallId!).cause, "budget reached: idle");
+  assert.equal(hung.checked[0]!.stallId, null);
+  assert.equal(s.store.getTicket(a.ticketId).pauseCause, "budget reached: idle");
+  assert.deepEqual(s.store.unansweredStalls(), []);
+  assert.equal(s.store.unfinishedTurns(a.assignmentId)[0]!.kind, "budget_pause");
+});
+
+test("time exhaustion while awaiting review pauses without entering the stall ladder and shows on the card", async () => {
+  const s = setup();
+  const a = s.startWorker(1);
+  // A simultaneous Semon signal must not turn exhaustion into a stall.
+  s.setSemon([semonStall(a.branch)]);
+  const later = new Date(NOW.getTime() + 480 * 60_000);
+  const result = await watchdog({ ...s.options(), now: () => later });
+  assert.equal(result.checked[0]!.stallId, null);
+  assert.equal(result.checked[0]!.newEpisode, false);
+  assert.equal(s.store.getTicket(a.ticketId).state, "paused");
+  assert.equal(s.store.getTicket(a.ticketId).pauseCause, "budget reached: time");
+  assert.deepEqual(s.store.unansweredStalls(), []);
+  assert.equal(s.store.unfinishedTurns(a.assignmentId).length, 1);
+  const card = s.store.statusCardBody(s.store.ticketContext(a.ticketId).thread.id)!;
+  assert.match(card, /Ostrom: Paused/);
+  assert.match(card, /Paused: budget reached: time/);
+  await watchdog({ ...s.options(), now: () => later });
+  assert.equal(s.store.unfinishedTurns(a.assignmentId).length, 1);
+});
+
+test("budget exhaustion cancels an active turn and runs budget cleanup once", async () => {
+  const s = setup();
+  const a = s.startWorker(1);
+  const runner = new FakeRunner();
+  runner.hold = true;
+  const workers = new Workers({ store: s.store,
+    config: { repo: "/repo", base: "main", worktrees: "/wt", harness: "codex", model: "gpt-6-luna", machine: "host" },
+    runners: { claude: runner, codex: runner } });
+  workers.deliver(a.assignmentId, "working", "work", () => {});
+  await new Promise((resolve) => setImmediate(resolve));
+  runner.sessions[0]!.auto = true;
+  const later = new Date(NOW.getTime() + 45 * 60_000);
+  await watchdog({ ...s.options(), workers, now: () => later });
+  await workers.drain();
+  assert.equal(runner.sessions[0]!.prompts.length, 2);
+  assert.match(runner.sessions[0]!.prompts[1]!, /budget has been reached/);
+  assert.equal(s.store.getTicket(a.ticketId).pauseCause, "budget reached: idle");
+  assert.deepEqual(s.store.unansweredStalls(), []);
+  await watchdog({ ...s.options(), workers, now: () => later });
+  await workers.drain();
+  assert.equal(runner.sessions[0]!.prompts.length, 2);
+});
+
+test("budget exhaustion and stale signals leave an operator pause unchanged", async () => {
+  const s = setup();
+  const a = s.startWorker(1);
+  s.store.pauseTicket(a.ticketId, "paused by the operator");
+  s.setSemon([semonStall(a.branch)]);
+  await watchdog({ ...s.options(), now: () => new Date(NOW.getTime() + 480 * 60_000) });
+  assert.equal(s.store.getTicket(a.ticketId).pauseCause, "paused by the operator");
+  assert.deepEqual(s.store.unansweredStalls(), []);
+  assert.deepEqual(s.store.unfinishedTurns(a.assignmentId), []);
 });
 
 test("the turn budget never flags the last allowed turn while it runs", async () => {

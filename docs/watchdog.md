@@ -1,6 +1,7 @@
 # The Watchdog and scripted stall
 
-Milestone 1 step 6 (`docs/direction.md`). `ostromd watchdog` checks every running native Worker once; `ostromd tick` runs it after follow-up routing and before the Router pass.
+Milestone 1 step 6 (`docs/direction.md`). `ostromd dev watchdog` checks running native Workers once;
+`ostromd tick` runs it after follow-up routing and before the Router pass.
 
 ## Signal
 
@@ -10,30 +11,48 @@ The Watchdog makes one deterministic Semon read:
 semon query stalls --idle-minutes <OSTROM_STALL_MINUTES> --since 1d --json
 ```
 
-Semon reports native sessions waiting on a question, whose process has gone, or which produce no output. A Worker is matched by its worktree branch, `ostrom/ticket-<ticket>-<assignment>`. A failed Semon read makes the pass fail and does not clear an existing episode.
+Semon reports native sessions waiting on a question, whose process has gone, or which produce no
+output. A Worker is matched by its worktree branch. A failed Semon read makes the pass fail and does
+not clear an existing episode.
 
-Workers are driven turn by turn, so Semon's verdicts are read against the turn. Between turns no process runs and a Worker that waits for review produces no output, so only an unanswered question counts. During a turn, a verdict counts only once the turn itself has run for `OSTROM_STALL_MINUTES`, because Semon's idle clock starts at the session's last write, which may predate the turn.
+Workers are driven turn by turn. Between turns no process runs and a Worker waiting for review
+produces no output, so only an unanswered question counts. During a turn, a verdict counts only once
+the turn itself has run for `OSTROM_STALL_MINUTES`, because Semon's idle clock may predate the turn.
+Two consecutive turn errors also count as a stall.
 
-## Episodes and the Router
+## Budgets are pauses
 
-A stall opens one `stall` row and remains one episode until Semon no longer reports it. The Router sees each unanswered, uncleared episode once and answers `wait` or `stop`; a stop needs a reply and ends the assignment only after that Router answer.
+Time or idle exhaustion pauses an open ticket with `budget reached: time` or `budget reached: idle`,
+queues the budget cleanup turn to push work in progress and wait, and cancels an active turn. Turn,
+token and escalation limits are evaluated after a turn finishes. Every budget pause appears on the
+status card. Exhaustion never opens a stall episode or starts recovery/public escalation, even if
+Semon reports a stall at the same time. The Watchdog leaves paused tickets alone.
+
+`ostrom extend` reopens only a budget pause whose limits are all clear after the increase. An
+insufficient extension, an extension of the wrong limit, or a different exhausted limit leaves it
+paused. Operator pauses stay paused. Wall-clock accounting still starts at ticket creation and
+includes review waits and pauses; extending does not reset it. A review wait that reaches its time
+budget can therefore pause, receive a sufficient extension, and merge without a human comment.
+
+## Episodes and recovery
+
+A stall opens one `stall` row. The deterministic ladder attempts recovery on the same session twice,
+then queues one public stuck reply and pauses with `stuck turn reported by the Watchdog`. Public
+stalls remain until a trusted reply or operator resume clears them; a quiet Semon read alone cannot
+clear a public stall. Paused tickets do not advance the ladder.
+
+Operator resume and comments or PR reviews from `OSTROM_ALLOWLIST` clear the ticket's open stall
+records and reset recovery attempts. A reply resumes only a pause imposed by the stuck ladder;
+operator and budget pauses remain. Already-open tickets do not undergo another resume transition.
+Ended tickets can have their stale stalls cleared without delivering work. Replies from authors
+outside the allowlist never clear stalls or resume pauses.
 
 ## Scripted stall
 
-Semon reports a completed Codex exec turn as `ended`, not `waiting-question`, even when its last
-Worker message says it is waiting for an answer. Nor does a hung command look idle to Semon: Codex
-polls a long-running command about once a minute, so the session keeps writing and Semon reports it
-working. The exercise therefore hangs an *open* turn (`sleep 3600`) under a short idle budget. Idle
-time is how long the running turn has gone without finishing; between turns a Worker waits on people
-and is not idle. The budget flags the hung turn as `budget reached: idle`. Each ladder step cancels
-the turn and starts a recovery turn, so each of the two recoveries and the public reply comes one
-idle budget after the last, as long as the Worker keeps hanging.
-
-Use a throwaway database. Start `ostromd run` against that store first; the script only seeds an
-accepted decision, whose ticket takes its budget from the environment as a Router-accepted one does.
-The daemon dispatches the ticket in its normal `route-candidates` pass and owns the turn it later
-cancels. Its public stuck reply is queued in the outbox and posts to the supplied issue when the
-daemon reaches its `send` pass.
+The old hung-turn exercise used a short idle budget to drive the stuck ladder. That exercises a
+budget pause now, not a stall: idle time measures how long a running turn has gone without finishing,
+and reaching it queues cleanup once. To verify that budget path with a throwaway database, start the
+daemon first and then seed the ticket:
 
 ```sh
 export OSTROM_REPO=onsager-ai/ostrom OSTROM_ALLOWLIST=<login> OSTROM_DB=/tmp/ostrom-stall/ostrom.sqlite
@@ -43,7 +62,7 @@ node src/ostromd/main.ts run --interval 15
 OSTROM_BUDGET_IDLE_MIN=3 node src/watchdog/scripted-stall.ts <issue-number>
 ```
 
-The seeded Worker brief runs `sleep 3600` again after every interruption and never commits or opens a
-pull request, so the ladder's recovery prompts cannot end the stall; it then asks which colour to
-use, red or blue. Stop the
-daemon and remove its scratch worktree and branch after the exercise.
+The daemon owns the Worker turn and cancellation. Expect a budget pause and no public stuck reply.
+The deterministic stall-ladder tests inject actual stall episodes separately. The seed brief repeats
+`sleep 3600` after interruption, so cleanup may itself hang; stop the daemon and remove the scratch
+worktree and branch after the exercise. Never use a live daemon store for this throwaway exercise.
