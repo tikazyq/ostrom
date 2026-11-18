@@ -2,8 +2,8 @@
 // session. A submitted review and all of its inline comments are one logical follow-up: one turn,
 // one acknowledgement reaction, and one summary reply after the Worker completes.
 
+import { parseComment } from "../commands/parser.ts";
 import { queueStatusCard } from "../github/cards.ts";
-import { renderReviewReply } from "../github/review-reply.ts";
 import type { Store, Thread, Trigger } from "../store/store.ts";
 import type { Workers } from "./workers.ts";
 
@@ -24,67 +24,40 @@ export function routeFollowUps(store: Store, workers: Workers): RoutePass {
   const grouped = new Set<string>();
   for (const delivery of pending) {
     const { trigger, ticketId, assignmentId } = delivery;
-    const cleared = assignmentId === null ? null : store.clearStallForHumanReply(assignmentId);
-    // Only the public stuck step pauses the ticket; a silent recovery leaves it open.
-    if (cleared !== null && store.getStall(cleared).publicAt !== null) {
-      store.resumeTicket(ticketId);
-      queueStatusCard(store, ticketId);
-    }
+    if (trigger.kind === "issue_state" || (trigger.kind === "issue_comment" && parseComment(trigger.body ?? "").kind === "command")) continue;
     if (assignmentId === null) {
       pass.failed.push({ triggerId: trigger.id, ticketId, error: `ticket ${ticketId} has no running Worker` });
       continue;
     }
-    if (trigger.reviewId !== undefined) {
-      const key = `${ticketId}:${assignmentId}:${trigger.reviewId}`;
-      if (grouped.has(key)) continue;
-      grouped.add(key);
-      const review = pending.filter((item) =>
-        item.ticketId === ticketId && item.assignmentId === assignmentId && item.trigger.reviewId === trigger.reviewId,
+    const reviewId = trigger.reviewId;
+    const key = reviewId === undefined ? `${trigger.id}:${assignmentId}` : `review-${ticketId}:${assignmentId}:${reviewId}`;
+    if (grouped.has(key)) continue;
+    grouped.add(key);
+    const triggers = reviewId === undefined ? [trigger] : pending.filter((item) =>
+      item.ticketId === ticketId && item.assignmentId === assignmentId && item.trigger.reviewId === reviewId,
+    ).map((item) => item.trigger);
+    if (reviewId !== undefined && !triggers.some((item) => item.kind === "pull_request_review")) continue;
+    const thread = store.getThread(trigger.threadId);
+    const added = store.atomic(() => {
+      const queued = workers.deliver(
+        assignmentId, key,
+        reviewId === undefined ? followUpMessage(ticketId, trigger, thread) : reviewFollowUpMessage(ticketId, thread, triggers),
+        { kind: "work", effect: {
+          kind: "delivery", triggerIds: triggers.map((item) => item.id), reaction: "received",
+          ...(reviewId === undefined ? {} : { review: { threadId: thread.id, reviewId } }),
+        } },
       );
-      if (!review.some((item) => item.trigger.kind === "pull_request_review")) continue;
-      const added = workers.deliver(
-        assignmentId,
-        `review-${key}`,
-        reviewFollowUpMessage(ticketId, store.getThread(trigger.threadId), review.map((item) => item.trigger)),
-        (turnId) => {
-          store.recordReviewDelivery(review.map((item) => item.trigger.id), assignmentId, turnId);
-          for (const item of review) enqueueReceivedReaction(store, item.trigger);
-        },
-        (result) => {
-          store.enqueueReply({
-            id: `review-${assignmentId}-${trigger.reviewId}`,
-            threadId: trigger.threadId,
-            body: renderReviewReply(result.text),
-          });
-        },
-      );
-      if (added) pass.queued.push({ triggerId: trigger.id, ticketId, assignmentId });
-      continue;
-    }
-    const added = workers.deliver(
-      assignmentId,
-      `${trigger.id}:${assignmentId}`,
-      followUpMessage(ticketId, trigger, store.getThread(trigger.threadId)),
-      (turnId) => {
-        store.recordDelivery(trigger.id, assignmentId, turnId);
-        enqueueReceivedReaction(store, trigger);
-      },
-    );
+      const cleared = store.clearStallForHumanReply(assignmentId);
+      // Only the public stuck step pauses the ticket; a silent recovery leaves it open.
+      if (cleared !== null && store.getStall(cleared).publicAt !== null) {
+        store.resumeTicket(ticketId);
+        queueStatusCard(store, ticketId);
+      }
+      return queued;
+    });
     if (added) pass.queued.push({ triggerId: trigger.id, ticketId, assignmentId });
   }
   return pass;
-}
-
-function enqueueReceivedReaction(store: Store, trigger: Trigger): void {
-  if (trigger.kind === "pull_request_review") return;
-  store.enqueueReply({
-    id: `received-${trigger.id}`,
-    threadId: trigger.threadId,
-    body: "",
-    kind: "reaction",
-    target: trigger.url,
-    reaction: "eyes",
-  });
 }
 
 const KIND_NOUNS: Record<string, string> = {

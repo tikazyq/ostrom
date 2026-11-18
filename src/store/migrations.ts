@@ -437,6 +437,27 @@ export const migrations: readonly string[] = [
   ) STRICT;
   CREATE INDEX merge_candidate_assignment ON merge_candidate (assignment_id);
   `,
+
+  // 24: Worker work and merge inhibition survive a daemon restart.
+  `
+  ALTER TABLE ticket ADD COLUMN stop_requested_at TEXT;
+  ALTER TABLE assignment ADD COLUMN merge_reserved_at TEXT;
+  ALTER TABLE merge_candidate ADD COLUMN wait_state TEXT
+    CHECK (wait_state IN ('waiting-for-human-merge', 'waiting-to-merge'));
+  CREATE INDEX merge_candidate_ready_reply ON merge_candidate (ready_reply_id);
+
+  CREATE TABLE worker_turn (
+    id            INTEGER PRIMARY KEY,
+    assignment_id INTEGER NOT NULL REFERENCES assignment (id),
+    delivery_key  TEXT NOT NULL,
+    prompt        TEXT NOT NULL,
+    kind          TEXT NOT NULL CHECK (kind IN ('work', 'control', 'stop', 'recovery')),
+    effect        TEXT,
+    state         TEXT NOT NULL DEFAULT 'queued' CHECK (state IN ('queued', 'running', 'finished')),
+    UNIQUE (assignment_id, delivery_key)
+  ) STRICT;
+  CREATE INDEX worker_turn_pending ON worker_turn (assignment_id, id) WHERE state <> 'finished';
+  `,
 ];
 
 /** Applies every migration newer than the database's version. Returns the resulting version. */

@@ -19,6 +19,18 @@ for (const state of ["working", "recovering", "paused", "stuck", "done", "stoppe
   });
 }
 
+test("status card snapshot: waiting for a human merge", async () => {
+  const state = "waiting-for-human-merge";
+  assert.equal(renderStatusCard({ ...base, state, mergeWait: { policy: "human", headSha: "abc123" } }), await snapshot(state));
+});
+
+test("status card snapshot: waiting to merge", async () => {
+  const state = "waiting-to-merge";
+  assert.equal(renderStatusCard({
+    ...base, state, mergeWait: { policy: "unattended", headSha: "abc123", quietDeadline: "2026-11-09T12:28:00Z" },
+  }), await snapshot(state));
+});
+
 test("status card snapshot: budget warning and budget pause", async () => {
   assert.equal(
     renderStatusCard({ ...base, state: "paused", budgetWarning: "tokens", pauseCause: "budget reached: tokens" }),

@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { queueStatusCard } from "../github/cards.ts";
 import { ghGet, type GhRunner } from "../github/gh.ts";
 import type { Store, Trigger } from "../store/store.ts";
@@ -12,7 +13,11 @@ export interface CommandPass {
 }
 
 /** Operator controls share the Worker delivery and durable state transitions used by GitHub commands. */
-export function operatorControls(store: Store, workers: Workers, gh: GhRunner, repo: string): {
+const PAUSE_PROMPT = "Pause this ticket after the current work finishes. Push your work in progress, then stop and wait for Ostrom to resume you.";
+const RESUME_PROMPT = "This ticket has resumed. Continue your work.";
+const STOP_PROMPT = "Stop this ticket gracefully. Push your work in progress and summarise precisely where you stopped.";
+
+export function operatorControls(store: Store, workers: Workers): {
   pause(ticketId: number): Promise<void>;
   resume(ticketId: number): Promise<void>;
   stop(ticketId: number): Promise<void>;
@@ -25,39 +30,37 @@ export function operatorControls(store: Store, workers: Workers, gh: GhRunner, r
   return {
     async pause(ticketId) {
       const assignment = running(ticketId);
-      store.pauseTicket(ticketId);
-      queueStatusCard(store, ticketId);
-      workers.deliver(assignment.id, `operator-pause-${ticketId}`, "Pause this ticket after the current work finishes. Push your work in progress, then stop and wait for Ostrom to resume you.", () => {});
+      store.atomic(() => {
+        workers.deliver(assignment.id, `operator-pause-${randomUUID()}`, PAUSE_PROMPT, { kind: "control" });
+        store.pauseTicket(ticketId);
+        queueStatusCard(store, ticketId);
+      });
     },
     async resume(ticketId) {
       const assignment = running(ticketId);
-      store.resumeTicket(ticketId);
-      queueStatusCard(store, ticketId);
-      workers.deliver(assignment.id, `operator-resume-${ticketId}`, "This ticket has resumed. Continue your work.", () => {});
+      store.atomic(() => {
+        workers.deliver(assignment.id, `operator-resume-${randomUUID()}`, RESUME_PROMPT, { kind: "control" });
+        store.resumeTicket(ticketId);
+        queueStatusCard(store, ticketId);
+      });
     },
     async stop(ticketId) {
       const assignment = running(ticketId);
-      workers.cancel(assignment.id);
-      workers.deliver(
-        assignment.id,
-        `operator-stop-${ticketId}`,
-        "Stop this ticket gracefully. Push your work in progress and summarise precisely where you stopped.",
-        () => {},
-        async (result) => {
-          for (const pr of await pullRequests(gh, repo, assignment.branch!)) await gh(["pr", "ready", "--undo", pr]);
-          store.endAssignment(assignment.id, "stopped by operator");
-          store.endTicket(ticketId);
-          store.enqueueReply({ id: `operator-stopped-${ticketId}`, threadId: store.ticketContext(ticketId).thread.id, body: result.text, blocking: true });
-          queueStatusCard(store, ticketId);
+      const firstStop = store.stopRequestedAt(ticketId) === null;
+      workers.deliver(assignment.id, `operator-stop-${randomUUID()}`, STOP_PROMPT, {
+        kind: "stop",
+        effect: {
+          kind: "stop", reason: "stopped by operator", replyId: `operator-stopped-${ticketId}`,
+          threadId: store.ticketContext(ticketId).thread.id,
         },
-      );
+      });
+      if (firstStop) workers.cancel(assignment.id);
     },
   };
 }
 
 /**
- * Consumes subscribed-thread comments before ordinary follow-up routing. This is the only path
- * that parses control words, so a command is never supplied to the Router or a Worker as text.
+ * Applies controls and routes redirects on subscribed threads before ordinary follow-up routing.
  */
 export async function routeCommands(
   store: Store,
@@ -96,85 +99,52 @@ export async function routeCommands(
         const number = store.getThread(pending.trigger.threadId).number;
         const merged = (await pullRequestsForBranch(gh, repo, assignment.branch!))
           .some((pr) => pr.number === number && pr.state === "merged");
-        store.recordCommandReceipt(pending.trigger.id, pending.ticketId, "close_pull_request", true);
-        if (!merged) {
-          store.unsubscribeTicket(pending.ticketId);
-          store.endAssignment(assignment.id, "pull request closed");
-          queueStatusCard(store, pending.ticketId);
-        }
-      } else if (command === "close_issue") {
-        const assignment = store.latestAssignment(pending.ticketId);
-        if (assignment?.state !== "running") throw new Error(`ticket ${pending.ticketId} has no running Worker`);
-        store.recordCommandReceipt(pending.trigger.id, pending.ticketId, "close_issue", true);
-        workers.cancel(assignment.id);
-        workers.deliver(
-          assignment.id,
-          `close-issue-${pending.trigger.id}-${assignment.id}`,
-          "The issue was closed. Stop this ticket gracefully, push your work in progress, and summarise precisely where you stopped.",
-          () => {},
-          async (result) => {
-            for (const pr of await pullRequests(gh, repo, assignment.branch!)) await gh(["pr", "ready", "--undo", pr]);
-            store.endAssignment(assignment.id, "issue closed");
-            store.endTicket(pending.ticketId);
-            store.enqueueReply({ id: `stopped-issue-closed-${pending.ticketId}`, threadId: pending.trigger.threadId, body: result.text, blocking: true });
+        store.atomic(() => {
+          if (!merged) {
+            store.unsubscribeTicket(pending.ticketId);
+            store.endAssignment(assignment.id, "pull request closed");
             queueStatusCard(store, pending.ticketId);
-          },
-        );
-      } else if (command === "redirect") {
-        const assignment = store.latestAssignment(pending.ticketId);
-        if (assignment?.state !== "running") throw new Error(`ticket ${pending.ticketId} has no running Worker`);
-        const instruction = await collaborator(gh, repo, pending.trigger.actor, permissions);
-        store.recordCommandReceipt(pending.trigger.id, pending.ticketId, "redirect", instruction);
-        const added = workers.deliver(
-          assignment.id,
-          `redirect-${pending.trigger.id}-${assignment.id}`,
-          followUpMessage(pending.ticketId, pending.trigger, store.getThread(pending.trigger.threadId), instruction),
-          (turnId) => {
-            store.recordDelivery(pending.trigger.id, assignment.id, turnId);
-            enqueueReaction(store, pending.trigger, "eyes");
-          },
-        );
-        if (!added) continue;
-      } else if (command === "pause") {
-        const assignment = store.latestAssignment(pending.ticketId);
-        if (assignment?.state !== "running") throw new Error(`ticket ${pending.ticketId} has no running Worker`);
-        store.pauseTicket(pending.ticketId);
-        store.recordCommandReceipt(pending.trigger.id, pending.ticketId, "pause", true);
-        enqueueReaction(store, pending.trigger, "+1");
-        queueStatusCard(store, pending.ticketId);
-        workers.deliver(
-          assignment.id,
-          `pause-${pending.trigger.id}-${assignment.id}`,
-          "Pause this ticket after the current work finishes. Push your work in progress, then stop and wait for Ostrom to resume you.",
-          () => {},
-        );
-      } else if (command === "resume") {
-        const assignment = store.latestAssignment(pending.ticketId);
-        if (assignment?.state !== "running") throw new Error(`ticket ${pending.ticketId} has no running Worker`);
-        store.resumeTicket(pending.ticketId);
-        store.recordCommandReceipt(pending.trigger.id, pending.ticketId, "resume", true);
-        enqueueReaction(store, pending.trigger, "+1");
-        queueStatusCard(store, pending.ticketId);
-        workers.deliver(assignment.id, `resume-${pending.trigger.id}-${assignment.id}`, "This ticket has resumed. Continue your work.", () => {});
+          }
+          store.recordCommandReceipt(pending.trigger.id, pending.ticketId, command, true);
+        });
+        if (!merged) workers.cancel(assignment.id);
       } else {
-        const assignment = store.latestAssignment(pending.ticketId);
-        if (assignment?.state !== "running") throw new Error(`ticket ${pending.ticketId} has no running Worker`);
-        store.recordCommandReceipt(pending.trigger.id, pending.ticketId, "stop", true);
-        enqueueReaction(store, pending.trigger, "+1");
-        workers.cancel(assignment.id);
-        workers.deliver(
-          assignment.id,
-          `stop-${pending.trigger.id}-${assignment.id}`,
-          "Stop this ticket gracefully. Push your work in progress and summarise precisely where you stopped.",
-          () => {},
-          async (result) => {
-            for (const pr of await pullRequests(gh, repo, assignment.branch!)) await gh(["pr", "ready", "--undo", pr]);
-            store.endAssignment(assignment.id, "stopped by command");
-            store.endTicket(pending.ticketId);
-            store.enqueueReply({ id: `stopped-${pending.ticketId}`, threadId: pending.trigger.threadId, body: result.text, blocking: true });
-            queueStatusCard(store, pending.ticketId);
-          },
-        );
+        const { trigger, ticketId } = pending;
+        const instruction = command !== "redirect" || await collaborator(gh, repo, trigger.actor, permissions);
+        const assignment = store.latestAssignment(ticketId);
+        if (assignment?.state !== "running") throw new Error(`ticket ${ticketId} has no running Worker`);
+        const stopping = command === "stop" || command === "close_issue";
+        const firstStop = stopping && store.stopRequestedAt(ticketId) === null;
+        store.atomic(() => {
+          if (stopping) {
+            const closed = command === "close_issue";
+            workers.deliver(assignment.id, `${command}-${trigger.id}`, closed
+              ? "The issue was closed. Stop this ticket gracefully, push your work in progress, and summarise precisely where you stopped."
+              : STOP_PROMPT, {
+              kind: "stop",
+              effect: {
+                kind: "stop", threadId: trigger.threadId,
+                reason: closed ? "issue closed" : "stopped by command",
+                replyId: closed ? `stopped-issue-closed-${ticketId}` : `stopped-${ticketId}`,
+              },
+            });
+            if (!closed) enqueueReaction(store, trigger, "+1");
+          } else if (command === "redirect") {
+            workers.deliver(assignment.id, `${trigger.id}:${assignment.id}`,
+              followUpMessage(ticketId, trigger, store.getThread(trigger.threadId), instruction),
+              { kind: "work", effect: { kind: "delivery", triggerIds: [trigger.id], reaction: "command-eyes" } },
+            );
+          } else {
+            workers.deliver(assignment.id, `${command}-${trigger.id}`, command === "pause" ? PAUSE_PROMPT : RESUME_PROMPT,
+              { kind: "control" });
+            if (command === "pause") store.pauseTicket(ticketId);
+            else store.resumeTicket(ticketId);
+            enqueueReaction(store, trigger, "+1");
+            queueStatusCard(store, ticketId);
+          }
+          store.recordCommandReceipt(trigger.id, ticketId, command, instruction);
+        });
+        if (firstStop) workers.cancel(assignment.id);
       }
       pass.handled.push({ triggerId: pending.trigger.id, ticketId: pending.ticketId, command, allowed });
     } catch (error) {
@@ -216,18 +186,7 @@ async function issueAuthor(gh: GhRunner, repo: string, number: number): Promise<
   return typeof issue.user?.login === "string" ? issue.user.login : "";
 }
 
-async function pullRequests(gh: GhRunner, repo: string, branch: string): Promise<string[]> {
-  const owner = repo.split("/")[0]!;
-  const response = await ghGet(gh, `repos/${repo}/pulls?head=${encodeURIComponent(`${owner}:${branch}`)}&state=open&per_page=100`);
-  if (!Array.isArray(response)) throw new Error("expected open pull requests");
-  return response.map((value) => {
-    const url = (value as { html_url?: unknown }).html_url;
-    if (typeof url !== "string") throw new Error("open pull request has no URL");
-    return url;
-  });
-}
-
-function enqueueReaction(store: Store, trigger: Trigger, reaction: "eyes" | "+1" | "confused"): void {
+function enqueueReaction(store: Store, trigger: Trigger, reaction: "+1" | "confused"): void {
   if (trigger.kind === "pull_request_review") return;
   store.enqueueReply({ id: `command-${reaction}-${trigger.id}`, threadId: trigger.threadId, body: "", kind: "reaction", target: trigger.url, reaction });
 }

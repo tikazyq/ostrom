@@ -145,7 +145,7 @@ async function run(intervalSeconds: number, deps: MainDeps): Promise<number> {
   }
   let code = 0;
   const owned = openWorkers(deps);
-  const controls = operatorControls(owned.store, owned.workers, deps.gh, config.repo);
+  const controls = operatorControls(owned.store, owned.workers);
   const api = localApi(owned.store, {
     socketPath: defaultSocketPath(deps.env),
     control: {
@@ -174,6 +174,7 @@ async function run(intervalSeconds: number, deps: MainDeps): Promise<number> {
 function makeWorkers(deps: MainDeps, store: Store): Workers {
   return new Workers({
     store,
+    gh: deps.gh,
     config: loadWorkerConfig(deps.env),
     runners: deps.runners ?? realRunners(deps.env),
     codexSessions: deps.codexSessions ?? codexSessionsDir(),

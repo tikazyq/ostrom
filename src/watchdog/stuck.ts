@@ -58,49 +58,51 @@ export function parseStuckReply(text: string, cause: string): StuckReply {
 export async function advanceStuckLadder(store: Store, workers: Workers): Promise<{ recovered: number[]; published: number[] }> {
   const result = { recovered: [] as number[], published: [] as number[] };
   for (const stall of store.unansweredStalls()) {
+    const { ticketId } = store.getAssignment(stall.assignmentId);
+    if (store.stopRequestedAt(ticketId) !== null) continue;
     if (stall.recoveryAttempts < 2 && stall.publicAt === null) {
-      const started = store.beginStallRecovery(stall.id);
-      if (started === null) continue;
+      const queued = store.atomic(() => {
+        const started = store.beginStallRecovery(stall.id);
+        if (started === null) return false;
+        workers.deliver(
+          stall.assignmentId,
+          `stuck-recovery-${stall.id}-${started.recoveryAttempts}`,
+          started.recoveryAttempts === 1
+            ? "Ostrom detected that this ticket is stuck. Check the state, make progress, and continue the work."
+            : "Ostrom still sees this ticket as stuck. Retry the work from the current state and make progress.",
+          { kind: "control" },
+        );
+        queueStatusCard(store, ticketId);
+        return true;
+      });
+      if (!queued) continue;
       workers.cancel(stall.assignmentId);
-      workers.deliver(
-        stall.assignmentId,
-        `stuck-recovery-${stall.id}-${started.recoveryAttempts}`,
-        started.recoveryAttempts === 1
-          ? "Ostrom detected that this ticket is stuck. Check the state, make progress, and continue the work."
-          : "Ostrom still sees this ticket as stuck. Retry the work from the current state and make progress.",
-        () => {},
-      );
-      queueStatusCard(store, store.getAssignment(stall.assignmentId).ticketId);
       result.recovered.push(stall.id);
       continue;
     }
     if (stall.publicAt !== null) continue;
-    await publish(store, workers, stall);
+    publish(store, workers, stall);
     result.published.push(stall.id);
   }
   return result;
 }
 
-async function publish(store: Store, workers: Workers, stall: Stall): Promise<void> {
+function publish(store: Store, workers: Workers, stall: Stall): void {
   const assignment = store.getAssignment(stall.assignmentId);
-  const context = store.ticketContext(assignment.ticketId);
-  store.publishStall(stall.id);
-  if (store.getTicket(assignment.ticketId).state === "open") store.pauseTicket(assignment.ticketId);
+  store.atomic(() => {
+    store.publishStall(stall.id);
+    if (store.getTicket(assignment.ticketId).state === "open") store.pauseTicket(assignment.ticketId);
+    workers.deliver(
+      assignment.id,
+      `stuck-public-${stall.id}`,
+      [
+        "Prepare the one GitHub stuck reply. Return JSON only with exactly these non-empty string fields:",
+        '"tryingTo", "blockedBy", "tried", "choices", "workSoFar".',
+        `The detected cause is: ${stall.cause ?? stall.semonReason ?? "unknown"}.`,
+        "Do not include markdown or a code fence.",
+      ].join(" "),
+      { kind: "control", effect: { kind: "stuck-reply", stallId: stall.id } },
+    );
+  });
   workers.cancel(assignment.id);
-  workers.deliver(
-    assignment.id,
-    `stuck-public-${stall.id}`,
-    [
-      "Prepare the one GitHub stuck reply. Return JSON only with exactly these non-empty string fields:",
-      '"tryingTo", "blockedBy", "tried", "choices", "workSoFar".',
-      `The detected cause is: ${stall.cause ?? stall.semonReason ?? "unknown"}.`,
-      "Do not include markdown or a code fence.",
-    ].join(" "),
-    () => {},
-    async (turn) => {
-      const reply = renderStuckReply(parseStuckReply(turn.text, stall.cause ?? stall.semonReason ?? "unknown"));
-      store.enqueueReply({ id: `stuck-${stall.id}`, threadId: context.thread.id, body: reply, blocking: true });
-      queueStatusCard(store, assignment.ticketId);
-    },
-  );
 }

@@ -81,6 +81,37 @@ export interface ReviewDelivery {
   reviewId: string;
 }
 
+export type TurnEffect =
+  | { kind: "delivery"; triggerIds: readonly number[]; reaction: "received" | "command-eyes"; review?: ReviewDelivery }
+  | { kind: "recovered-reviews"; reviews: readonly ReviewDelivery[] }
+  | { kind: "stuck-reply"; stallId: number }
+  | { kind: "stop"; threadId: number; replyId: string; reason: string };
+
+export interface NewWorkerTurn {
+  key: string;
+  prompt: string;
+  kind: "work" | "control" | "stop" | "recovery";
+  effect?: TurnEffect;
+}
+
+export interface WorkerTurn extends NewWorkerTurn {
+  id: number;
+  number: number;
+}
+
+export interface MergeWait {
+  assignmentId: number;
+  repository: string;
+  prNumber: number;
+  headSha: string;
+  baseSha: string;
+  policy: string;
+  state: "waiting-for-human-merge" | "waiting-to-merge";
+  readyReplyId?: string;
+  blockingReason?: string;
+  quietDeadline?: string;
+}
+
 export type CommandReceiptName = "redirect" | "pause" | "resume" | "stop" | "forbidden" | "close_issue" | "close_pull_request" | "ignore_issue_state";
 
 export interface PendingCommand {
@@ -362,6 +393,12 @@ export class Store {
   }
 
   // --- triggers ------------------------------------------------------------------------------
+
+  getTrigger(triggerId: number): Trigger {
+    const row = this.#get('SELECT * FROM "trigger" WHERE id = ?', triggerId);
+    if (row === undefined) throw new Error(`no trigger ${triggerId}`);
+    return toTrigger(row);
+  }
 
   /** Records an event once. A repeat of the same source event id is a no-op marked duplicate. */
   insertTrigger(trigger: NewTrigger): Inserted {
@@ -652,6 +689,115 @@ export class Store {
     }
   }
 
+  stopRequestedAt(ticketId: number): string | null {
+    const row = this.#get("SELECT stop_requested_at FROM ticket WHERE id = ?", ticketId);
+    if (row === undefined) throw new Error(`no ticket ${ticketId}`);
+    return row["stop_requested_at"] as string | null;
+  }
+
+  // --- Worker queue and merge reservation ----------------------------------------------------
+
+  enqueueWorkerTurn(assignmentId: number, turn: NewWorkerTurn): number | null {
+    return this.#transaction(() => {
+      const row = this.#get(
+        `INSERT INTO worker_turn (assignment_id, delivery_key, prompt, kind, effect)
+         VALUES (?, ?, ?, ?, ?) ON CONFLICT (assignment_id, delivery_key) DO NOTHING RETURNING id`,
+        assignmentId, turn.key, turn.prompt, turn.kind, turn.effect === undefined ? null : JSON.stringify(turn.effect),
+      );
+      if (turn.kind === "stop") {
+        this.#run(
+          `UPDATE ticket SET stop_requested_at = COALESCE(stop_requested_at, ?)
+           WHERE id = (SELECT ticket_id FROM assignment WHERE id = ?)`,
+          this.#stamp(), assignmentId,
+        );
+      }
+      return row === undefined ? null : row["id"] as number;
+    });
+  }
+
+  /** Claims the next runnable turn and records its native turn number together. */
+  startQueuedTurn(assignmentId: number): WorkerTurn | null {
+    return this.#transaction(() => {
+      const row = this.#get(
+        `SELECT w.* FROM worker_turn AS w
+         JOIN assignment AS a ON a.id = w.assignment_id JOIN ticket AS t ON t.id = a.ticket_id
+         WHERE w.assignment_id = ? AND w.state = 'queued'
+           AND a.state = 'running' AND a.turn_started_at IS NULL AND a.merge_reserved_at IS NULL
+           AND t.state IN ('open', 'paused')
+           AND (t.state = 'open' OR w.kind <> 'work')
+           AND (t.stop_requested_at IS NULL OR w.kind IN ('stop', 'recovery'))
+         ORDER BY (w.kind = 'recovery') DESC, w.id LIMIT 1`,
+        assignmentId,
+      );
+      if (row === undefined) return null;
+      const id = row["id"] as number;
+      this.#run("UPDATE worker_turn SET state = 'running' WHERE id = ?", id);
+      return {
+        id, number: this.beginTurn(assignmentId), key: row["delivery_key"] as string,
+        prompt: row["prompt"] as string, kind: row["kind"] as NewWorkerTurn["kind"],
+        ...(row["effect"] === null ? {} : { effect: JSON.parse(row["effect"] as string) as TurnEffect }),
+      };
+    });
+  }
+
+  finishQueuedTurn(id: number): void {
+    this.#run("UPDATE worker_turn SET state = 'finished' WHERE id = ?", id);
+  }
+
+  /** Requeues interrupted work behind a durable recovery prompt, once even if recovery also crashes. */
+  recoverWorkerTurn(assignment: Assignment, prompt: string): void {
+    this.#transaction(() => {
+      const wasQueued = this.#get(
+        "SELECT 1 FROM worker_turn WHERE assignment_id = ? AND state = 'running'", assignment.id,
+      ) !== undefined;
+      const alreadyRecovering = this.#get(
+        "SELECT 1 FROM worker_turn WHERE assignment_id = ? AND kind = 'recovery' AND state <> 'finished'", assignment.id,
+      ) !== undefined;
+      if (!alreadyRecovering) {
+        // Before the queue existed, a delivered review's callback was only recoverable from delivery.
+        const reviews = wasQueued ? [] : this.reviewDeliveries(assignment.id, `${assignment.sessionId}:${assignment.turns}`);
+        this.enqueueWorkerTurn(assignment.id, {
+          key: `interrupted-${assignment.turns}`, prompt, kind: "recovery",
+          ...(reviews.length === 0 ? {} : { effect: { kind: "recovered-reviews", reviews } }),
+        });
+      }
+      this.#run("UPDATE worker_turn SET state = 'queued' WHERE assignment_id = ? AND state = 'running'", assignment.id);
+      this.#run(
+        "UPDATE assignment SET interruptions = interruptions + 1, turn_started_at = NULL WHERE id = ?", assignment.id,
+      );
+    });
+  }
+
+  /** A merge may only start on a live, open assignment that owes no Worker work. */
+  isWorkerIdle(assignmentId: number): boolean {
+    const assignment = this.getAssignment(assignmentId);
+    const { ticketId } = assignment;
+    return assignment.state === "running" && assignment.sessionId !== null && assignment.turnStartedAt === null &&
+      this.getTicket(ticketId).state === "open" && this.stopRequestedAt(ticketId) === null &&
+      this.mergeReservedAt(assignmentId) === null &&
+      this.#get("SELECT 1 FROM worker_turn WHERE assignment_id = ? AND state <> 'finished'", assignmentId) === undefined &&
+      !this.pendingCommands().some((pending) => pending.ticketId === ticketId) &&
+      !this.pendingDeliveries().some((pending) => pending.ticketId === ticketId);
+  }
+
+  mergeReservedAt(assignmentId: number): string | null {
+    const row = this.#get("SELECT merge_reserved_at FROM assignment WHERE id = ?", assignmentId);
+    if (row === undefined) throw new Error(`no assignment ${assignmentId}`);
+    return row["merge_reserved_at"] as string | null;
+  }
+
+  reserveMerge(assignmentId: number): boolean {
+    return this.#transaction(() => {
+      if (!this.isWorkerIdle(assignmentId)) return false;
+      this.#run("UPDATE assignment SET merge_reserved_at = ? WHERE id = ?", this.#stamp(), assignmentId);
+      return true;
+    });
+  }
+
+  releaseMerge(assignmentId: number): void {
+    this.#run("UPDATE assignment SET merge_reserved_at = NULL WHERE id = ?", assignmentId);
+  }
+
   // --- assignments ---------------------------------------------------------------------------
 
   /** Binds an open ticket to a Worker that is about to be created. */
@@ -694,14 +840,15 @@ export class Store {
 
   /** `running → ended`, with the reason when the Worker was stopped rather than finished. */
   endAssignment(assignmentId: number, reason: string | null = null): void {
-    const { changes } = this.#run(
-      `UPDATE assignment SET state = 'ended', ended_at = ?, end_reason = ?, stall_recovery_attempts = 0
-       WHERE id = ? AND state = 'running'`,
-      this.#stamp(),
-      reason,
-      assignmentId,
-    );
-    if (Number(changes) !== 1) this.#illegalAssignment(assignmentId, "ended");
+    this.#transaction(() => {
+      const { changes } = this.#run(
+        `UPDATE assignment SET state = 'ended', ended_at = ?, end_reason = ?, stall_recovery_attempts = 0
+         WHERE id = ? AND state = 'running'`,
+        this.#stamp(), reason, assignmentId,
+      );
+      if (Number(changes) !== 1) this.#illegalAssignment(assignmentId, "ended");
+      this.#run("UPDATE worker_turn SET state = 'finished' WHERE assignment_id = ? AND state <> 'finished'", assignmentId);
+    });
   }
 
   /** `pending → ended`: the Worker never started, for the reason given. */
@@ -861,7 +1008,9 @@ export class Store {
        WHERE t.kind IN ('issue_comment', 'issue_state')
          AND (ticket.state = 'open' OR t.kind = 'issue_state' OR lower(ltrim(COALESCE(t.body, ''))) GLOB '@ostrom *')
          AND NOT EXISTS (SELECT 1 FROM decision_trigger WHERE trigger_id = t.id)
-         AND NOT EXISTS (SELECT 1 FROM delivery WHERE delivery.trigger_id = t.id)
+         AND NOT EXISTS (
+           SELECT 1 FROM delivery JOIN assignment ON assignment.id = delivery.assignment_id
+           WHERE delivery.trigger_id = t.id AND assignment.ticket_id = ticket.id)
          AND NOT EXISTS (
            SELECT 1 FROM command_receipt
            WHERE command_receipt.trigger_id = t.id AND command_receipt.ticket_id = ticket.id)
@@ -1087,6 +1236,40 @@ export class Store {
     });
   }
 
+  // --- merge wait ----------------------------------------------------------------------------
+
+  saveMergeWait(wait: MergeWait): void {
+    this.#run(
+      `INSERT INTO merge_candidate
+         (assignment_id, repository, pr_number, head_sha, base_sha, policy, wait_state,
+          ready_reply_id, ready_sent_at, blocking_reason, quiet_deadline)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, (SELECT sent_at FROM outbox WHERE id = ? AND kind = 'comment'), ?, ?)
+       ON CONFLICT (assignment_id, pr_number) DO UPDATE SET
+         head_sha = excluded.head_sha, base_sha = excluded.base_sha, policy = excluded.policy,
+         wait_state = excluded.wait_state, ready_reply_id = excluded.ready_reply_id,
+         ready_sent_at = excluded.ready_sent_at, blocking_reason = excluded.blocking_reason,
+         quiet_deadline = excluded.quiet_deadline`,
+      wait.assignmentId, wait.repository, wait.prNumber, wait.headSha, wait.baseSha, wait.policy, wait.state,
+      wait.readyReplyId ?? null, wait.readyReplyId ?? null, wait.blockingReason ?? null, wait.quietDeadline ?? null,
+    );
+  }
+
+  mergeWait(assignmentId: number, prNumber: number): (MergeWait & { readySentAt: string | null }) | null {
+    const row = this.#get(
+      `SELECT * FROM merge_candidate WHERE assignment_id = ? AND pr_number = ? AND wait_state IS NOT NULL`,
+      assignmentId, prNumber,
+    );
+    if (row === undefined) return null;
+    return {
+      assignmentId, prNumber, repository: row["repository"] as string,
+      headSha: row["head_sha"] as string, baseSha: row["base_sha"] as string, policy: row["policy"] as string,
+      state: row["wait_state"] as MergeWait["state"], readySentAt: row["ready_sent_at"] as string | null,
+      ...(row["ready_reply_id"] === null ? {} : { readyReplyId: row["ready_reply_id"] as string }),
+      ...(row["blocking_reason"] === null ? {} : { blockingReason: row["blocking_reason"] as string }),
+      ...(row["quiet_deadline"] === null ? {} : { quietDeadline: row["quiet_deadline"] as string }),
+    };
+  }
+
   // --- outbox --------------------------------------------------------------------------------
 
   /**
@@ -1221,12 +1404,17 @@ export class Store {
 
   /** Marks a reply sent. Marking it sent a second time throws. */
   markReplySent(replyId: string): void {
-    const { changes } = this.#run(
-      "UPDATE outbox SET sent_at = ?, attempts = attempts + 1 WHERE id = ? AND sent_at IS NULL",
-      this.#stamp(),
-      replyId,
-    );
-    if (Number(changes) !== 1) this.#unsentReplyMissing(replyId);
+    this.#transaction(() => {
+      const sentAt = this.#stamp();
+      const row = this.#get(
+        "UPDATE outbox SET sent_at = ?, attempts = attempts + 1 WHERE id = ? AND sent_at IS NULL RETURNING kind",
+        sentAt, replyId,
+      );
+      if (row === undefined) this.#unsentReplyMissing(replyId);
+      if (row?.["kind"] === "comment") {
+        this.#run("UPDATE merge_candidate SET ready_sent_at = ? WHERE ready_reply_id = ?", sentAt, replyId);
+      }
+    });
   }
 
   /** Records a failed send and when to try again. A sent reply cannot fail afterwards. */
@@ -1265,7 +1453,13 @@ export class Store {
     return this.#db.prepare(sql).run(...params);
   }
 
+  /** Commits a synchronous set of domain updates together. */
+  atomic<T>(body: () => T): T {
+    return this.#transaction(body);
+  }
+
   #transaction<T>(body: () => T): T {
+    if (this.#db.isTransaction) return body();
     this.#db.exec("BEGIN IMMEDIATE");
     try {
       const result = body();

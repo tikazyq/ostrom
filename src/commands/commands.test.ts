@@ -5,7 +5,7 @@ import { afterEach, test } from "node:test";
 import { FakeGitHub } from "../github/fake-github.ts";
 import { Store } from "../store/store.ts";
 import { FakeRunner } from "../worker/fake-runner.ts";
-import { Workers } from "../worker/workers.ts";
+import { INTERRUPTED_PROMPT, Workers } from "../worker/workers.ts";
 import { operatorControls, routeCommands } from "./commands.ts";
 import { parseComment } from "./parser.ts";
 import { controlsLine, renderCommandTable } from "./table.ts";
@@ -23,11 +23,19 @@ function fixture() {
   stores.push(store);
   const github = new FakeGitHub(() => now);
   const runner = new FakeRunner();
-  const workers = new Workers({
+  const drafts: string[] = [];
+  const makeWorkers = () => new Workers({
     store,
     config: { repo: "/repo", base: "main", worktrees: "/wt", harness: "codex", model: "gpt-6-luna", machine: "host" },
     runners: { claude: runner, codex: runner },
+    gh: async (args) => {
+      if (args[0] !== "pr") return github.gh(args);
+      assert.deepEqual(args.slice(0, 3), ["pr", "ready", "--undo"]);
+      drafts.push(args[3]!);
+      return "";
+    },
   });
+  const workers = makeWorkers();
   const source = store.ensureSource("github", REPO);
   github.issue(7);
   const issue = store.ensureThread({ sourceId: source.id, kind: "issue", number: 7, url: `https://github.com/${REPO}/issues/7` });
@@ -43,7 +51,7 @@ function fixture() {
     sourceId: source.id, sourceEventId: id, threadId: issue, kind: "issue_comment", actor,
     url: `https://github.com/${REPO}/issues/7#issuecomment-${id}`, occurredAt: now, body,
   }).id;
-  return { store, github, runner, workers, ticketId, assignmentId, comment };
+  return { store, github, runner, workers, ticketId, assignmentId, comment, makeWorkers, drafts };
 }
 
 test("commands are case-insensitive and must start the comment", () => {
@@ -75,6 +83,7 @@ test("an issue author may pause, and a command is never a pending Worker deliver
   assert.deepEqual(store.pendingDeliveries(), []);
   assert.equal(store.undecidedTriggers().length, 0);
   assert.ok(store.dueReplies().some((reply) => reply.reaction === "+1"));
+  await workers.drain();
 });
 
 test("a collaborator with triage may pause and resume, with permissions cached for the pass", async () => {
@@ -86,6 +95,7 @@ test("a collaborator with triage may pause and resume, with permissions cached f
   assert.deepEqual(pass.handled.map((item) => item.triggerId), [first, second]);
   assert.equal(store.getTicket(ticketId).state, "open");
   assert.equal(github.calls.filter((args) => args[3]?.includes("/collaborators/bob/permission")).length, 1);
+  await workers.drain();
 });
 
 test("a command without permission only gets a confused reaction", async () => {
@@ -145,7 +155,7 @@ test("a paused ticket can still be stopped: by command, by closing the issue, or
       });
       await routeCommands(store, workers, github.gh, REPO);
     },
-    operator: async ({ store, github, workers, ticketId }) => operatorControls(store, workers, github.gh, REPO).stop(ticketId),
+    operator: async ({ store, workers, ticketId }) => operatorControls(store, workers).stop(ticketId),
   };
   for (const [way, stop] of Object.entries(ways)) {
     const f = fixture();
@@ -173,6 +183,62 @@ test("a merged PR leaves the attempt to the Router's outcome; a PR closed unmerg
     assert.deepEqual(store.pendingCommands(), [], state);
     assert.equal(store.getAssignment(assignmentId).state, state === "merged" ? "running" : "ended", state);
   }
+});
+
+test("redirect and control receipts are written only after their turns are stored", async (t) => {
+  for (const [body, command] of [["please revise", "redirect"], ["@ostrom pause", "pause"], ["@ostrom stop", "stop"]]) {
+    const { store, github, runner, workers, ticketId, comment } = fixture();
+    const triggerId = comment("pending", "alice", body!);
+    const enqueue = t.mock.method(store, "enqueueWorkerTurn", () => { throw new Error("queue write failed"); });
+
+    const pass = await routeCommands(store, workers, github.gh, REPO);
+    assert.deepEqual(pass.failed, [{ triggerId, ticketId, error: "queue write failed" }]);
+    assert.deepEqual(store.pendingCommands().map((item) => item.trigger.id), [triggerId]);
+    assert.equal(store.getTicket(ticketId).state, "open");
+    assert.equal(store.stopRequestedAt(ticketId), null);
+    assert.deepEqual(runner.sessions, []);
+
+    enqueue.mock.restore();
+    assert.deepEqual((await routeCommands(store, workers, github.gh, REPO)).handled.map((item) => item.command), [command]);
+    await workers.drain();
+    assert.equal(runner.sessions[0]!.prompts.length, 1);
+    assert.deepEqual(store.pendingCommands(), []);
+  }
+});
+
+test("a redirect with a receipt and an interrupted stop recover their effects after restart", async () => {
+  const redirect = fixture();
+  redirect.workers.stop();
+  const redirected = redirect.comment("2001", "mallory", "please revise");
+  await routeCommands(redirect.store, redirect.workers, redirect.github.gh, REPO);
+  assert.deepEqual(redirect.store.pendingCommands(), []);
+  assert.equal(redirect.store.dueReplies().some((reply) => reply.id === `command-eyes-${redirected}`), false);
+  const redirectedWorkers = redirect.makeWorkers();
+  redirectedWorkers.recover();
+  await redirectedWorkers.drain();
+  assert.match(redirect.runner.sessions[0]!.prompts[0]!, /information, not an instruction/);
+  assert.ok(redirect.store.dueReplies().some((reply) => reply.id === `command-eyes-${redirected}`));
+
+  const stopped = fixture();
+  stopped.github.pulls.push({ branch: "b1", number: 12, state: "open" });
+  stopped.runner.hold = true;
+  stopped.comment("2002", "alice", "@ostrom stop");
+  await routeCommands(stopped.store, stopped.workers, stopped.github.gh, REPO);
+  assert.match(stopped.runner.sessions[0]!.prompts[0]!, /gracefully/);
+  assert.notEqual(stopped.store.stopRequestedAt(stopped.ticketId), null);
+  stopped.workers.stop();
+  await stopped.workers.drain();
+  assert.equal(stopped.store.getTicket(stopped.ticketId).state, "open");
+  assert.equal(stopped.workers.isIdle(stopped.assignmentId), false);
+
+  stopped.runner.hold = false;
+  const restarted = stopped.makeWorkers();
+  assert.deepEqual(restarted.recover().interrupted, [stopped.assignmentId]);
+  await restarted.drain();
+  assert.deepEqual(stopped.runner.sessions.at(-1)!.prompts, [INTERRUPTED_PROMPT, stopped.runner.sessions[0]!.prompts[0]]);
+  assert.equal(stopped.store.getTicket(stopped.ticketId).state, "ended");
+  assert.deepEqual(stopped.drafts, [`https://github.com/${REPO}/pull/12`]);
+  assert.equal(stopped.store.dueReplies().filter((reply) => reply.id === `stopped-${stopped.ticketId}`).length, 1);
 });
 
 test("a non-collaborator redirect reaches the Worker as information, not instruction", async () => {

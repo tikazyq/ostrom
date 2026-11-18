@@ -17,8 +17,9 @@ afterEach(() => {
   while (stores.length > 0) stores.pop()!.close();
 });
 
-function fixture(extra: Partial<WorkersDeps> = {}, harness: "claude" | "codex" = "codex") {
-  const store = Store.open(":memory:", { now: () => new Date("2026-11-09T12:00:00.000Z") });
+function fixture(extra: Partial<WorkersDeps> = {}, harness: "claude" | "codex" = "codex", path = ":memory:") {
+  const open = () => Store.open(path, { now: () => new Date("2026-11-09T12:00:00.000Z") });
+  const store = open();
   stores.push(store);
   const source = store.ensureSource("github", REPO);
   const issue = store.ensureThread({ sourceId: source.id, kind: "issue", number: 7, url: `https://github.com/${REPO}/issues/7` });
@@ -33,8 +34,8 @@ function fixture(extra: Partial<WorkersDeps> = {}, harness: "claude" | "codex" =
     worktrees.push([repo, path, base]);
     return `ostrom/ticket-${ticket}-${assignment}`;
   };
-  const make = () => new Workers({ store, config: { ...config, harness }, runners: { claude: runner, codex: runner }, addWorktree, ...extra });
-  return { store, runner, worktrees, ticketId: ticketId!, workers: make(), make };
+  const make = (db = store) => new Workers({ store: db, config: { ...config, harness }, runners: { claude: runner, codex: runner }, addWorktree, ...extra });
+  return { store, runner, worktrees, ticketId: ticketId!, workers: make(), make, open };
 }
 
 test("dispatch makes the worktree, starts the session with the brief and stores its id", async () => {
@@ -188,7 +189,85 @@ test("restart recovery resumes running sessions by id and sends the interrupted 
   assert.match(store.getAssignment(stuck).endReason!, /before the session started/);
 });
 
-test("a stop cuts off the running turn, starts no queued one, and leaves the turn for recovery", async () => {
+test("shutdown saves an interrupted follow-up and the next queued turn for recovery", async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "worker-queue-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const { store, runner, ticketId, workers, make, open } = fixture({}, "codex", join(dir, "worker.db"));
+  await workers.dispatch(ticketId);
+  await workers.drain();
+
+  runner.sessions[0]!.auto = false;
+  workers.deliver(1, "interrupted", "finish this");
+  workers.deliver(1, "queued", "next");
+  await Promise.resolve();
+  workers.stop();
+  await workers.drain();
+  assert.deepEqual(runner.sessions[0]!.prompts.slice(1), ["finish this"]);
+  const a = store.getAssignment(1);
+  assert.deepEqual([a.state, a.outcome, a.lastError], ["running", null, null]);
+  assert.notEqual(a.turnStartedAt, null, "the cut-off turn stays open");
+  stores.splice(stores.indexOf(store), 1);
+  store.close();
+
+  const reopened = open();
+  try {
+    const restarted = make(reopened);
+    assert.deepEqual(restarted.recover().interrupted, [1]);
+    await restarted.drain();
+    assert.deepEqual(runner.sessions.at(-1)!.prompts, [INTERRUPTED_PROMPT, "finish this", "next"]);
+    assert.equal(reopened.getAssignment(1).turnStartedAt, null);
+    assert.equal(restarted.isIdle(1), true);
+  } finally {
+    reopened.close();
+  }
+});
+
+test("a merge reservation holds queued turns and keeps their live callbacks attached", async () => {
+  const { store, runner, ticketId, workers } = fixture();
+  await workers.dispatch(ticketId);
+  await workers.drain();
+  assert.equal(workers.isIdle(1), true);
+  assert.equal(workers.reserveMerge(1), true);
+  assert.equal(workers.reserveMerge(1), false);
+
+  const callbacks: string[] = [];
+  workers.deliver(1, "deferred", "next", (id) => { callbacks.push(id); }, (result) => { callbacks.push(result.text); });
+  await workers.drain();
+  assert.deepEqual(callbacks, []);
+  assert.equal(runner.sessions[0]!.prompts.length, 1);
+
+  store.pauseTicket(ticketId);
+  workers.releaseMerge(1);
+  await workers.drain();
+  assert.equal(workers.isIdle(1), false);
+  assert.deepEqual(callbacks, []);
+  store.resumeTicket(ticketId);
+  workers.deliver(1, "resume", "continue", { kind: "control" });
+  await workers.drain();
+  assert.deepEqual(callbacks, ["sess-1:2", "ok"]);
+  assert.equal(workers.isIdle(1), true);
+});
+
+test("restart keeps a merge reservation until it is explicitly released", async () => {
+  const { store, runner, ticketId, workers, make } = fixture();
+  await workers.dispatch(ticketId);
+  await workers.drain();
+  assert.equal(workers.reserveMerge(1), true);
+  workers.deliver(1, "behind-reservation", "next");
+  workers.stop();
+  await workers.drain();
+
+  const restarted = make();
+  restarted.recover();
+  await restarted.drain();
+  assert.notEqual(store.mergeReservedAt(1), null);
+  assert.deepEqual(runner.sessions.at(-1)!.prompts, []);
+  restarted.releaseMerge(1);
+  await restarted.drain();
+  assert.deepEqual(runner.sessions.at(-1)!.prompts, ["next"]);
+});
+
+test("shutdown while the first turn runs preserves work queued behind it", async () => {
   const { store, runner, ticketId, workers, make } = fixture();
   runner.hold = true;
   await workers.dispatch(ticketId);
@@ -204,7 +283,7 @@ test("a stop cuts off the running turn, starts no queued one, and leaves the tur
   const restarted = make();
   assert.deepEqual(restarted.recover().interrupted, [1]);
   await restarted.drain();
-  assert.deepEqual(runner.sessions.at(-1)!.prompts, [INTERRUPTED_PROMPT]);
+  assert.deepEqual(runner.sessions.at(-1)!.prompts, [INTERRUPTED_PROMPT, "next"]);
   assert.equal(store.getAssignment(1).turnStartedAt, null);
 });
 

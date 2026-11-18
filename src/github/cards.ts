@@ -11,15 +11,16 @@ export function queueStatusCard(store: Store, ticketId: number, now = new Date()
   const assignment = store.latestAssignment(ticketId);
   if (assignment === null || assignment.harness === null || assignment.model === null) return;
   const openStall = store.unansweredStalls().find((stall) => stall.assignmentId === assignment.id);
+  const pullRequest = store.ticketPullRequest(ticketId);
+  const mergeWait = pullRequest === null ? null : store.mergeWait(assignment.id, pullRequest.number);
   const state: StatusCardState =
     ticket.state === "ended" ? (assignment.endReason === null ? "done" : "stopped") :
       openStall !== undefined && openStall.publicAt !== null ? "stuck" :
         openStall !== undefined ? "recovering" :
           ticket.state === "paused" ? "paused" :
-            assignment.outcome === "failed" ? "stuck" : "working";
+            assignment.outcome === "failed" ? "stuck" : mergeWait?.state ?? "working";
   const budget = store.ticketBudget(ticketId);
   const warning = budgetWarning(budget, now);
-  const pullRequest = store.ticketPullRequest(ticketId);
   const lastActivityAt = new Date(assignment.lastActivityAt ?? assignment.outcomeAt ?? assignment.startedAt ?? assignment.createdAt);
   store.enqueueStatusCard(
     context.thread.id,
@@ -27,6 +28,7 @@ export function queueStatusCard(store: Store, ticketId: number, now = new Date()
       state,
       ...(assignment.endReason === "issue closed" ? { stoppedReason: "issue closed" as const } : {}),
       ...(pullRequest === null ? {} : { pullRequest: pullRequest.url }),
+      ...(mergeWait !== null && state === mergeWait.state ? { mergeWait } : {}),
       ...(warning === null ? {} : { budgetWarning: warning }),
       ...(ticket.pauseCause === null ? {} : { pauseCause: ticket.pauseCause }),
       harness: assignment.harness,

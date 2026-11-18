@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { afterEach, test } from "node:test";
 import { Store } from "../store/store.ts";
+import { queueStatusCard } from "./cards.ts";
 import { FakeGitHub } from "./fake-github.ts";
 import { replyMarker } from "./marker.ts";
 import { defaultBackoffMs, sendDueReplies, type SendOptions } from "./outbox.ts";
@@ -140,6 +141,50 @@ test("ordinary comments batch after the gathering window while a blocking questi
 
   store.enqueueReply({ id: "q1", threadId: thread, body: "need a decision", blocking: true });
   assert.deepEqual((await send({ batchWindowMs: 10 * 60_000 })).sent, ["q1"]);
+});
+
+test("merge readiness records confirmed delivery after batching, failure or marker recovery", async () => {
+  for (const markerFound of [false, true]) {
+    const { store, github, thread, send, posts, advance } = fixture();
+    const source = store.ensureSource("github", github.repo);
+    const trigger = store.insertTrigger({
+      sourceId: source.id, sourceEventId: "accepted", threadId: thread, kind: "issue_comment",
+      actor: "alice", url: `https://github.com/${github.repo}/issues/7`, occurredAt: new Date(T0),
+    });
+    const { ticketId } = store.recordDecision({ threadId: thread, triggerIds: [trigger.id], verdict: "accept", reason: "work" });
+    const assignmentId = store.createAssignment(ticketId!);
+    store.configureNativeAssignment(assignmentId, { harness: "codex", model: "m", worktree: "/wt", branch: "b1", machine: "host" });
+    store.startNativeAssignment(assignmentId, "s1");
+    const pr = store.ensureThread({ sourceId: source.id, kind: "pull_request", number: 42, url: `https://github.com/${github.repo}/pull/42` });
+    store.subscribe(ticketId!, pr);
+    const readyReplyId = "outcome-a1-pr42-opened";
+    store.saveMergeWait({
+      assignmentId, repository: github.repo, prNumber: 42, headSha: "abc123", baseSha: "def456", policy: "unattended",
+      state: "waiting-to-merge", readyReplyId, blockingReason: "checks to pass",
+    });
+    queueStatusCard(store, ticketId!, new Date(T0));
+    assert.match(store.pendingReplies().find((reply) => reply.id === `card-thread-${thread}`)!.body, /Waiting to merge[\s\S]*Waiting for: checks to pass/);
+    await send();
+
+    const sentAt = () => store.mergeWait(assignmentId, 42)!.readySentAt;
+    store.enqueueReply({ id: readyReplyId, threadId: thread, body: "Ready for review." });
+    assert.equal(sentAt(), null);
+    const windows = { batchWindowMs: 60_000, commentGapMs: 0 };
+    assert.deepEqual((await send(windows)).sent, []);
+    assert.equal(sentAt(), null);
+    advance(60_000);
+    github.failWhen = (args) => args[2] === "POST" ? new Error("connection reset") : undefined;
+    assert.equal((await send(windows)).failed.length, 1);
+    assert.equal(sentAt(), null);
+
+    github.failWhen = undefined;
+    if (markerFound) github.comment(7, { login: "operator", body: `Ready for review.\n\n${replyMarker(readyReplyId)}`, at: new Date(T0 + 60_000) });
+    const before = posts();
+    const confirmedAt = advance(30_000);
+    assert.deepEqual((await send(windows))[markerFound ? "found" : "sent"], [readyReplyId]);
+    assert.equal(sentAt(), confirmedAt.toISOString());
+    assert.equal(posts() - before, markerFound ? 0 : 1);
+  }
 });
 
 test("a status card posts once then future states edit the same comment", async () => {
