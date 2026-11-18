@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
+import { migrations } from "../store/migrations.ts";
 import { Store } from "../store/store.ts";
 import { routeCandidates, type Batch } from "../router/router.ts";
 import { FakeRunner } from "../worker/fake-runner.ts";
@@ -398,31 +399,43 @@ test("first enable posts a distinct notice after an opened reply was sent before
 test("merge-enabled migration refreshes previously tracked, delivered opened replies", async () => {
   const dir = mkdtempSync(join(tmpdir(), "ostrom-merge-upgrade-"));
   const path = join(dir, "store.db");
-  // Populate the pre-enable tracking state through public methods, then reopen at migration 26
-  // so the real migration, rather than a hand-written equivalent, upgrades those durable rows.
   let now = new Date("2026-11-10T12:00:00.000Z");
-  let store = Store.open(path, { now: () => now });
-  const source = store.ensureSource("github", "o/r");
-  const thread = store.ensureThread({ sourceId: source.id, kind: "issue", number: 1, url: "https://github.com/o/r/issues/1" });
-  const trigger = store.insertTrigger({ sourceId: source.id, sourceEventId: "old", threadId: thread, kind: "issue_comment", actor: "alice", url: "https://github.com/o/r/issues/1#issuecomment-1", occurredAt: new Date() }).id;
-  const ticket = store.recordDecision({ threadId: thread, triggerIds: [trigger], verdict: "accept", reason: "work" }).ticketId!;
-  const assignment = store.createAssignment(ticket);
-  store.configureNativeAssignment(assignment, { harness: "claude", model: "m", worktree: "/w", branch: "b", machine: "h" });
-  store.startNativeAssignment(assignment, "s");
+  const at = now.toISOString();
+  const sourceId = 1;
+  const ticket = 1;
+  const assignment = 1;
   const opened = `outcome-a${assignment}-pr2-opened`;
-  store.enqueueReply({ id: opened, threadId: thread, body: "previous ready reply" });
-  store.trackReadyReply(assignment, opened);
-  store.markReplySent(opened);
-  assert.notEqual(store.readyReplySentAt(assignment), null);
-  store.close();
-  const upgrade = new DatabaseSync(path);
-  upgrade.prepare("DELETE FROM schema_version WHERE version >= 27").run();
-  upgrade.close();
-  store = Store.open(path, { now: () => now });
+
+  // Build the actual pre-enable schema and seed an already delivered, tracked reply.
+  const before = new DatabaseSync(path);
+  try {
+    before.exec("CREATE TABLE schema_version (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL) STRICT");
+    for (const [index, sql] of migrations.slice(0, 26).entries()) {
+      before.exec(sql);
+      before.prepare("INSERT INTO schema_version VALUES (?, ?)").run(index + 1, at);
+    }
+    before.exec(`
+      INSERT INTO source (id, kind, name) VALUES (${sourceId}, 'github', 'o/r');
+      INSERT INTO thread (id, source_id, kind, number, url)
+        VALUES (1, ${sourceId}, 'issue', 1, 'https://github.com/o/r/issues/1');
+      INSERT INTO "trigger" (id, source_id, source_event_id, thread_id, kind, actor, url, occurred_at, received_at)
+        VALUES (1, ${sourceId}, 'old', 1, 'issue_comment', 'alice', 'https://github.com/o/r/issues/1#issuecomment-1', '${at}', '${at}');
+      INSERT INTO decision (id, thread_id, verdict, reason, decided_at) VALUES (1, 1, 'accept', 'work', '${at}');
+      INSERT INTO decision_trigger (decision_id, trigger_id) VALUES (1, 1);
+      INSERT INTO ticket (id, decision_id, state, opened_at) VALUES (${ticket}, 1, 'open', '${at}');
+      INSERT INTO subscription (ticket_id, thread_id, subscribed_at) VALUES (${ticket}, 1, '${at}');
+      INSERT INTO assignment (id, ticket_id, state, created_at, started_at, harness, model, worktree, branch, machine, session_id)
+        VALUES (${assignment}, ${ticket}, 'running', '${at}', '${at}', 'claude', 'm', '/w', 'b', 'h', 's');
+      INSERT INTO outbox (id, thread_id, body, enqueued_at, next_attempt_at, attempts, sent_at)
+        VALUES ('${opened}', 1, 'previous ready reply', '${at}', '${at}', 1, '${at}');
+      INSERT INTO ready_reply (assignment_id, reply_id, sent_at) VALUES (${assignment}, '${opened}', '${at}');
+    `);
+  } finally { before.close(); }
+  const store = Store.open(path, { now: () => now });
   try {
     assert.equal(store.readyReplyId(assignment), null);
     assert.equal(store.hasReply(opened), true);
-    const pr = store.ensureThread({ sourceId: source.id, kind: "pull_request", number: 2, url: "https://github.com/o/r/pull/2" });
+    const pr = store.ensureThread({ sourceId, kind: "pull_request", number: 2, url: "https://github.com/o/r/pull/2" });
     store.subscribe(ticket, pr);
     const f = fixture();
     const options: MergePassOptions = { ...f.options(), store, now: () => now,
