@@ -135,6 +135,40 @@ test("a stop requested while effort is being chosen prevents that ordinary turn"
   assert.equal(s.store.queuedTurn(1, "review-1")?.state, "cancelled");
 });
 
+test("shutdown cancels effort inference before dispatch and before a queued turn", async () => {
+  for (const kind of ["dispatch", "follow_up"] as const) {
+    let hold = kind === "dispatch";
+    let entered!: () => void;
+    const selecting = new Promise<void>((resolve) => { entered = resolve; });
+    const s = fixture({ askEffort: async (_text, signal) => {
+      if (!hold) return '{"effort":"low","reason":"Small turn."}';
+      assert.ok(signal);
+      entered();
+      return new Promise<string>((_resolve, reject) => {
+        const abort = () => reject(new Error("selection cancelled"));
+        signal.addEventListener("abort", abort, { once: true });
+        if (signal.aborted) abort();
+      });
+    } });
+    if (kind === "dispatch") {
+      const dispatched = s.workers.dispatch(s.ticketId);
+      await selecting;
+      s.workers.stop();
+      await assert.rejects(dispatched, /did not start/);
+    } else {
+      await s.workers.dispatch(s.ticketId);
+      await s.workers.drain();
+      hold = true;
+      s.workers.deliver(1, "next", "continue", () => {});
+      await selecting;
+      s.workers.stop();
+    }
+    await s.workers.drain();
+    assert.equal(s.runner.sessions[0]!.prompts.length, kind === "dispatch" ? 0 : 1);
+    if (kind === "follow_up") assert.equal(s.store.queuedTurn(1, "next")?.state, "queued");
+  }
+});
+
 test("approval model never creates a worktree or native session before approval", async () => {
   const { store, ticketId, workers, runner, worktrees } = fixture();
   store.chooseTicketModel(ticketId, "codex", "gpt-6-luna", "Needs approval.", false);

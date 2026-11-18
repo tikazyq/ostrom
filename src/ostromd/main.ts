@@ -207,7 +207,7 @@ function makeWorkers(deps: MainDeps, store: Store): Workers {
     store,
     config: loadWorkerConfig(deps.env),
     runners: deps.runners ?? realRunners(deps.env),
-    askEffort: async (text) => (await askRouter({ router: loadRouterConfig(deps.env), runners: deps.runners ?? realRunners(deps.env) }, text)).reply,
+    askEffort: async (text, signal) => (await askRouter({ router: loadRouterConfig(deps.env), runners: deps.runners ?? realRunners(deps.env) }, text, signal)).reply,
     codexSessions: deps.codexSessions ?? codexSessionsDir(),
     ...(deps.addWorktree === undefined ? {} : { addWorktree: deps.addWorktree }),
     gh: deps.gh,

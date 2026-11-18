@@ -445,8 +445,30 @@ test(
     const stop = new AbortController();
     const run = deps(tickEnv(dbPath), github.gh, semonAnswer(20, []));
     run.runner.hold = true;
+    const start = run.runner.start.bind(run.runner);
+    run.runner.start = (options) => {
+      const session = start(options);
+      if (options.sandbox === "read-only") {
+        session.auto = true;
+        session.reply = () => '{"effort":"low","reason":"Resume interrupted work."}';
+      }
+      return session;
+    };
+    let started!: () => void;
+    const workerStarted = new Promise<void>((resolve) => { started = resolve; });
+    const resume = run.runner.resume.bind(run.runner);
+    run.runner.resume = (options) => {
+      const session = resume(options);
+      const send = session.send.bind(session);
+      session.send = (prompt, signal, effort) => {
+        const result = send(prompt, signal, effort);
+        started();
+        return result;
+      };
+      return session;
+    };
     run.deps.stop = stop.signal;
-    run.deps.sleep = async () => { stop.abort(); };
+    run.deps.sleep = async () => { await workerStarted; stop.abort(); };
     await main(["run", "--interval", "30"], run.deps);
 
     const after = Store.open(dbPath);

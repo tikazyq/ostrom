@@ -27,7 +27,7 @@ export interface Dispatched {
 export interface WorkersDeps {
   store: Store;
   config: WorkerConfig;
-  askEffort?: (message: string) => Promise<string>;
+  askEffort?: (message: string, signal?: AbortSignal) => Promise<string>;
   runners: Record<"claude" | "codex", Runner>;
   /** Where Codex writes rollout records; set to verify the Worker's model after each Codex turn. */
   codexSessions?: string;
@@ -132,7 +132,7 @@ export class Workers {
       const turn = this.#enqueue(id, () => this.#firstTurn(id, session, workerBrief(context, branch, config.base, config.rules)));
       await Promise.race([started, turn]);
       const assignment = store.getAssignment(id);
-      if (assignment.state === "ended") throw new Error(assignment.endReason ?? "the session did not start");
+      if (assignment.sessionId === null || assignment.state === "ended") throw new Error(assignment.endReason ?? "the session did not start");
       return { assignmentId: id, sessionId: assignment.sessionId!, branch };
     } catch (error) {
       if (store.getAssignment(id).state === "pending") {
@@ -370,7 +370,7 @@ export class Workers {
     let result: TurnResult;
     try {
       const assignment = store.getAssignment(id);
-      const choice = await chooseEffort(store, assignment.ticketId, assignment.harness!, assignment.model!, "dispatch", prompt, this.#deps.askEffort);
+      const choice = await chooseEffort(store, assignment.ticketId, assignment.harness!, assignment.model!, "dispatch", prompt, this.#deps.askEffort, controller.signal);
       if (this.#stopping) return;
       store.startWorkerTurn(id, "dispatch", choice.effort, choice.reason);
       result = await session.send(prompt, controller.signal, choice.effort);
@@ -406,12 +406,18 @@ export class Workers {
     if (queued === null || queued.state !== "queued" || this.#stopping || assignment.state !== "running" || assignment.outcome === "failed") return;
     const ticket = store.getTicket(assignment.ticketId);
     if (ticket.state === "paused" && !RUNS_WHILE_PAUSED.some((prefix) => key.startsWith(prefix))) return;
-    // No await separates this check from starting the native turn, so a held reservation never
-    // increments the ticket's turn budget.
+    // A held reservation prevents both effort inference and consuming the ticket's turn budget.
     if (store.reservationHeld(id)) return;
     if (store.queuedTurn(id, key)?.state !== "queued") return;
     const kind = key.startsWith("stuck-recovery-") ? "recovery" : key.startsWith("redirect-") ? "redirect" : queued.kind;
-    const choice = await chooseEffort(store, assignment.ticketId, assignment.harness!, assignment.model!, kind, queued.prompt, this.#deps.askEffort);
+    const controller = new AbortController();
+    this.#inFlight.set(id, controller);
+    let choice: Awaited<ReturnType<typeof chooseEffort>>;
+    try {
+      choice = await chooseEffort(store, assignment.ticketId, assignment.harness!, assignment.model!, kind, queued.prompt, this.#deps.askEffort, controller.signal);
+    } finally {
+      if (this.#inFlight.get(id) === controller) this.#inFlight.delete(id);
+    }
     // Inference yields: recheck state, pause and merge reservation before claiming the turn.
     const rechecked = store.getAssignment(id);
     if (this.#stopping || rechecked.state !== "running" || rechecked.outcome === "failed" || store.reservationHeld(id)) return;
@@ -431,7 +437,6 @@ export class Workers {
     store.startWorkerTurn(id, kind, choice.effort, choice.reason);
     queueStatusCard(store, assignment.ticketId);
     onStart?.(turnId);
-    const controller = new AbortController();
     this.#inFlight.set(id, controller);
     let result: TurnResult;
     try {

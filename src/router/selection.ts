@@ -64,7 +64,7 @@ export interface EffortChoice { effort: Effort | null; reason: string }
 
 /** The caller supplies the Router's one-shot read-only inference transport. */
 export async function chooseEffort(store: Store, ticketId: number, harness: Harness, model: string, kind: string, prompt: string,
-  ask?: (message: string) => Promise<string>): Promise<EffortChoice> {
+  ask?: (message: string, signal?: AbortSignal) => Promise<string>, signal?: AbortSignal): Promise<EffortChoice> {
   const allowed = turnEfforts(store, harness, model);
   const override = store.ticketModel(ticketId)?.effort;
   if (override != null && allowed.includes(override as Effort)) return { effort: override as Effort, reason: "Persistent operator effort override." };
@@ -77,7 +77,7 @@ export async function chooseEffort(store: Store, ticketId: number, harness: Harn
       'Prefer the lowest effort that can complete the turn. Answer only JSON: {"effort":"...","reason":"one line"}.',
       JSON.stringify({ model, harness, objective: store.models.view().objective, allowed, kind, prompt,
         history: store.ticketTurns(ticketId).map((turn) => ({ kind: turn.kind, effort: turn.requestedEffort, status: turn.status, result: turn.result })) }),
-    ].join("\n"));
+    ].join("\n"), signal);
     const currentAllowed = turnEfforts(store, harness, model);
     const latestOverride = store.ticketModel(ticketId)?.effort;
     if (latestOverride != null && currentAllowed.includes(latestOverride as Effort)) return { effort: latestOverride as Effort, reason: "Persistent operator effort override." };

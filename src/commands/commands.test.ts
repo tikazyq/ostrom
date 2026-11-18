@@ -189,7 +189,8 @@ test("closing the issue cancels a hung turn, gets the graceful stop prompt and e
   const { github, runner, store, workers, ticketId, assignmentId } = fixture();
   runner.hold = true;
   workers.deliver(assignmentId, "hung", "work", () => {});
-  await Promise.resolve();
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(runner.sessions[0]?.running, 1, "the Worker turn must be running before issue closure");
   const source = store.ensureSource("github", REPO);
   store.insertTrigger({
     sourceId: source.id, sourceEventId: "closed-state", threadId: store.ticketContext(ticketId).thread.id,

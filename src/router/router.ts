@@ -394,6 +394,7 @@ function flaggedStalls(store: Store): StallItem[] {
 export async function askRouter(
   options: Pick<RouteOptions, "router" | "runners">,
   text: string,
+  signal?: AbortSignal,
 ): Promise<{ sessionId: string; reply: string }> {
   const cwd = await mkdtemp(join(tmpdir(), "ostrom-router-"));
   try {
@@ -404,7 +405,7 @@ export async function askRouter(
       sandbox: "read-only",
       onSessionId: (id) => { sessionId = id; },
     });
-    const result = await session.send(text);
+    const result = await session.send(text, signal);
     if (result.status !== "completed" || sessionId === null) {
       throw new RouterRunError(`Router session ${sessionId ?? "unknown"} ended ${result.status}`);
     }
