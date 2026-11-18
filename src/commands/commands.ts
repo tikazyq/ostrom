@@ -49,6 +49,7 @@ export function operatorControls(store: Store, workers: Workers, gh: GhRunner, r
           store.enqueueReply({ id: `operator-stopped-${ticketId}`, threadId: store.ticketContext(ticketId).thread.id, body: result.text, blocking: true });
           queueStatusCard(store, ticketId);
         },
+        true,
       );
     },
   };
@@ -112,12 +113,14 @@ export async function routeCommands(
             store.enqueueReply({ id: `stopped-issue-closed-${pending.ticketId}`, threadId: pending.trigger.threadId, body: result.text, blocking: true });
             queueStatusCard(store, pending.ticketId);
           },
+          true,
         );
       } else if (command === "redirect") {
         const assignment = store.latestAssignment(pending.ticketId);
         if (assignment?.state !== "running") throw new Error(`ticket ${pending.ticketId} has no running Worker`);
         const instruction = await collaborator(gh, repo, pending.trigger.actor, permissions);
         store.recordCommandReceipt(pending.trigger.id, pending.ticketId, "redirect", instruction);
+        if (store.clearStallForHumanReply(assignment.id) !== null) store.resumeTicket(pending.ticketId);
         const added = workers.deliver(
           assignment.id,
           `redirect-${pending.trigger.id}-${assignment.id}`,
@@ -166,6 +169,7 @@ export async function routeCommands(
             store.enqueueReply({ id: `stopped-${pending.ticketId}`, threadId: pending.trigger.threadId, body: result.text, blocking: true });
             queueStatusCard(store, pending.ticketId);
           },
+          true,
         );
       }
       pass.handled.push({ triggerId: pending.trigger.id, ticketId: pending.ticketId, command, allowed });

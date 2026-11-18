@@ -60,6 +60,48 @@ test("dispatch makes the worktree, starts the session with the brief and stores 
   assert.deepEqual([done.turnStartedAt, done.inputTokens, done.cachedInputTokens, done.outputTokens, done.outcome], [null, 10, 5, 2, null]);
 });
 
+test("replacement cancels a hung first turn without an assignment outcome and keeps turns serial", async () => {
+  const { store, runner, ticketId, workers } = fixture();
+  runner.hold = true;
+  await workers.dispatch(ticketId);
+  const session = runner.sessions[0]!;
+  session.auto = true;
+  let completed = false;
+  workers.deliver(1, "replacement", "recover", () => {
+    assert.equal(store.getAssignment(1).outcome, null);
+    assert.equal(store.getAssignment(1).consecutiveErrors, 0);
+  }, () => { completed = true; }, true);
+  await workers.drain();
+  assert.equal(completed, true);
+  assert.equal(session.maxRunning, 1);
+  assert.equal(session.prompts.length, 2);
+  assert.deepEqual(
+    [store.getAssignment(1).state, store.getAssignment(1).outcome, store.getAssignment(1).turnStartedAt],
+    ["running", null, null],
+  );
+});
+
+test("replacement cancels a hung follow-up without calling its completion handler", async () => {
+  const { store, runner, ticketId, workers } = fixture();
+  await workers.dispatch(ticketId);
+  await workers.drain();
+  const session = runner.sessions[0]!;
+  session.auto = false;
+  let started!: () => void;
+  const running = new Promise<void>((resolve) => { started = resolve; });
+  let completed = false;
+  workers.deliver(1, "hung", "hang", started, () => { completed = true; });
+  await running;
+  session.auto = true;
+  workers.deliver(1, "replacement", "recover", () => {
+    assert.equal(store.getAssignment(1).outcome, null);
+  }, undefined, true);
+  await workers.drain();
+  assert.equal(completed, false);
+  assert.equal(session.maxRunning, 1);
+  assert.equal(store.getAssignment(1).turns, 3);
+});
+
 test("a reached ticket budget pauses after the current turn and asks the Worker to push WIP", async () => {
   const { store, runner, ticketId, workers } = fixture();
   store.setTicketBudget(ticketId, { timeMinutes: 480, idleMinutes: 30, turns: 1, tokens: 1_000_000, escalations: 0 });

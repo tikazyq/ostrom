@@ -49,7 +49,7 @@ export function parseStuckReply(text: string, cause: string): StuckReply {
 export async function advanceStuckLadder(store: Store, workers: Workers): Promise<{ recovered: number[]; published: number[] }> {
   const result = { recovered: [] as number[], published: [] as number[] };
   for (const stall of store.unansweredStalls()) {
-    if (stall.recoveryAttempts < 2 && stall.publicAt === null) {
+    if (store.getAssignment(stall.assignmentId).recoveryAttempts < 2 && stall.publicAt === null) {
       const started = store.beginStallRecovery(stall.id);
       if (started === null) continue;
       workers.deliver(
@@ -59,6 +59,8 @@ export async function advanceStuckLadder(store: Store, workers: Workers): Promis
           ? "Ostrom detected that this ticket is stuck. Check the state, make progress, and continue the work."
           : "Ostrom still sees this ticket as stuck. Retry the work from the current state and make progress.",
         () => {},
+        undefined,
+        true,
       );
       queueStatusCard(store, store.getAssignment(stall.assignmentId).ticketId);
       result.recovered.push(stall.id);
@@ -91,5 +93,6 @@ async function publish(store: Store, workers: Workers, stall: Stall): Promise<vo
       store.enqueueReply({ id: `stuck-${stall.id}`, threadId: context.thread.id, body: reply, blocking: true });
       queueStatusCard(store, assignment.ticketId);
     },
+    true,
   );
 }

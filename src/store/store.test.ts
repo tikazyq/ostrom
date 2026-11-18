@@ -65,6 +65,34 @@ test("migrations apply once and record their version", () => {
   );
 });
 
+test("recovery attempts persist across episodes and Store instances, and reset on human follow-up or end", () => {
+  const db = database({ enableForeignKeyConstraints: true });
+  const first = new Store(db);
+  const source = first.ensureSource("github", "onsager-ai/ostrom");
+  const issue = first.ensureThread({ sourceId: source.id, kind: "issue", number: 7, url: "https://github.com/onsager-ai/ostrom/issues/7" });
+  const trigger = first.insertTrigger({
+    sourceId: source.id, sourceEventId: "accepted", threadId: issue, kind: "issue_comment", actor: "alice",
+    url: "https://github.com/onsager-ai/ostrom/issues/7#issuecomment-1", occurredAt: new Date(),
+  });
+  const ticket = first.recordDecision({ threadId: issue, triggerIds: [trigger.id], verdict: "accept", reason: "work" }).ticketId!;
+  const assignment = first.createAssignment(ticket);
+  first.configureNativeAssignment(assignment, { harness: "codex", model: "m", worktree: "/wt", branch: "b", machine: "host" });
+  first.startNativeAssignment(assignment, "session");
+  const one = first.recordStall({ assignmentId: assignment, semonReason: "no-output", detail: null });
+  assert.equal(first.beginStallRecovery(one.id)?.recoveryAttempts, 1);
+  first.clearStall(assignment);
+
+  const reopened = new Store(db);
+  const two = reopened.recordStall({ assignmentId: assignment, semonReason: "no-output", detail: null });
+  assert.equal(reopened.beginStallRecovery(two.id)?.recoveryAttempts, 2);
+  assert.equal(reopened.beginStallRecovery(two.id), null);
+  assert.equal(reopened.clearStallForHumanReply(assignment), null);
+  assert.equal(reopened.getAssignment(assignment).recoveryAttempts, 0);
+  assert.equal(reopened.beginStallRecovery(two.id)?.recoveryAttempts, 1);
+  reopened.endAssignment(assignment);
+  assert.equal(reopened.getAssignment(assignment).recoveryAttempts, 0);
+});
+
 test("a database newer than the code is refused", () => {
   const db = database();
   migrate(db);

@@ -1,69 +1,36 @@
-// The scripted stall (docs/direction.md, milestone 1 pass criterion): seeds a throwaway store,
-// creates a native Worker's worktree, and starts it on gpt-6-luna with one question to ask.
-// After OSTROM_STALL_MINUTES the Watchdog flags the stalled native session.
-//
-//   node src/watchdog/scripted-stall.ts <issue-number>
-//
-// Environment: OSTROM_REPO, OSTROM_ALLOWLIST, OSTROM_DB (use a new file), OSTROM_WORKER_REPO and
-// OSTROM_WORKER_BASE. The issue is only where a Router reply would go; nothing is posted unless
-// `ostromd send` runs on this store, so never run `send` on it.
+// Seed accepted work for the daemon-backed stall exercise (docs/watchdog.md).
+// ostromd owns the worktree, session, hung turn and every subsequent recovery turn.
 
-import { join } from "node:path";
-
-import { loadConfig, loadWorkerConfig } from "../ostromd/config.ts";
-import { sessionConfig } from "../session/config.ts";
-import { codexRunner } from "../session/runner.ts";
-import { createWorktree } from "../session/worktree.ts";
+import { loadConfig } from "../ostromd/config.ts";
 import { Store } from "../store/store.ts";
 
 export const STALL_BRIEF = [
   "This is a scripted stall for Ostrom's Watchdog test.",
-  "Ask the operator exactly one question: Which colour should the scripted stall use, red or blue?",
-  "Wait for the answer. Do not make any edits or run commands.",
+  "For the initial work turn only, run `sleep 3600` as a foreground shell command and wait for it.",
+  "Do not edit files, commit, push, or open a pull request for this exercise.",
+  "If Ostrom interrupts you with a recovery message, run `sleep 3600` again and wait.",
+  "If Ostrom asks for the public stuck reply or a graceful stop, follow that new message instead of sleeping.",
 ].join("\n");
 
-async function scriptedStall(issue: number): Promise<void> {
-  const config = loadConfig(process.env);
-  const worker = loadWorkerConfig(process.env);
-  const store = Store.open(config.dbPath);
-  try {
-    const source = store.ensureSource("github", config.repo);
-    const url = `https://github.com/${config.repo}/issues/${issue}`;
-    const threadId = store.ensureThread({ sourceId: source.id, kind: "issue", number: issue, url });
-    const trigger = store.insertTrigger({
-      sourceId: source.id,
-      sourceEventId: `scripted-stall-${Date.now()}`,
-      threadId,
-      kind: "issue_comment",
-      actor: config.allowlist[0]!,
-      url: `${url}#scripted-stall`,
-      occurredAt: new Date(),
-    });
-    const { ticketId } = store.recordDecision({
-      threadId,
-      triggerIds: [trigger.id],
-      verdict: "accept",
-      reason: "Scripted stall: the Worker asks a question and waits.",
-    });
-    const assignmentId = store.createAssignment(ticketId!);
-    const path = join(worker.worktrees, `ticket-${ticketId}-${assignmentId}`);
-    const branch = await createWorktree(worker.repo, path, worker.base, ticketId!, assignmentId);
-    store.configureNativeAssignment(assignmentId, {
-      harness: "codex", model: "gpt-6-luna", worktree: path, branch, machine: worker.machine,
-    });
-    const { codex } = sessionConfig(process.env);
-    const session = codexRunner(codex).start({
-      cwd: path,
-      model: "gpt-6-luna",
-      writableDirs: [join(worker.repo, ".git")],
-      onSessionId: (sessionId) => store.startNativeAssignment(assignmentId, sessionId),
-    });
-    const result = await session.send(STALL_BRIEF);
-    if (result.status !== "completed" || result.sessionId === null) throw new Error("scripted Worker did not start");
-    process.stdout.write(`${JSON.stringify({ ticketId, assignmentId, sessionId: result.sessionId, branch, worktree: path })}\n`);
-  } finally {
-    store.close();
-  }
+export function seedScriptedStall(store: Store, repo: string, actor: string, issue: number): number {
+  const source = store.ensureSource("github", repo);
+  const url = `https://github.com/${repo}/issues/${issue}`;
+  const threadId = store.ensureThread({ sourceId: source.id, kind: "issue", number: issue, url });
+  const trigger = store.insertTrigger({
+    sourceId: source.id,
+    sourceEventId: `scripted-stall-${Date.now()}`,
+    threadId,
+    kind: "issue_comment",
+    actor,
+    url: `${url}#scripted-stall`,
+    occurredAt: new Date(),
+  });
+  return store.recordDecision({
+    threadId,
+    triggerIds: [trigger.id],
+    verdict: "accept",
+    reason: STALL_BRIEF,
+  }).ticketId!;
 }
 
 if (import.meta.main) {
@@ -73,7 +40,14 @@ if (import.meta.main) {
     process.exitCode = 2;
   } else {
     try {
-      await scriptedStall(Number(issue));
+      const config = loadConfig(process.env);
+      const store = Store.open(config.dbPath);
+      try {
+        const ticketId = seedScriptedStall(store, config.repo, config.allowlist[0]!, Number(issue));
+        process.stdout.write(`${JSON.stringify({ ticketId })}\n`);
+      } finally {
+        store.close();
+      }
     } catch (error) {
       process.stderr.write(`scripted-stall: ${error instanceof Error ? error.message : String(error)}\n`);
       process.exitCode = 1;

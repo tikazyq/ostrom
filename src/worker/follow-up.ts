@@ -24,10 +24,6 @@ export function routeFollowUps(store: Store, workers: Workers): RoutePass {
   const grouped = new Set<string>();
   for (const delivery of pending) {
     const { trigger, ticketId, assignmentId } = delivery;
-    if (assignmentId !== null && store.clearStallForHumanReply(assignmentId) !== null) {
-      store.resumeTicket(ticketId);
-      queueStatusCard(store, ticketId);
-    }
     if (assignmentId === null) {
       pass.failed.push({ triggerId: trigger.id, ticketId, error: `ticket ${ticketId} has no running Worker` });
       continue;
@@ -56,7 +52,13 @@ export function routeFollowUps(store: Store, workers: Workers): RoutePass {
           });
         },
       );
-      if (added) pass.queued.push({ triggerId: trigger.id, ticketId, assignmentId });
+      if (added) {
+        if (store.clearStallForHumanReply(assignmentId) !== null) {
+          store.resumeTicket(ticketId);
+          queueStatusCard(store, ticketId);
+        }
+        pass.queued.push({ triggerId: trigger.id, ticketId, assignmentId });
+      }
       continue;
     }
     const added = workers.deliver(
@@ -68,7 +70,13 @@ export function routeFollowUps(store: Store, workers: Workers): RoutePass {
         enqueueReceivedReaction(store, trigger);
       },
     );
-    if (added) pass.queued.push({ triggerId: trigger.id, ticketId, assignmentId });
+    if (added) {
+      if (store.clearStallForHumanReply(assignmentId) !== null) {
+        store.resumeTicket(ticketId);
+        queueStatusCard(store, ticketId);
+      }
+      pass.queued.push({ triggerId: trigger.id, ticketId, assignmentId });
+    }
   }
   return pass;
 }

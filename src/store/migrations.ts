@@ -357,6 +357,17 @@ export const migrations: readonly string[] = [
   ALTER TABLE assignment ADD COLUMN last_error TEXT;
   ALTER TABLE assignment ADD COLUMN consecutive_errors INTEGER NOT NULL DEFAULT 0 CHECK (consecutive_errors >= 0);
   `,
+
+  // 19: Recovery attempts belong to the assignment and survive Semon clearing an episode.
+  `
+  ALTER TABLE assignment ADD COLUMN recovery_attempts INTEGER NOT NULL DEFAULT 0 CHECK (recovery_attempts >= 0 AND recovery_attempts <= 2);
+  UPDATE assignment SET recovery_attempts = MIN(2, (
+    SELECT COALESCE(SUM(stall.recovery_attempts), 0) FROM stall
+    WHERE stall.assignment_id = assignment.id AND stall.detected_at > COALESCE((
+      SELECT MAX(cleared_by_human_at) FROM stall WHERE assignment_id = assignment.id
+    ), '')
+  )) WHERE state = 'running';
+  `,
 ];
 
 /** Applies every migration newer than the database's version. Returns the resulting version. */

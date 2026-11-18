@@ -42,6 +42,7 @@ export class Workers {
   readonly #deps: WorkersDeps;
   readonly #sessions = new Map<number, Session>();
   readonly #chains = new Map<number, Promise<void>>();
+  readonly #turns = new Map<number, AbortController>();
   readonly #queued = new Set<string>();
   readonly #budgetPauses = new Set<number>();
 
@@ -92,7 +93,8 @@ export class Workers {
   /**
    * Queues a follow-up turn on the assignment's session. `onStart` runs when the turn begins, with
    * the turn's id; that is when the caller records delivery, so a message lost with the queue in a
-   * crash is sent again. Returns false when the same key is already queued.
+   * crash is sent again. Returns false when the same key is already queued. `replace` aborts the
+   * active turn and permits the new control turn even while the ticket is paused.
    */
   deliver(
     assignmentId: number,
@@ -100,13 +102,15 @@ export class Workers {
     prompt: string,
     onStart: (turnId: string) => void,
     onComplete?: (result: TurnResult) => void | Promise<void>,
+    replace = false,
   ): boolean {
     if (this.#queued.has(key)) return false;
+    if (replace) this.#turns.get(assignmentId)?.abort();
     this.#queued.add(key);
     void this.#enqueue(assignmentId, () => this.#turn(assignmentId, prompt, (turnId) => {
       onStart(turnId);
       this.#queued.delete(key);
-    }, onComplete, key)).finally(() => this.#queued.delete(key));
+    }, onComplete, key, replace)).finally(() => this.#queued.delete(key));
     return true;
   }
 
@@ -161,11 +165,28 @@ export class Workers {
     return next;
   }
 
+  /** A replacement waits for the SDK to release the session before the next queued turn starts. */
+  async #send(id: number, session: Session, prompt: string): Promise<TurnResult | null> {
+    const controller = new AbortController();
+    this.#turns.set(id, controller);
+    try {
+      const result = await session.send(prompt, controller.signal);
+      if (!controller.signal.aborted) return result;
+    } catch (error) {
+      if (!controller.signal.aborted) throw error;
+    } finally {
+      this.#turns.delete(id);
+    }
+    // Ostrom cancelled this turn to replace it; it is not a cancelled assignment outcome.
+    this.#deps.store.endTurn(id, null);
+    return null;
+  }
+
   async #firstTurn(id: number, session: Session, prompt: string): Promise<void> {
     const { store } = this.#deps;
-    let result: TurnResult;
+    let result: TurnResult | null;
     try {
-      result = await session.send(prompt);
+      result = await this.#send(id, session, prompt);
     } catch (error) {
       if (store.getAssignment(id).state === "pending") {
         store.abandonAssignment(id, error instanceof Error ? error.message : String(error));
@@ -174,6 +195,7 @@ export class Workers {
       }
       return;
     }
+    if (result === null) return;
     this.#finished(id, result);
   }
 
@@ -183,22 +205,24 @@ export class Workers {
     onStart?: (turnId: string) => void,
     onComplete?: (result: TurnResult) => void | Promise<void>,
     key = "",
+    replace = false,
   ): Promise<void> {
     const { store } = this.#deps;
     const assignment = store.getAssignment(id);
     if (assignment.state !== "running") return;
     const ticket = store.getTicket(assignment.ticketId);
-    if (ticket.state === "paused" && !key.startsWith("budget-pause-") && !key.startsWith("stuck-")) return;
+    if (ticket.state === "paused" && !replace && !key.startsWith("budget-pause-")) return;
     const session = this.#session(assignment);
     const turn = store.beginTurn(id);
     onStart?.(`${assignment.sessionId}:${turn}`);
-    let result: TurnResult;
+    let result: TurnResult | null;
     try {
-      result = await session.send(prompt);
+      result = await this.#send(id, session, prompt);
     } catch (error) {
       this.#failed(id, error);
       return;
     }
+    if (result === null) return;
     this.#finished(id, result);
     if (result.status === "completed") await onComplete?.(result);
   }

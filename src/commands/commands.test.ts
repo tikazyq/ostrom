@@ -6,7 +6,7 @@ import { FakeGitHub } from "../github/fake-github.ts";
 import { Store } from "../store/store.ts";
 import { FakeRunner } from "../worker/fake-runner.ts";
 import { Workers } from "../worker/workers.ts";
-import { routeCommands } from "./commands.ts";
+import { operatorControls, routeCommands } from "./commands.ts";
 import { parseComment } from "./parser.ts";
 import { controlsLine, renderCommandTable } from "./table.ts";
 
@@ -110,6 +110,53 @@ test("closing the issue gets the graceful stop prompt and ends with the distinct
   assert.match(runner.sessions[0]!.prompts.at(-1)!, /issue was closed/);
   assert.equal(store.getTicket(ticketId).state, "ended");
   assert.ok(store.dueReplies().some((reply) => reply.id === `stopped-issue-closed-${ticketId}`));
+});
+
+test("stop and issue closure replace a hung turn even on a paused ticket", async () => {
+  for (const control of ["operator", "stop", "close_issue"] as const) {
+    const { store, github, runner, workers, ticketId, assignmentId, comment } = fixture();
+    runner.hold = true;
+    let started!: () => void;
+    const running = new Promise<void>((resolve) => { started = resolve; });
+    workers.deliver(assignmentId, "hung", "hang", started);
+    await running;
+    runner.sessions[0]!.auto = true;
+    const stall = store.recordStall({ assignmentId, semonReason: "no-output", detail: null });
+    store.beginStallRecovery(stall.id);
+    store.pauseTicket(ticketId);
+    if (control === "operator") {
+      await operatorControls(store, workers, github.gh, REPO).stop(ticketId);
+    } else {
+      if (control === "stop") comment("stop", "alice", "@ostrom stop");
+      else {
+        const context = store.ticketContext(ticketId);
+        store.insertTrigger({
+          sourceId: context.source.id, sourceEventId: "closed", threadId: context.thread.id,
+          kind: "issue_state", actor: "alice", url: context.thread.url, occurredAt: new Date(), body: "closed",
+        });
+      }
+      assert.deepEqual((await routeCommands(store, workers, github.gh, REPO)).failed, []);
+    }
+    await workers.drain();
+    assert.equal(store.getTicket(ticketId).state, "ended", control);
+    const assignment = store.getAssignment(assignmentId);
+    assert.equal(assignment.state, "ended", control);
+    assert.equal(assignment.recoveryAttempts, 0, control);
+    assert.equal(assignment.outcome, null, control);
+    assert.equal(runner.sessions[0]!.maxRunning, 1, control);
+    assert.match(runner.sessions[0]!.prompts[1]!, /gracefully/);
+  }
+});
+
+test("a human redirect resets recovery attempts before another stall episode", async () => {
+  const { store, github, workers, assignmentId, comment } = fixture();
+  const stall = store.recordStall({ assignmentId, semonReason: "no-output", detail: null });
+  store.beginStallRecovery(stall.id);
+  store.clearStall(assignmentId);
+  comment("redirect", "alice", "try the other approach");
+  await routeCommands(store, workers, github.gh, REPO);
+  await workers.drain();
+  assert.equal(store.getAssignment(assignmentId).recoveryAttempts, 0);
 });
 
 test("a merged PR leaves the attempt to the Router's outcome; a PR closed unmerged ends it", async () => {
