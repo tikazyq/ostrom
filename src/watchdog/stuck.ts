@@ -49,29 +49,30 @@ export function parseStuckReply(text: string, cause: string): StuckReply {
 export async function advanceStuckLadder(store: Store, workers: Workers): Promise<{ recovered: number[]; published: number[] }> {
   const result = { recovered: [] as number[], published: [] as number[] };
   for (const stall of store.unansweredStalls()) {
-    if (stall.recoveryAttempts < 2 && stall.publicAt === null) {
-      const started = store.beginStallRecovery(stall.id);
-      if (started === null) continue;
+    if (stall.publicAt !== null || workers.isStopping(stall.assignmentId)) continue;
+    const attempt = store.beginStallRecovery(stall.id);
+    if (attempt !== null) {
       workers.deliver(
         stall.assignmentId,
-        `stuck-recovery-${stall.id}-${started.recoveryAttempts}`,
-        started.recoveryAttempts === 1
+        `stuck-recovery-${stall.id}-${attempt}`,
+        attempt === 1
           ? "Ostrom detected that this ticket is stuck. Check the state, make progress, and continue the work."
           : "Ostrom still sees this ticket as stuck. Retry the work from the current state and make progress.",
         () => {},
+        undefined,
+        "stuck",
       );
       queueStatusCard(store, store.getAssignment(stall.assignmentId).ticketId);
       result.recovered.push(stall.id);
       continue;
     }
-    if (stall.publicAt !== null) continue;
-    await publish(store, workers, stall);
+    publish(store, workers, stall);
     result.published.push(stall.id);
   }
   return result;
 }
 
-async function publish(store: Store, workers: Workers, stall: Stall): Promise<void> {
+function publish(store: Store, workers: Workers, stall: Stall): void {
   const assignment = store.getAssignment(stall.assignmentId);
   const context = store.ticketContext(assignment.ticketId);
   store.publishStall(stall.id);
@@ -86,10 +87,12 @@ async function publish(store: Store, workers: Workers, stall: Stall): Promise<vo
       "Do not include markdown or a code fence.",
     ].join(" "),
     () => {},
-    async (turn) => {
+    (turn) => {
+      if (store.getStall(stall.id).clearedAt !== null) return;
       const reply = renderStuckReply(parseStuckReply(turn.text, stall.cause ?? stall.semonReason ?? "unknown"));
       store.enqueueReply({ id: `stuck-${stall.id}`, threadId: context.thread.id, body: reply, blocking: true });
       queueStatusCard(store, assignment.ticketId);
     },
+    "stuck",
   );
 }

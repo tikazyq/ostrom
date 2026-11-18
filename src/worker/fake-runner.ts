@@ -6,7 +6,8 @@ import type { Runner, Session, SessionOptions, TurnResult } from "../session/run
 export class FakeSession implements Session {
   readonly prompts: string[] = [];
   /** Turns that have started and not finished; the test calls `release` to finish the oldest. */
-  readonly #open: { resolve: (r: TurnResult) => void; reject: (e: Error) => void }[] = [];
+  readonly #open: (() => void)[] = [];
+  aborted = 0;
   /** When true a turn finishes at once instead of waiting for `release`. */
   auto = true;
   failWith: Error | undefined;
@@ -24,7 +25,7 @@ export class FakeSession implements Session {
     this.resumed = resumed;
   }
 
-  async send(prompt: string): Promise<TurnResult> {
+  async send(prompt: string, signal?: AbortSignal): Promise<TurnResult> {
     this.prompts.push(prompt);
     this.running++;
     this.maxRunning = Math.max(this.maxRunning, this.running);
@@ -38,20 +39,27 @@ export class FakeSession implements Session {
         model: null,
       };
       if (this.auto) return result;
-      return await new Promise<TurnResult>((resolve, reject) => this.#open.push({ resolve, reject }));
+      return await new Promise<TurnResult>((resolve) => {
+        const release = () => {
+          signal?.removeEventListener("abort", abort);
+          resolve(result);
+        };
+        const abort = () => {
+          this.#open.splice(this.#open.indexOf(release), 1);
+          this.aborted++;
+          resolve({ ...result, status: "cancelled", usage: null });
+        };
+        this.#open.push(release);
+        if (signal?.aborted) abort();
+        else signal?.addEventListener("abort", abort, { once: true });
+      });
     } finally {
       this.running--;
     }
   }
 
   release(): void {
-    this.#open.shift()!.resolve({
-      sessionId: this.id,
-      text: "ok",
-      status: "completed",
-      usage: { inputTokens: 10, cachedInputTokens: 5, outputTokens: 2 },
-      model: null,
-    });
+    this.#open.shift()!();
   }
 }
 
@@ -74,11 +82,11 @@ export class FakeRunner implements Runner {
     }
     const send = session.send.bind(session);
     let announced = false;
-    session.send = async (prompt) => {
+    session.send = async (prompt, signal) => {
       if (!announced) options.onSessionId?.(session.id);
       announced = true;
       if (this.failAfterId !== undefined) throw this.failAfterId;
-      return send(prompt);
+      return send(prompt, signal);
     };
     return session;
   }

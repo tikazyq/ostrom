@@ -2,7 +2,7 @@ import { queueStatusCard } from "../github/cards.ts";
 import { ghGet, type GhRunner } from "../github/gh.ts";
 import type { Store, Trigger } from "../store/store.ts";
 import { pullRequestsForBranch } from "../worker/dispatch.ts";
-import { followUpMessage } from "../worker/follow-up.ts";
+import { followUpMessage, receiveHumanFollowUp } from "../worker/follow-up.ts";
 import type { Workers } from "../worker/workers.ts";
 import { parseComment } from "./parser.ts";
 
@@ -49,6 +49,7 @@ export function operatorControls(store: Store, workers: Workers, gh: GhRunner, r
           store.enqueueReply({ id: `operator-stopped-${ticketId}`, threadId: store.ticketContext(ticketId).thread.id, body: result.text, blocking: true });
           queueStatusCard(store, ticketId);
         },
+        "stop",
       );
     },
   };
@@ -112,6 +113,7 @@ export async function routeCommands(
             store.enqueueReply({ id: `stopped-issue-closed-${pending.ticketId}`, threadId: pending.trigger.threadId, body: result.text, blocking: true });
             queueStatusCard(store, pending.ticketId);
           },
+          "stop",
         );
       } else if (command === "redirect") {
         const assignment = store.latestAssignment(pending.ticketId);
@@ -128,6 +130,7 @@ export async function routeCommands(
           },
         );
         if (!added) continue;
+        receiveHumanFollowUp(store, pending.ticketId, assignment.id);
       } else if (command === "pause") {
         const assignment = store.latestAssignment(pending.ticketId);
         if (assignment?.state !== "running") throw new Error(`ticket ${pending.ticketId} has no running Worker`);
@@ -166,6 +169,7 @@ export async function routeCommands(
             store.enqueueReply({ id: `stopped-${pending.ticketId}`, threadId: pending.trigger.threadId, body: result.text, blocking: true });
             queueStatusCard(store, pending.ticketId);
           },
+          "stop",
         );
       }
       pass.handled.push({ triggerId: pending.trigger.id, ticketId: pending.ticketId, command, allowed });

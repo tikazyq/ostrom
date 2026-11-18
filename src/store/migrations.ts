@@ -357,6 +357,19 @@ export const migrations: readonly string[] = [
   ALTER TABLE assignment ADD COLUMN last_error TEXT;
   ALTER TABLE assignment ADD COLUMN consecutive_errors INTEGER NOT NULL DEFAULT 0 CHECK (consecutive_errors >= 0);
   `,
+
+  // 19: Recovery attempts carry across stall episodes until a human replies or the assignment ends.
+  `
+  ALTER TABLE assignment ADD COLUMN recovery_attempts INTEGER NOT NULL DEFAULT 0 CHECK (recovery_attempts BETWEEN 0 AND 2);
+  UPDATE assignment SET recovery_attempts = (
+    SELECT MIN(2, COALESCE(SUM(stall.recovery_attempts), 0)) FROM stall
+    WHERE stall.assignment_id = assignment.id AND stall.id > COALESCE((
+      SELECT MAX(previous.id) FROM stall AS previous
+      WHERE previous.assignment_id = assignment.id AND previous.cleared_by_human_at IS NOT NULL
+    ), 0)
+  ) WHERE state = 'running';
+  ALTER TABLE stall DROP COLUMN recovery_attempts;
+  `,
 ];
 
 /** Applies every migration newer than the database's version. Returns the resulting version. */

@@ -38,10 +38,20 @@ export const INTERRUPTED_PROMPT =
   "You were interrupted while working on this ticket. Check your state (git status, your branch and " +
   "pull request) and continue where you stopped.";
 
+type TurnMode = "normal" | "stuck" | "stop";
+
+type QueuedTurn = { mode: TurnMode; run: () => Promise<void> };
+type TurnQueue = {
+  waiting: QueuedTurn[];
+  activeMode: TurnMode | null;
+  controller: AbortController | null;
+  done: Promise<void>;
+};
+
 export class Workers {
   readonly #deps: WorkersDeps;
   readonly #sessions = new Map<number, Session>();
-  readonly #chains = new Map<number, Promise<void>>();
+  readonly #queues = new Map<number, TurnQueue>();
   readonly #queued = new Set<string>();
   readonly #budgetPauses = new Set<number>();
 
@@ -100,14 +110,26 @@ export class Workers {
     prompt: string,
     onStart: (turnId: string) => void,
     onComplete?: (result: TurnResult) => void | Promise<void>,
+    mode: TurnMode = "normal",
   ): boolean {
     if (this.#queued.has(key)) return false;
     this.#queued.add(key);
-    void this.#enqueue(assignmentId, () => this.#turn(assignmentId, prompt, (turnId) => {
-      onStart(turnId);
-      this.#queued.delete(key);
-    }, onComplete, key)).finally(() => this.#queued.delete(key));
+    void this.#enqueue(assignmentId, async () => {
+      try {
+        await this.#turn(assignmentId, prompt, (turnId) => {
+          onStart(turnId);
+          if (mode === "normal") this.#queued.delete(key);
+        }, onComplete, key, mode);
+      } finally {
+        this.#queued.delete(key);
+      }
+    }, mode);
     return true;
+  }
+
+  isStopping(id: number): boolean {
+    const queue = this.#queues.get(id);
+    return queue !== undefined && (queue.activeMode === "stop" || queue.waiting.some((turn) => turn.mode === "stop"));
   }
 
   /**
@@ -135,7 +157,7 @@ export class Workers {
 
   /** Resolves when every queued and running turn has finished. */
   async drain(): Promise<void> {
-    while (this.#chains.size > 0) await Promise.all([...this.#chains.values()]);
+    while (this.#queues.size > 0) await Promise.all([...this.#queues.values()].map((queue) => queue.done));
   }
 
   #session(assignment: Assignment): Session {
@@ -152,20 +174,59 @@ export class Workers {
     return session;
   }
 
-  #enqueue(id: number, job: () => Promise<void>): Promise<void> {
-    const next = (this.#chains.get(id) ?? Promise.resolve()).then(job);
-    this.#chains.set(id, next);
-    void next.finally(() => {
-      if (this.#chains.get(id) === next) this.#chains.delete(id);
-    });
-    return next;
+  #enqueue(id: number, job: () => Promise<void>, mode: TurnMode = "normal"): Promise<void> {
+    let queue = this.#queues.get(id);
+    if (queue === undefined) {
+      const next: TurnQueue = {
+        waiting: [],
+        activeMode: null,
+        controller: null,
+        done: Promise.resolve().then(async () => {
+          for (let turn = next.waiting.shift(); turn !== undefined; turn = next.waiting.shift()) {
+            next.activeMode = turn.mode;
+            await turn.run();
+          }
+          this.#queues.delete(id);
+        }),
+      };
+      this.#queues.set(id, next);
+      queue = next;
+    }
+    const { promise: done, resolve, reject } = Promise.withResolvers<void>();
+    const turn = { mode, run: () => job().then(resolve, reject) };
+    // Replacements go ahead of ordinary follow-ups. Graceful stop has the highest priority.
+    const index = queue.waiting.findIndex((item) =>
+      (mode === "stop" && item.mode !== "stop") || (mode === "stuck" && item.mode === "normal"),
+    );
+    if (index === -1) queue.waiting.push(turn);
+    else queue.waiting.splice(index, 0, turn);
+    if (mode !== "normal" && queue.activeMode !== "stop") queue.controller?.abort();
+    return done;
+  }
+
+  async #send(id: number, session: Session, prompt: string): Promise<TurnResult | null> {
+    const queue = this.#queues.get(id)!;
+    const controller = new AbortController();
+    queue.controller = controller;
+    let result: TurnResult | undefined;
+    try {
+      result = await session.send(prompt, controller.signal);
+      if (!controller.signal.aborted) return result;
+    } catch (error) {
+      if (!controller.signal.aborted) throw error;
+    } finally {
+      queue.controller = null;
+    }
+    // Ostrom replaces this turn on the same session. Retain usage, but do not report an outcome.
+    this.#deps.store.endTurn(id, result?.usage ?? null);
+    return null;
   }
 
   async #firstTurn(id: number, session: Session, prompt: string): Promise<void> {
     const { store } = this.#deps;
-    let result: TurnResult;
+    let result: TurnResult | null;
     try {
-      result = await session.send(prompt);
+      result = await this.#send(id, session, prompt);
     } catch (error) {
       if (store.getAssignment(id).state === "pending") {
         store.abandonAssignment(id, error instanceof Error ? error.message : String(error));
@@ -174,7 +235,7 @@ export class Workers {
       }
       return;
     }
-    this.#finished(id, result);
+    if (result !== null) this.#finished(id, result);
   }
 
   async #turn(
@@ -183,22 +244,24 @@ export class Workers {
     onStart?: (turnId: string) => void,
     onComplete?: (result: TurnResult) => void | Promise<void>,
     key = "",
+    mode: TurnMode = "normal",
   ): Promise<void> {
     const { store } = this.#deps;
     const assignment = store.getAssignment(id);
     if (assignment.state !== "running") return;
     const ticket = store.getTicket(assignment.ticketId);
-    if (ticket.state === "paused" && !key.startsWith("budget-pause-") && !key.startsWith("stuck-")) return;
+    if (ticket.state === "paused" && mode === "normal" && !key.startsWith("budget-pause-")) return;
     const session = this.#session(assignment);
     const turn = store.beginTurn(id);
     onStart?.(`${assignment.sessionId}:${turn}`);
-    let result: TurnResult;
+    let result: TurnResult | null;
     try {
-      result = await session.send(prompt);
+      result = await this.#send(id, session, prompt);
     } catch (error) {
       this.#failed(id, error);
       return;
     }
+    if (result === null) return;
     this.#finished(id, result);
     if (result.status === "completed") await onComplete?.(result);
   }

@@ -160,6 +160,7 @@ export interface Assignment {
   outputTokens: number;
   lastError: string | null;
   consecutiveErrors: number;
+  recoveryAttempts: number;
   /** The last time this Worker completed a turn. */
   lastActivityAt: string | null;
   /** Set while a turn runs; still set when ostromd starts means the turn was interrupted. */
@@ -194,7 +195,6 @@ export interface Stall {
   action: StallAction | null;
   answeredAt: string | null;
   cause: string | null;
-  recoveryAttempts: number;
   publicAt: string | null;
   clearedByHumanAt: string | null;
 }
@@ -686,7 +686,7 @@ export class Store {
   /** `running → ended`, with the reason when the Worker was stopped rather than finished. */
   endAssignment(assignmentId: number, reason: string | null = null): void {
     const { changes } = this.#run(
-      "UPDATE assignment SET state = 'ended', ended_at = ?, end_reason = ? WHERE id = ? AND state = 'running'",
+      "UPDATE assignment SET state = 'ended', ended_at = ?, end_reason = ?, recovery_attempts = 0 WHERE id = ? AND state = 'running'",
       this.#stamp(),
       reason,
       assignmentId,
@@ -948,14 +948,15 @@ export class Store {
     });
   }
 
-  /** Starts the next silent recovery. The third call returns null, leaving public escalation due. */
-  beginStallRecovery(stallId: number): Stall | null {
+  /** Starts the next silent recovery and returns its attempt number, or null if escalation is due. */
+  beginStallRecovery(stallId: number): number | null {
     const row = this.#get(
-      `UPDATE stall SET recovery_attempts = recovery_attempts + 1
-       WHERE id = ? AND cleared_at IS NULL AND public_at IS NULL AND recovery_attempts < 2 RETURNING *`,
+      `UPDATE assignment SET recovery_attempts = recovery_attempts + 1
+       WHERE id = (SELECT assignment_id FROM stall WHERE id = ? AND cleared_at IS NULL AND public_at IS NULL)
+         AND state = 'running' AND recovery_attempts < 2 RETURNING recovery_attempts`,
       stallId,
     );
-    return row === undefined ? null : toStall(row);
+    return row === undefined ? null : row["recovery_attempts"] as number;
   }
 
   /** Marks the one public stuck reply as queued. It cannot be repeated for this episode. */
@@ -968,14 +969,17 @@ export class Store {
     return toStall(row);
   }
 
-  /** A human reply clears the public stuck state without losing the episode record. */
+  /** A human reply resets the ladder. Returns the cleared public episode, if any. */
   clearStallForHumanReply(assignmentId: number): number | null {
-    const row = this.#get(
-      `UPDATE stall SET cleared_by_human_at = ?, cleared_at = ?
-       WHERE assignment_id = ? AND public_at IS NOT NULL AND cleared_at IS NULL RETURNING id`,
-      this.#stamp(), this.#stamp(), assignmentId,
-    );
-    return row === undefined ? null : row["id"] as number;
+    return this.#transaction(() => {
+      this.#run("UPDATE assignment SET recovery_attempts = 0 WHERE id = ?", assignmentId);
+      const row = this.#get(
+        `UPDATE stall SET cleared_by_human_at = ?, cleared_at = ?
+         WHERE assignment_id = ? AND cleared_at IS NULL RETURNING id, public_at`,
+        this.#stamp(), this.#stamp(), assignmentId,
+      );
+      return row === undefined || row["public_at"] === null ? null : row["id"] as number;
+    });
   }
 
   /** Ends the assignment's open stall episode, if any. Returns its id, or null when none was open. */
@@ -1001,7 +1005,7 @@ export class Store {
               stall.semon_reason AS stall_semon_reason, stall.detail AS stall_detail,
               stall.detected_at AS stall_detected_at, stall.cleared_at AS stall_cleared_at,
               stall.action AS stall_action, stall.answered_at AS stall_answered_at, stall.cause AS stall_cause,
-              stall.recovery_attempts AS stall_recovery_attempts, stall.public_at AS stall_public_at,
+              stall.public_at AS stall_public_at,
               stall.cleared_by_human_at AS stall_cleared_by_human_at
        FROM ticket JOIN assignment ON assignment.ticket_id = ticket.id JOIN stall ON stall.assignment_id = assignment.id
        WHERE stall.public_at IS NOT NULL AND stall.cleared_at IS NULL ORDER BY stall.public_at, ticket.id`,
@@ -1009,7 +1013,7 @@ export class Store {
       id: row["stall_id"], assignment_id: row["stall_assignment_id"], semon_reason: row["stall_semon_reason"],
       detail: row["stall_detail"], detected_at: row["stall_detected_at"], cleared_at: row["stall_cleared_at"],
       action: row["stall_action"], answered_at: row["stall_answered_at"], cause: row["stall_cause"],
-      recovery_attempts: row["stall_recovery_attempts"], public_at: row["stall_public_at"],
+      public_at: row["stall_public_at"],
       cleared_by_human_at: row["stall_cleared_by_human_at"],
     }) }));
   }
@@ -1303,6 +1307,7 @@ function toAssignment(row: Row): Assignment {
     outputTokens: row["output_tokens"] as number,
     lastError: row["last_error"] as string | null,
     consecutiveErrors: row["consecutive_errors"] as number,
+    recoveryAttempts: row["recovery_attempts"] as number,
     lastActivityAt: row["last_activity_at"] as string | null,
     turnStartedAt: row["turn_started_at"] as string | null,
     interruptions: row["interruptions"] as number,
@@ -1326,7 +1331,6 @@ function toStall(row: Row): Stall {
     action: row["action"] as StallAction | null,
     answeredAt: row["answered_at"] as string | null,
     cause: row["cause"] as string | null,
-    recoveryAttempts: row["recovery_attempts"] as number,
     publicAt: row["public_at"] as string | null,
     clearedByHumanAt: row["cleared_by_human_at"] as string | null,
   };
