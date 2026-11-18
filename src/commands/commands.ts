@@ -54,26 +54,28 @@ export async function routeCommands(
           `close-issue-${pending.trigger.id}-${assignment.id}`,
           "The issue was closed. Stop this ticket gracefully, push your work in progress, and summarise precisely where you stopped.",
           () => {},
-          async (result) => {
+          async (result, store) => {
             for (const pr of await pullRequests(gh, repo, assignment.branch!)) await gh(["pr", "ready", "--undo", pr]);
             store.endAssignment(assignment.id, "issue closed");
             store.endTicket(pending.ticketId);
             store.enqueueReply({ id: `stopped-issue-closed-${pending.ticketId}`, threadId: pending.trigger.threadId, body: result.text, blocking: true });
             queueStatusCard(store, pending.ticketId);
           },
+          true,
         );
       } else if (command === "redirect") {
         const assignment = store.latestAssignment(pending.ticketId);
         if (assignment?.state !== "running") throw new Error(`ticket ${pending.ticketId} has no running Worker`);
         const instruction = await collaborator(gh, repo, pending.trigger.actor, permissions);
-        store.recordCommandReceipt(pending.trigger.id, pending.ticketId, "redirect", instruction);
         const added = workers.deliver(
           assignment.id,
-          `redirect-${pending.trigger.id}-${assignment.id}`,
+          `${pending.trigger.id}:${assignment.id}`,
           followUpMessage(pending.ticketId, pending.trigger, store.getThread(pending.trigger.threadId), instruction),
-          (turnId) => {
+          (turnId, store) => {
+            store.recordCommandReceipt(pending.trigger.id, pending.ticketId, "redirect", instruction);
             store.recordDelivery(pending.trigger.id, assignment.id, turnId);
             enqueueReaction(store, pending.trigger, "eyes");
+            queueStatusCard(store, pending.ticketId);
           },
         );
         if (!added) continue;
@@ -89,6 +91,8 @@ export async function routeCommands(
           `pause-${pending.trigger.id}-${assignment.id}`,
           "Pause this ticket after the current work finishes. Push your work in progress, then stop and wait for Ostrom to resume you.",
           () => {},
+          undefined,
+          true,
         );
       } else if (command === "resume") {
         const assignment = store.latestAssignment(pending.ticketId);
@@ -108,13 +112,14 @@ export async function routeCommands(
           `stop-${pending.trigger.id}-${assignment.id}`,
           "Stop this ticket gracefully. Push your work in progress and summarise precisely where you stopped.",
           () => {},
-          async (result) => {
+          async (result, store) => {
             for (const pr of await pullRequests(gh, repo, assignment.branch!)) await gh(["pr", "ready", "--undo", pr]);
             store.endAssignment(assignment.id, "stopped by command");
             store.endTicket(pending.ticketId);
             store.enqueueReply({ id: `stopped-${pending.ticketId}`, threadId: pending.trigger.threadId, body: result.text, blocking: true });
             queueStatusCard(store, pending.ticketId);
           },
+          true,
         );
       }
       pass.handled.push({ triggerId: pending.trigger.id, ticketId: pending.ticketId, command, allowed });

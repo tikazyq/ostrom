@@ -252,7 +252,6 @@ test(
     const answer = {
       decisions: [{ thread: issue, triggers: [trigger], verdict: "ignore", reason: "nothing asked", reply: null }],
       outcomes: [],
-      stalls: [],
     };
     const judged = deps(env, gh);
     judged.runner.start = ((options) => {
@@ -280,7 +279,7 @@ const semonAnswer = (minutes: number, stalls: unknown[]) => async () => ({
 test(
   "watchdog prints each check, flags a stall once, and a failed Semon read exits non-zero",
   withDb(async (dbPath) => {
-    const env = { OSTROM_REPO: "o/r", OSTROM_ALLOWLIST: "alice", OSTROM_DB: dbPath, OSTROM_STALL_MINUTES: "20" };
+    const env = { OSTROM_REPO: "o/r", OSTROM_ALLOWLIST: "alice", OSTROM_DB: dbPath, OSTROM_STALL_MINUTES: "20", ...workerEnv };
     const store = Store.open(dbPath);
     const source = store.ensureSource("github", "o/r");
     const issue = store.ensureThread({ sourceId: source.id, kind: "issue", number: 7, url: "https://github.com/o/r/issues/7" });
@@ -290,21 +289,24 @@ test(
     }).id;
     const { ticketId } = store.recordDecision({ threadId: issue, triggerIds: [trigger], verdict: "accept", reason: "fix it" });
     const assignmentId = store.createAssignment(ticketId!);
-    store.configureNativeAssignment(assignmentId, { harness: "codex", model: "m", worktree: "/w", branch: "ostrom/ticket-1-1", machine: "host" });
+    store.configureNativeAssignment(assignmentId, { harness: "claude", model: "m", worktree: "/w", branch: "ostrom/ticket-1-1", machine: "host" });
     store.startNativeAssignment(assignmentId, "session-1");
     store.close();
-    const stalled = semonAnswer(20, [{ id: "s", branch: "ostrom/ticket-1-1", stall_reason: "waiting-question", open_question: { text: "Which?" } }]);
+    const stalled = semonAnswer(20, [{ id: "session-1", branch: "ostrom/ticket-1-1", idle_ms: 1_800_000, stall_reason: "waiting-question", open_question: { text: "Which?" } }]);
 
     const missing = deps({ ...env, OSTROM_STALL_MINUTES: "" }, async () => "[]", stalled);
     assert.equal(await main(["watchdog"], missing.deps), 1);
     assert.match(missing.err.join("\n"), /OSTROM_STALL_MINUTES/);
 
+    const runner = new FakeRunner();
     const first = deps(env, async () => "[]", stalled);
+    first.deps.runners = { claude: runner, codex: runner };
     assert.equal(await main(["watchdog"], first.deps), 0);
     assert.deepEqual(first.out.map((line) => JSON.parse(line)), [{
       assignmentId: 1, semonReason: "waiting-question", stallId: 1, newEpisode: true, clearedStallId: null,
     }]);
     const second = deps(env, async () => "[]", stalled);
+    second.deps.runners = first.deps.runners;
     assert.equal(await main(["watchdog"], second.deps), 0);
     assert.equal(JSON.parse(second.out[0]!).newEpisode, false);
 

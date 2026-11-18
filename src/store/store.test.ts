@@ -370,3 +370,27 @@ test("a stopped native assignment ends with its reason and is owed a reply; a fi
   store.endAssignment(stopped, "model mismatch");
   assert.deepEqual(store.abandonedAssignments().map((a) => [a.id, a.endReason]), [[stopped, "model mismatch"]]);
 });
+
+
+test("ticket usage includes running wall time and sums completed turns across assignments", () => {
+  const { store, accept, advance } = fixture();
+  const ticket = accept();
+  const start = (sessionId: string) => {
+    const assignment = store.createAssignment(ticket);
+    store.configureNativeAssignment(assignment, { harness: "claude", model: "m", branch: sessionId, worktree: "/w", machine: "host" });
+    store.startNativeAssignment(assignment, sessionId);
+    store.beginTurn(assignment);
+    return assignment;
+  };
+  const first = start("session-1");
+  advance(2000);
+  assert.deepEqual(store.budgetUsage(ticket, 1000), { wallMs: 2000, idleMs: 1000, turns: 1, tokens: 0 });
+  store.endTurn(first, { inputTokens: 5, cachedInputTokens: 3, outputTokens: 2 });
+  store.endAssignment(first);
+  advance(60_000);
+  const second = start("session-2");
+  advance(3000);
+  store.endTurn(second, { inputTokens: 4, cachedInputTokens: 2, outputTokens: 1 });
+  assert.deepEqual(store.budgetUsage(ticket), { wallMs: 5000, idleMs: 0, turns: 2, tokens: 17 });
+  assert.equal(store.getTicket(ticket).budget.escalations, 1);
+});

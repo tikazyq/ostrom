@@ -1,6 +1,5 @@
 // The Watchdog (docs/direction.md, milestone 1 step 6): a deterministic check over native
-// Workers. It records each Semon stall episode once and leaves every judgement to the Router,
-// which sees the episode in its next batch (AGENTS.md rule 3). It never ends work.
+// Workers. It checks ticket budgets and runs the two-attempt recovery ladder.
 //
 // Semon's `stalls` read is the one Semon call Ostrom makes:
 //   semon query stalls --idle-minutes <N> --since 1d --json
@@ -9,6 +8,10 @@
 // output. A Worker's session is matched to its assignment by its git branch
 // (`ostrom/ticket-<ticket>-<assignment>`). A failed read is reported and never clears an episode.
 
+import { queueStatusCard } from "../github/cards.ts";
+import { MINUTE_MS } from "../worker/budget.ts";
+import type { Workers } from "../worker/workers.ts";
+import { parseStuckReply, RECOVERY_PROMPT, renderStuckReply, RETRY_PROMPT, stuckDecision } from "./stuck.ts";
 import type { ProcessRunner } from "../process.ts";
 import type { Store } from "../store/store.ts";
 
@@ -24,6 +27,7 @@ export interface SemonStall {
   /** Why Semon calls it stalled: process-gone, waiting-question or no-output at the time of writing. */
   stallReason: string;
   openQuestion: string | null;
+  idleMs: number;
 }
 
 export class SemonOutputError extends Error {
@@ -66,7 +70,12 @@ export function parseSemonStalls(stdout: string, idleMinutes: number): SemonStal
     const path = `$.stalls[${index}]`;
     const stall = record(item, path);
     const question = stall["open_question"];
+    const idleMs = stall["idle_ms"];
+    if (typeof idleMs !== "number" || !Number.isSafeInteger(idleMs) || idleMs < 0) {
+      throw new SemonOutputError(`${path}.idle_ms: expected a non-negative integer`);
+    }
     return {
+      idleMs,
       id: string(stall["id"], `${path}.id`),
       branch: stall["branch"] === null ? null : string(stall["branch"], `${path}.branch`),
       stallReason: string(stall["stall_reason"], `${path}.stall_reason`),
@@ -80,6 +89,8 @@ export interface WatchdogOptions {
   store: Store;
   semon: ProcessRunner;
   idleMinutes: number;
+  workers: Workers;
+  now?: Date;
 }
 
 export interface Checked {
@@ -87,7 +98,7 @@ export interface Checked {
   semonReason: string | null;
   /** The open stall episode, or null when the Worker is not stalled. */
   stallId: number | null;
-  /** This pass opened the episode: it is flagged to the Router's next batch. */
+  /** This pass opened the episode. */
   newEpisode: boolean;
   /** The episode this pass cleared, if any. */
   clearedStallId: number | null;
@@ -101,36 +112,93 @@ export interface WatchdogPass {
 
 /** One pass over running assignments. */
 export async function watchdog(options: WatchdogOptions): Promise<WatchdogPass> {
-  const { store, idleMinutes } = options;
+  const { store, idleMinutes, workers, now = new Date() } = options;
   const pass: WatchdogPass = { checked: [], failed: [] };
+  const running = store.runningAssignments();
+  const queryMinutes = running.reduce((threshold, assignment) => {
+    const ticket = store.getTicket(assignment.ticketId);
+    return ticket.state === "open" ? Math.min(threshold, Math.max(1, Math.floor(0.8 * ticket.budget.idleMs / MINUTE_MS))) : threshold;
+  }, idleMinutes);
   let semon: SemonStall[] | null;
   try {
-    semon = await readSemonStalls(options.semon, idleMinutes);
+    semon = await readSemonStalls(options.semon, queryMinutes);
   } catch (error) {
     semon = null;
     pass.failed.push({ what: "semon stalls", error: message(error) });
   }
-  for (const assignment of store.runningAssignments()) {
-    const matched = assignment.branch === null ? undefined : semon?.find((stall) => stall.branch === assignment.branch);
-    const semonReason = matched?.stallReason ?? null;
-    const checked: Checked = {
-      assignmentId: assignment.id,
-      semonReason,
-      stallId: null,
-      newEpisode: false,
-      clearedStallId: null,
-    };
-    if (semonReason !== null) {
-      const question = matched?.openQuestion ?? null;
-      const detail =
-        question === null ? null : question.length > DETAIL_CHARS ? `${question.slice(0, DETAIL_CHARS)}…` : question;
-      const recorded = store.recordStall({ assignmentId: assignment.id, semonReason, detail });
-      checked.stallId = recorded.id;
-      checked.newEpisode = !recorded.duplicate;
-    } else if (semon !== null) {
-      checked.clearedStallId = store.clearStall(assignment.id);
+  for (const { id } of running) {
+    const assignment = store.getAssignment(id);
+    if (assignment.state !== "running") continue;
+    const ticket = store.getTicket(assignment.ticketId);
+    if (ticket.state !== "open" || assignment.sessionId === null) continue;
+    if (ticket.budgetResume) {
+      workers.resumeBudget(assignment.id);
+      continue;
     }
+    const matched = semon?.find((stall) => stall.branch === assignment.branch && stall.id === assignment.sessionId);
+    const lastTurn = assignment.lastTurnAt === null ? null : Date.parse(assignment.lastTurnAt);
+    const turnStart = assignment.turnStartedAt === null ? null : Date.parse(assignment.turnStartedAt);
+    // A result from before the present turn must not interrupt the present turn.
+    const idleMs = matched?.stallReason === "no-output" && turnStart !== null && now.getTime() - matched.idleMs >= turnStart ?
+      matched.idleMs : 0;
+    if (workers.enforceBudget(assignment.id, idleMs)) continue;
+    const failed = assignment.outcome === "failed" || assignment.outcome === "cancelled";
+    const checkAt = turnStart ?? lastTurn;
+    const fresh = matched !== undefined && matched.idleMs >= idleMinutes * MINUTE_MS &&
+      (checkAt === null || now.getTime() - checkAt >= idleMinutes * MINUTE_MS);
+    const reason = fresh ? matched.stallReason : failed && turnStart === null ? "turn failed" : null;
+    const checked: Checked = {
+      assignmentId: assignment.id, semonReason: fresh ? matched.stallReason : null,
+      stallId: null, newEpisode: false, clearedStallId: null,
+    };
     pass.checked.push(checked);
+    let stall = store.openStall(assignment.id);
+    if (reason !== null && stall === null) {
+      const question = matched?.openQuestion ?? null;
+      const detail = question !== null && question.length > DETAIL_CHARS ? `${question.slice(0, DETAIL_CHARS)}…` : question;
+      const recorded = store.recordStall({ assignmentId: assignment.id, semonReason: reason, detail });
+      checked.newEpisode = !recorded.duplicate;
+      stall = store.getStall(recorded.id);
+    }
+    if (stall !== null) {
+      checked.stallId = stall.id;
+      // Semon omits sessions until they are idle long enough. Absence during that window
+      // after a recovery turn is not evidence of progress.
+      const settled = reason !== null || (semon !== null && turnStart === null &&
+        (lastTurn === null || now.getTime() - lastTurn >= idleMinutes * MINUTE_MS));
+      const action = stuckDecision(stall.attempts, stall.blockedAt !== null, reason !== null, settled);
+      if (action === "recover") {
+        const stallId = stall.id;
+        const prompt = stall.attempts === 0 ? RECOVERY_PROMPT : RETRY_PROMPT;
+        workers.recoverStall(assignment.id, stallId, prompt, turnStart !== null, (result, workerStore) => {
+          try {
+            parseStuckReply(result.text);
+            workerStore.saveRecoveryReply(stallId, result.text);
+          } catch {
+            // A Worker that cannot supply the template still gets an evidence-based reply.
+          }
+        });
+      } else if (action === "block" && turnStart !== null) {
+        workers.interrupt(assignment.id);
+      } else if (action === "block") {
+        const context = store.ticketContext(ticket.id);
+        const cause = stall.semonReason === "waiting-question" ? "The Worker is waiting for an answer." :
+          stall.semonReason === "process-gone" ? "The Worker process stopped responding." :
+          stall.semonReason === "no-output" ? "The Worker stopped producing output." : "The Worker turn failed.";
+        const fallback = {
+          trying: `Complete the work requested in ${context.thread.url}.`,
+          blockedBy: cause,
+          tried: "Attempted to recover twice on the same session.",
+          options: ["Provide the missing information or redirect the work.", "Ask Ostrom to stop with `@ostrom stop`."],
+          work: "Ostrom could not verify a pushed checkpoint.",
+        };
+        const reply = parseStuckReply(stall.recoveryReply ?? JSON.stringify(fallback));
+        store.blockStall(stall.id, renderStuckReply(reply));
+      } else if (action === "clear") {
+        checked.clearedStallId = store.clearStall(assignment.id);
+      }
+    }
+    queueStatusCard(store, ticket.id, now, idleMs);
   }
   return pass;
 }

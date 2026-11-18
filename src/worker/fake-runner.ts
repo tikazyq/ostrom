@@ -24,7 +24,7 @@ export class FakeSession implements Session {
     this.resumed = resumed;
   }
 
-  async send(prompt: string): Promise<TurnResult> {
+  async send(prompt: string, signal?: AbortSignal): Promise<TurnResult> {
     this.prompts.push(prompt);
     this.running++;
     this.maxRunning = Math.max(this.maxRunning, this.running);
@@ -38,7 +38,22 @@ export class FakeSession implements Session {
         model: null,
       };
       if (this.auto) return result;
-      return await new Promise<TurnResult>((resolve, reject) => this.#open.push({ resolve, reject }));
+      return await new Promise<TurnResult>((resolve, reject) => {
+        const cancel = (): void => {
+          const index = this.#open.indexOf(turn);
+          if (index !== -1) this.#open.splice(index, 1);
+          resolve({ ...result, status: "cancelled", text: "", usage: null });
+        };
+        const turn = { resolve: (value: TurnResult) => {
+          signal?.removeEventListener("abort", cancel);
+          resolve(value);
+        }, reject };
+        if (signal?.aborted) cancel();
+        else {
+          this.#open.push(turn);
+          signal?.addEventListener("abort", cancel, { once: true });
+        }
+      });
     } finally {
       this.running--;
     }
@@ -74,11 +89,11 @@ export class FakeRunner implements Runner {
     }
     const send = session.send.bind(session);
     let announced = false;
-    session.send = async (prompt) => {
+    session.send = async (prompt, signal) => {
       if (!announced) options.onSessionId?.(session.id);
       announced = true;
       if (this.failAfterId !== undefined) throw this.failAfterId;
-      return send(prompt);
+      return send(prompt, signal);
     };
     return session;
   }

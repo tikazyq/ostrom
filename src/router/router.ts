@@ -1,9 +1,7 @@
 // The Router (docs/direction.md, milestone 1 steps 2 and 5) judges candidates (accept, ignore or
 // stop) and writes the words of each reply. Everything else is code (AGENTS.md rule 3): which
 // triggers are candidates, which outcomes are owed a reply, checking the model's answer, recording
-// decisions, dispatching Workers, queueing replies, and ending finished work. A stall the Watchdog
-// flagged is judged here too (step 6): the model chooses wait or stop and words any reply; code
-// carries out that answer and nothing more.
+// decisions, dispatching Workers, queueing replies, and ending finished work.
 //
 // Transport: each pass starts a fresh, read-only native session in a temporary directory and sends
 // it one self-contained batch. The Router has no Ostrom tools and no state to resume. An answer
@@ -16,7 +14,7 @@ import { join } from "node:path";
 import { ghGet, type GhRunner } from "../github/gh.ts";
 import type { RouterConfig } from "../ostromd/config.ts";
 import type { Runner } from "../session/runner.ts";
-import { stallReplyId, type StallAction, type Store, type Trigger, type Verdict } from "../store/store.ts";
+import type { Store, Trigger, Verdict } from "../store/store.ts";
 import { pullRequestsForBranch, type BranchPullRequest } from "../worker/dispatch.ts";
 import type { Workers } from "../worker/workers.ts";
 
@@ -44,14 +42,14 @@ export interface ThreadView {
   candidates: CandidateView[];
 }
 
-export type OutcomeEvent = "pr_opened" | "pr_merged" | "pr_closed" | "failed" | "cancelled";
+export type OutcomeEvent = "pr_opened" | "pr_merged" | "pr_closed" | "failed";
 
 /** Something that happened to accepted work and is owed one reply on the thread that asked for it. */
 export interface Outcome {
   /** The outbox id of its reply; stable, so each outcome is replied to once. */
   key: string;
   event: OutcomeEvent;
-  /** A merged or closed PR, a failed or cancelled Worker: the ticket ends once its reply is queued. */
+  /** A merged or closed PR, or a Worker that could not start: the ticket ends once its reply is queued. */
   terminal: boolean;
   assignmentId: number;
   ticketId: number;
@@ -63,26 +61,9 @@ export interface Outcome {
   detail: string | null;
 }
 
-/** A stall episode the Watchdog recorded and the Router has not answered (milestone 1 step 6). */
-export interface StallItem {
-  /** `stall-<id>`: the key the answer names, and the outbox id of its reply. */
-  key: string;
-  stallId: number;
-  assignmentId: number;
-  ticketId: number;
-  /** The store thread the ticket was accepted on, where any reply goes. */
-  thread: number;
-  threadUrl: string;
-  request: string;
-  semonReason: string | null;
-  detail: string | null;
-  since: string;
-}
-
 export interface Batch {
   threads: ThreadView[];
   outcomes: Outcome[];
-  stalls: StallItem[];
 }
 
 // --- the answer ------------------------------------------------------------------------------
@@ -95,16 +76,9 @@ export interface RouterDecision {
   reply: string | null;
 }
 
-export interface RouterStallAnswer {
-  key: string;
-  action: StallAction;
-  reply: string | null;
-}
-
 export interface RouterAnswer {
   decisions: RouterDecision[];
   outcomes: { key: string; reply: string }[];
-  stalls: RouterStallAnswer[];
 }
 
 /** The Router's reply did not satisfy the contract. Nothing from it is recorded. */
@@ -131,7 +105,6 @@ export interface RoutePassResult {
     replyId: string | null;
   }[];
   outcomes: { key: string; event: OutcomeEvent; ticketId: number; ticketEnded: boolean }[];
-  stalls: { key: string; action: StallAction; ticketId: number; replyId: string | null; ticketEnded: boolean }[];
   dispatched: { ticketId: number; assignmentId: number; sessionId: string; branch: string }[];
   /** Work this pass could not do; the command exits non-zero when any is listed. */
   failed: { what: string; error: string }[];
@@ -155,16 +128,15 @@ export interface RouteOptions {
  */
 export async function routeCandidates(options: RouteOptions): Promise<RoutePassResult> {
   const { store } = options;
-  const result: RoutePassResult = { router: null, decisions: [], outcomes: [], stalls: [], dispatched: [], failed: [] };
+  const result: RoutePassResult = { router: null, decisions: [], outcomes: [], dispatched: [], failed: [] };
 
   await dispatchPending(options, result);
 
   const batch: Batch = {
     threads: await candidateThreads(options),
     outcomes: await pendingOutcomes(options, result),
-    stalls: flaggedStalls(options.store),
   };
-  if (batch.threads.length === 0 && batch.outcomes.length === 0 && batch.stalls.length === 0) return result;
+  if (batch.threads.length === 0 && batch.outcomes.length === 0) return result;
 
   const asked = await askRouter(options, routerMessage(batch));
   result.router = { sessionId: asked.sessionId };
@@ -189,12 +161,6 @@ export async function routeCandidates(options: RouteOptions): Promise<RoutePassR
     );
     result.outcomes.push({ key, event: outcome.event, ticketId: outcome.ticketId, ticketEnded });
   }
-  const stalls = new Map(batch.stalls.map((stall) => [stall.key, stall]));
-  for (const { key, action, reply } of answer.stalls) {
-    const recorded = store.answerStall(stalls.get(key)!.stallId, action, reply);
-    result.stalls.push({ key, action, ...recorded });
-  }
-
   await dispatchPending(options, result);
   return result;
 }
@@ -271,7 +237,7 @@ async function fetchBody(gh: GhRunner, repo: string, trigger: Trigger, number: n
 
 /**
  * Outcomes of accepted work not yet replied to. A running Worker's branch is looked up with `gh`
- * for its PRs and its turns' recorded outcome is read; an assignment that never started or was
+ * for its PRs. An assignment that never started or was
  * stopped is a failure. Each assignment yields at most one terminal outcome per pass, and a PR
  * first seen merged or closed is not also reported as opened. A branch that cannot be read is
  * reported and skipped.
@@ -315,10 +281,6 @@ async function pendingOutcomes(options: RouteOptions, result: RoutePassResult): 
       if (!outcome.terminal) owed(outcome);
       else terminal ??= outcome;
     }
-    const status = assignment.outcome;
-    if (terminal === null && (status === "failed" || status === "cancelled")) {
-      terminal = { ...base, key: `outcome-a${assignment.id}-${status}`, event: status, terminal: true, pullRequest: null };
-    }
     if (terminal !== null) owed(terminal);
   }
 
@@ -341,28 +303,6 @@ async function pendingOutcomes(options: RouteOptions, result: RoutePassResult): 
     });
   }
   return outcomes;
-}
-
-// --- stalls ----------------------------------------------------------------------------------
-
-/** Stall episodes the Watchdog opened and the Router has not answered, each flagged once. */
-function flaggedStalls(store: Store): StallItem[] {
-  return store.unansweredStalls().map((stall) => {
-    const assignment = store.getAssignment(stall.assignmentId);
-    const context = store.ticketContext(assignment.ticketId);
-    return {
-      key: stallReplyId(stall.id),
-      stallId: stall.id,
-      assignmentId: assignment.id,
-      ticketId: assignment.ticketId,
-      thread: context.thread.id,
-      threadUrl: context.thread.url,
-      request: context.reason,
-      semonReason: stall.semonReason,
-      detail: stall.detail,
-      since: stall.detectedAt,
-    };
-  });
 }
 
 // --- asking the Router -----------------------------------------------------------------------
@@ -399,7 +339,6 @@ const OUTCOME_MEANING: Record<OutcomeEvent, string> = {
   pr_merged: "the pull request was merged; the work is done",
   pr_closed: "the pull request was closed without merging; the work has stopped",
   failed: "the Worker failed; the work has stopped",
-  cancelled: "the Worker was cancelled; the work has stopped",
 };
 
 /** The whole message for one Router turn: the contract, then the batch as JSON. */
@@ -415,15 +354,6 @@ export function routerMessage(batch: Batch): string {
       request: outcome.request,
       pullRequest: outcome.pullRequest,
       detail: outcome.detail,
-    })),
-    stalls: batch.stalls.map((stall) => ({
-      key: stall.key,
-      thread: stall.thread,
-      threadUrl: stall.threadUrl,
-      request: stall.request,
-      signals: { semon: stall.semonReason },
-      detail: stall.detail,
-      since: stall.since,
     })),
   };
   return [
@@ -444,16 +374,9 @@ export function routerMessage(batch: Batch): string {
     'For every outcome write one short "reply" telling the person on the thread what happened,',
     "with the pull request link when there is one.",
     "",
-    "Each stall is a Worker the Watchdog found making no progress. Its signals say why: from Semon,",
-    '"waiting-question" (it asked a question and waits), "process-gone" (its process died) or "no-output"',
-    '(it is working but writes nothing). "detail" is its open question, if any. For every stall choose',
-    '"action": "wait" leaves the Worker be, with reply null or a short note telling the person on the',
-    'thread what the Worker waits for; "stop" ends the work, and its reply tells the person it stopped.',
-    "",
     "Answer with one JSON object and nothing else: no prose, no code fence. Its shape:",
     '{"decisions":[{"thread":<thread>,"triggers":[<trigger>,...],"verdict":"accept"|"ignore"|"stop",',
-    '"reason":"...","reply":"..."|null}],"outcomes":[{"key":"<key>","reply":"..."}],',
-    '"stalls":[{"key":"<key>","action":"wait"|"stop","reply":"..."|null}]}',
+    '"reason":"...","reply":"..."|null}],"outcomes":[{"key":"<key>","reply":"..."}]}',
     "",
     "The batch:",
     JSON.stringify(payload, null, 2),
@@ -465,9 +388,8 @@ export function routerMessage(batch: Batch): string {
 /**
  * Parses and checks the Router's reply against the batch it answers. The reply must be one JSON
  * object with exactly the contract's fields; every candidate is decided exactly once, on its own
- * thread; an accept carries a reply; exactly the batch's outcomes are answered; and exactly its
- * stalls are answered wait or stop, a stop with a reply. Anything else throws, so a partial or
- * malformed answer records nothing.
+ * thread; an accept carries a reply; exactly the batch's outcomes are answered. Anything else
+ * throws, so a partial or malformed answer records nothing.
  */
 export function parseRouterAnswer(reply: string, batch: Batch): RouterAnswer {
   let value: unknown;
@@ -476,7 +398,7 @@ export function parseRouterAnswer(reply: string, batch: Batch): RouterAnswer {
   } catch {
     throw new RouterOutputError(`Router reply is not JSON: ${JSON.stringify(reply.slice(0, 200))}`);
   }
-  const root = object(value, "$", ["decisions", "outcomes", "stalls"], ["decisions", "outcomes", "stalls"]);
+  const root = object(value, "$", ["decisions", "outcomes"], ["decisions", "outcomes"]);
 
   const threadOf = new Map<number, number>();
   for (const thread of batch.threads) {
@@ -522,26 +444,7 @@ export function parseRouterAnswer(reply: string, batch: Batch): RouterAnswer {
   const unanswered = [...owed].filter((key) => !answered.has(key));
   if (unanswered.length > 0) throw new RouterOutputError(`outcomes ${unanswered.join(", ")} have no reply`);
 
-  const flagged = new Set(batch.stalls.map((stall) => stall.key));
-  const judged = new Set<string>();
-  const stalls = list(root["stalls"], "$.stalls").map((item, index): RouterStallAnswer => {
-    const path = `$.stalls[${index}]`;
-    const stall = object(item, path, ["key", "action", "reply"], ["key", "action", "reply"]);
-    const key = text(stall["key"], `${path}.key`);
-    if (!flagged.has(key)) throw new RouterOutputError(`${path}: ${key} is not a stall of this batch`);
-    if (judged.has(key)) throw new RouterOutputError(`${path}: ${key} is answered twice`);
-    judged.add(key);
-    const action = stall["action"];
-    if (action !== "wait" && action !== "stop") {
-      throw new RouterOutputError(`${path}.action: expected wait or stop, got ${JSON.stringify(action)}`);
-    }
-    const replyText = stall["reply"] === null ? null : text(stall["reply"], `${path}.reply`);
-    if (action === "stop" && replyText === null) throw new RouterOutputError(`${path}: a stop needs a reply`);
-    return { key, action, reply: replyText };
-  });
-  const unjudged = [...flagged].filter((key) => !judged.has(key));
-  if (unjudged.length > 0) throw new RouterOutputError(`stalls ${unjudged.join(", ")} have no answer`);
-  return { decisions, outcomes, stalls };
+  return { decisions, outcomes };
 }
 
 function object(value: unknown, path: string, allowed: string[], required: string[]): Record<string, unknown> {

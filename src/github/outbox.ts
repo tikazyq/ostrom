@@ -45,7 +45,7 @@ export async function sendDueReplies(options: SendOptions): Promise<SendResult> 
       await sendOne(reply, options, result);
       continue;
     }
-    if (reply.id === `card-thread-${reply.threadId}` || reply.id.startsWith("review-")) {
+    if (reply.id === `card-thread-${reply.threadId}` || reply.id.startsWith("review-") || reply.id.startsWith("stall-")) {
       await postCommentBatch([reply], options, result);
       continue;
     }
@@ -99,6 +99,7 @@ async function postCommentBatch(replies: readonly Reply[], options: SendOptions,
       if (isStatusCard(reply)) store.setStatusCardCommentId(reply.threadId, found);
       result.found.push(reply.id);
     }
+    remaining = remaining.filter((reply) => !store.isClearedStallReply(reply.id));
     if (remaining.length === 0) return;
     const body = remaining.map((reply) => `${reply.body}\n\n${replyMarker(reply.id)}`).join("\n\n---\n\n");
     const posted = JSON.parse(await gh(["api", "--method", "POST", `repos/${repo}/issues/${number}/comments`, "-f", `body=${body}`])) as { id?: unknown };

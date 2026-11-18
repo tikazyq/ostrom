@@ -2,6 +2,7 @@
 // See docs/direction.md, "Data model". Only the operations milestone 1 needs live here.
 
 import { DatabaseSync, type SQLInputValue } from "node:sqlite";
+import { assessBudget, type BudgetExtension, type BudgetLimits, type BudgetMetric, type BudgetUsage } from "../worker/budget.ts";
 import { migrate } from "./migrations.ts";
 
 export type SourceKind = "github";
@@ -101,6 +102,9 @@ export interface Ticket {
   state: TicketState;
   openedAt: string;
   endedAt: string | null;
+  budget: BudgetLimits;
+  budgetPause: BudgetMetric | null;
+  budgetResume: boolean;
 }
 
 export interface Assignment {
@@ -120,6 +124,7 @@ export interface Assignment {
   /** Set while a turn runs; still set when ostromd starts means the turn was interrupted. */
   turnStartedAt: string | null;
   interruptions: number;
+  lastTurnAt: string | null;
   createdAt: string;
   startedAt: string | null;
   endedAt: string | null;
@@ -146,8 +151,9 @@ export interface Stall {
   detail: string | null;
   detectedAt: string;
   clearedAt: string | null;
-  action: StallAction | null;
-  answeredAt: string | null;
+  attempts: number;
+  recoveryReply: string | null;
+  blockedAt: string | null;
 }
 
 export interface NewStall {
@@ -156,10 +162,7 @@ export interface NewStall {
   detail: string | null;
 }
 
-/** The Router's answer to a flagged stall: leave the Worker be, or stop the work. */
-export type StallAction = "wait" | "stop";
-
-/** The outbox id of the reply the Router wrote for a stall: stable, so it is sent once. */
+/** The outbox id of a stall reply: stable, so it is sent once. */
 export function stallReplyId(stallId: number): string {
   return `stall-${stallId}`;
 }
@@ -449,9 +452,77 @@ export class Store {
     }
   }
 
+  budgetUsage(ticketId: number, idleMs = 0): BudgetUsage {
+    const row = this.#get(
+      `SELECT COALESCE(SUM(turns), 0) AS turns,
+              COALESCE(SUM(input_tokens + cached_input_tokens + output_tokens), 0) AS tokens,
+              COALESCE(SUM(wall_ms + CASE WHEN turn_started_at IS NULL THEN 0 ELSE
+                max(0, unixepoch(?, 'subsec') * 1000 - unixepoch(turn_started_at, 'subsec') * 1000) END), 0) AS wall
+       FROM assignment WHERE ticket_id = ?`, this.#stamp(), ticketId,
+    )!;
+    return { turns: row["turns"] as number, tokens: row["tokens"] as number, wallMs: Math.round(row["wall"] as number), idleMs };
+  }
+
+  /** Claim the single checkpoint turn and close normal delivery in the same transaction. */
+  beginBudgetPause(assignmentId: number, metric: BudgetMetric): boolean {
+    return this.#transaction(() => {
+      const assignment = this.getAssignment(assignmentId);
+      if (assignment.state !== "running" || assignment.turnStartedAt !== null) return false;
+      const { changes } = this.#run(
+        "UPDATE ticket SET state = 'paused', budget_pause = ?, budget_resume = 0 WHERE id = ? AND state = 'open'",
+        metric, assignment.ticketId,
+      );
+      if (Number(changes) === 0) return false;
+      this.beginTurn(assignmentId);
+      return true;
+    });
+  }
+
+  extendBudget(ticketId: number, extension: BudgetExtension): Ticket {
+    return this.#transaction(() => {
+      const ticket = this.getTicket(ticketId);
+      if (ticket.state === "ended") throw new IllegalTransition(`ticket ${ticketId} has ended`);
+      const budget = { ...ticket.budget };
+      for (const key of ["wallMs", "turns", "tokens"] as const) {
+        const increase = extension[key];
+        if (increase === undefined) continue;
+        if (!Number.isSafeInteger(increase) || increase <= 0 || !Number.isSafeInteger(budget[key] + increase)) {
+          throw new Error(`invalid budget increase for ${key}`);
+        }
+        budget[key] += increase;
+      }
+      if (ticket.budgetPause !== null) {
+        const assignment = this.latestAssignment(ticketId);
+        if (assignment?.state !== "running" || assignment.sessionId === null) {
+          throw new IllegalTransition(`ticket ${ticketId} has no retained Worker`);
+        }
+        if (assignment.turnStartedAt !== null) throw new IllegalTransition(`ticket ${ticketId} is still saving work`);
+        const { reached } = assessBudget(budget, this.budgetUsage(ticketId));
+        if (reached.length > 0) throw new IllegalTransition(`ticket ${ticketId} needs more budget for ${reached.join(", ")}`);
+        this.clearStall(assignment.id);
+        this.#run("UPDATE ticket SET state = 'open', budget_pause = NULL, budget_resume = 1 WHERE id = ?", ticketId);
+      }
+      this.#run("UPDATE ticket SET wall_limit_ms = ?, turn_limit = ?, token_limit = ? WHERE id = ?",
+        budget.wallMs, budget.turns, budget.tokens, ticketId);
+      return this.getTicket(ticketId);
+    });
+  }
+
+  beginBudgetResume(assignmentId: number): boolean {
+    return this.#transaction(() => {
+      const assignment = this.getAssignment(assignmentId);
+      if (assignment.state !== "running" || assignment.turnStartedAt !== null) return false;
+      const { changes } = this.#run("UPDATE ticket SET budget_resume = 0 WHERE id = ? AND state = 'open' AND budget_resume = 1",
+        assignment.ticketId);
+      if (Number(changes) === 0) return false;
+      this.beginTurn(assignmentId);
+      return true;
+    });
+  }
+
   resumeTicket(ticketId: number): void {
     const { changes } = this.#run(
-      "UPDATE ticket SET state = 'open' WHERE id = ? AND state = 'paused'",
+      "UPDATE ticket SET state = 'open' WHERE id = ? AND state = 'paused' AND budget_pause IS NULL",
       ticketId,
     );
     if (Number(changes) !== 1) {
@@ -562,13 +633,13 @@ export class Store {
 
   /** Clears the running turn and adds its usage, when it reported any. */
   endTurn(assignmentId: number, usage: { inputTokens: number; cachedInputTokens: number; outputTokens: number } | null): void {
+    const now = this.#stamp();
     this.#run(
-      `UPDATE assignment SET turn_started_at = NULL, input_tokens = input_tokens + ?,
-         cached_input_tokens = cached_input_tokens + ?, output_tokens = output_tokens + ? WHERE id = ?`,
-      usage?.inputTokens ?? 0,
-      usage?.cachedInputTokens ?? 0,
-      usage?.outputTokens ?? 0,
-      assignmentId,
+      `UPDATE assignment SET wall_ms = wall_ms + max(0, round((unixepoch(?, 'subsec') - unixepoch(turn_started_at, 'subsec')) * 1000)),
+         turn_started_at = NULL, last_turn_at = ?, input_tokens = input_tokens + ?,
+         cached_input_tokens = cached_input_tokens + ?, output_tokens = output_tokens + ?
+       WHERE id = ? AND turn_started_at IS NOT NULL`,
+      now, now, usage?.inputTokens ?? 0, usage?.cachedInputTokens ?? 0, usage?.outputTokens ?? 0, assignmentId,
     );
   }
 
@@ -653,12 +724,13 @@ export class Store {
        JOIN subscription ON subscription.thread_id = t.thread_id
        JOIN ticket ON ticket.id = subscription.ticket_id AND ticket.state IN ('open', 'paused')
        WHERE t.kind IN ('issue_comment', 'issue_state')
-         AND (ticket.state = 'open' OR t.kind = 'issue_state' OR lower(ltrim(COALESCE(t.body, ''))) GLOB '@ostrom *')
+         AND ((ticket.state = 'open' AND ticket.budget_resume = 0) OR t.kind = 'issue_state' OR lower(ltrim(COALESCE(t.body, ''))) GLOB '@ostrom *')
          AND NOT EXISTS (SELECT 1 FROM decision_trigger WHERE trigger_id = t.id)
-         AND NOT EXISTS (SELECT 1 FROM delivery WHERE delivery.trigger_id = t.id)
          AND NOT EXISTS (
            SELECT 1 FROM command_receipt
            WHERE command_receipt.trigger_id = t.id AND command_receipt.ticket_id = ticket.id)
+         AND NOT EXISTS (SELECT 1 FROM delivery JOIN assignment ON assignment.id = delivery.assignment_id
+           WHERE delivery.trigger_id = t.id AND assignment.ticket_id = ticket.id)
        ORDER BY occurred_at, id, p_ticket_id`,
     ).map((row) => ({ trigger: toTrigger(row), ticketId: row["p_ticket_id"] as number }));
   }
@@ -684,7 +756,7 @@ export class Store {
       `SELECT t.*, ticket.id AS p_ticket_id, worker.id AS p_assignment_id
        FROM "trigger" AS t
        JOIN subscription ON subscription.thread_id = t.thread_id
-       JOIN ticket ON ticket.id = subscription.ticket_id AND ticket.state = 'open'
+       JOIN ticket ON ticket.id = subscription.ticket_id AND ticket.state = 'open' AND ticket.budget_resume = 0
        LEFT JOIN assignment AS worker ON worker.id = (
          SELECT id FROM assignment WHERE ticket_id = ticket.id AND state = 'running' ORDER BY id DESC LIMIT 1)
        WHERE NOT EXISTS (SELECT 1 FROM decision_trigger WHERE trigger_id = t.id)
@@ -712,6 +784,7 @@ export class Store {
       turnId,
       this.#stamp(),
     );
+    if (Number(changes) !== 0) this.clearStall(assignmentId);
     return { duplicate: Number(changes) === 0 };
   }
 
@@ -755,54 +828,53 @@ export class Store {
       this.#stamp(),
       assignmentId,
     );
-    return row === undefined ? null : (row["id"] as number);
+    if (row === undefined) return null;
+    return row["id"] as number;
+  }
+
+  openStall(assignmentId: number): Stall | null {
+    const row = this.#get("SELECT * FROM stall WHERE assignment_id = ? AND cleared_at IS NULL", assignmentId);
+    return row === undefined ? null : toStall(row);
+  }
+
+  beginRecovery(stallId: number): boolean {
+    return this.#transaction(() => {
+      const stall = this.getStall(stallId);
+      const assignment = this.getAssignment(stall.assignmentId);
+      if (assignment.state !== "running" || assignment.turnStartedAt !== null ||
+          this.getTicket(assignment.ticketId).state !== "open") return false;
+      const { changes } = this.#run(
+        "UPDATE stall SET attempts = attempts + 1 WHERE id = ? AND attempts < 2 AND cleared_at IS NULL AND blocked_at IS NULL",
+        stallId,
+      );
+      if (Number(changes) === 0) return false;
+      this.beginTurn(assignment.id);
+      return true;
+    });
+  }
+
+  saveRecoveryReply(stallId: number, reply: string): void {
+    this.#run("UPDATE stall SET recovery_reply = ? WHERE id = ? AND cleared_at IS NULL", reply, stallId);
+  }
+
+  blockStall(stallId: number, reply: string): boolean {
+    return this.#transaction(() => {
+      const { changes } = this.#run(
+        "UPDATE stall SET blocked_at = ? WHERE id = ? AND attempts = 2 AND blocked_at IS NULL AND cleared_at IS NULL",
+        this.#stamp(), stallId,
+      );
+      if (Number(changes) === 0) return false;
+      const assignment = this.getAssignment(this.getStall(stallId).assignmentId);
+      const threadId = this.ticketContext(assignment.ticketId).thread.id;
+      this.#insertReply({ id: stallReplyId(stallId), threadId, body: reply, blocking: true });
+      return true;
+    });
   }
 
   getStall(stallId: number): Stall {
     const row = this.#get("SELECT * FROM stall WHERE id = ?", stallId);
     if (row === undefined) throw new Error(`no stall ${stallId}`);
     return toStall(row);
-  }
-
-  /** Open stall episodes the Router has not answered, on running assignments, oldest first. */
-  unansweredStalls(): Stall[] {
-    return this.#all(
-      `SELECT stall.* FROM stall JOIN assignment ON assignment.id = stall.assignment_id
-       WHERE stall.cleared_at IS NULL AND stall.answered_at IS NULL AND assignment.state = 'running'
-       ORDER BY stall.id`,
-    ).map(toStall);
-  }
-
-  /**
-   * Records the Router's answer to a stall. In the same transaction its reply, if any, is queued
-   * on the thread the ticket was accepted on, and a `stop` ends the assignment and, once no
-   * assignment of it runs, the ticket. Code never stops work on a stall without this answer.
-   */
-  answerStall(
-    stallId: number,
-    action: StallAction,
-    reply: string | null,
-  ): { replyId: string | null; ticketId: number; ticketEnded: boolean } {
-    return this.#transaction(() => {
-      const { changes } = this.#run(
-        "UPDATE stall SET action = ?, answered_at = ? WHERE id = ? AND answered_at IS NULL",
-        action,
-        this.#stamp(),
-        stallId,
-      );
-      if (Number(changes) !== 1) {
-        throw new IllegalTransition(`stall ${stallId} was already answered ${String(this.getStall(stallId).action)}`);
-      }
-      const assignment = this.getAssignment(this.getStall(stallId).assignmentId);
-      let replyId: string | null = null;
-      if (reply !== null) {
-        replyId = stallReplyId(stallId);
-        const threadId = this.ticketContext(assignment.ticketId).thread.id;
-        this.#insertReply({ id: replyId, threadId, body: reply });
-      }
-      if (action === "wait") return { replyId, ticketId: assignment.ticketId, ticketEnded: false };
-      return { replyId, ticketId: assignment.ticketId, ticketEnded: this.#endWork(assignment) };
-    });
   }
 
   // --- outbox --------------------------------------------------------------------------------
@@ -883,7 +955,7 @@ export class Store {
     const kind: OutboxKind = thread.statusCardCommentId === null ? "comment" : "edit";
     const target = thread.statusCardCommentId === null ? null : String(thread.statusCardCommentId);
     const existing = this.#get(
-      "SELECT id, sent_at FROM outbox WHERE id = ? OR (id LIKE ? AND sent_at IS NULL) ORDER BY id DESC LIMIT 1",
+      "SELECT id, body, sent_at FROM outbox WHERE id = ? OR id LIKE ? ORDER BY id DESC LIMIT 1",
       id,
       `${id}-%`,
     );
@@ -891,6 +963,7 @@ export class Store {
       this.#insertReply({ id, threadId, body, kind, ...(target === null ? {} : { target }) });
       return;
     }
+    if (existing["body"] === body) return;
     if (existing["sent_at"] !== null) {
       this.#insertReply({ id: `${id}-${this.#stamp()}`, threadId, body, kind, ...(target === null ? {} : { target }) });
       return;
@@ -901,10 +974,18 @@ export class Store {
     );
   }
 
+  /** A human reply can clear a stall while the sender is looking up its comment marker. */
+  isClearedStallReply(id: string): boolean {
+    return id.startsWith("stall-") && this.#get("SELECT 1 FROM stall WHERE id = ? AND blocked_at IS NOT NULL AND cleared_at IS NOT NULL",
+      Number(id.slice("stall-".length))) !== undefined;
+  }
+
   /** Unsent replies whose next attempt is due, oldest due first. */
   dueReplies(limit = 50): Reply[] {
     return this.#all(
       `SELECT * FROM outbox WHERE sent_at IS NULL AND next_attempt_at <= ?
+       AND NOT EXISTS (SELECT 1 FROM stall WHERE stall.id = CAST(substr(outbox.id, 7) AS INTEGER)
+         AND outbox.id GLOB 'stall-*' AND blocked_at IS NOT NULL AND cleared_at IS NOT NULL)
        ORDER BY next_attempt_at, enqueued_at, id LIMIT ?`,
       this.#stamp(),
       limit,
@@ -1032,6 +1113,15 @@ function toTicket(row: Row): Ticket {
     state: row["state"] as TicketState,
     openedAt: row["opened_at"] as string,
     endedAt: row["ended_at"] as string | null,
+    budget: {
+      wallMs: row["wall_limit_ms"] as number,
+      idleMs: row["idle_limit_ms"] as number,
+      turns: row["turn_limit"] as number,
+      tokens: row["token_limit"] as number,
+      escalations: row["escalation_limit"] as number,
+    },
+    budgetPause: row["budget_pause"] as BudgetMetric | null,
+    budgetResume: row["budget_resume"] === 1,
   };
 }
 
@@ -1052,6 +1142,7 @@ function toAssignment(row: Row): Assignment {
     outputTokens: row["output_tokens"] as number,
     turnStartedAt: row["turn_started_at"] as string | null,
     interruptions: row["interruptions"] as number,
+    lastTurnAt: row["last_turn_at"] as string | null,
     createdAt: row["created_at"] as string,
     startedAt: row["started_at"] as string | null,
     endedAt: row["ended_at"] as string | null,
@@ -1069,8 +1160,9 @@ function toStall(row: Row): Stall {
     detail: row["detail"] as string | null,
     detectedAt: row["detected_at"] as string,
     clearedAt: row["cleared_at"] as string | null,
-    action: row["action"] as StallAction | null,
-    answeredAt: row["answered_at"] as string | null,
+    attempts: row["attempts"] as number,
+    recoveryReply: row["recovery_reply"] as string | null,
+    blockedAt: row["blocked_at"] as string | null,
   };
 }
 

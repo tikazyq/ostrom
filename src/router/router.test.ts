@@ -35,7 +35,6 @@ const acceptAll = (batch: Batch): RouterAnswer => ({
     reply: "On it: a Worker is starting.",
   })),
   outcomes: batch.outcomes.map((outcome) => ({ key: outcome.key, reply: `Update: ${outcome.event}` })),
-  stalls: batch.stalls.map((stall) => ({ key: stall.key, action: "wait" as const, reply: null })),
 });
 
 
@@ -150,7 +149,6 @@ test("an ignore is recorded with no ticket, no Worker and no reply", async () =>
       },
     ],
     outcomes: [],
-    stalls: [],
   });
   const pass = await routeCandidates(s.options());
   assert.deepEqual(pass.decisions.map((d) => [d.verdict, d.ticketId, d.replyId]), [["ignore", null, null]]);
@@ -204,20 +202,6 @@ test("the answer must decide each candidate once, on its thread, and answer exac
         detail: null,
       },
     ],
-    stalls: [
-      {
-        key: "stall-3",
-        stallId: 3,
-        assignmentId: 1,
-        ticketId: 1,
-        thread: 1,
-        threadUrl: "u",
-        request: "r",
-        semonReason: "waiting-question",
-        detail: "Which colour?",
-        since: "t",
-      },
-    ],
   };
   const decision = (triggers: number[], extra: Record<string, unknown> = {}) => ({
     thread: 1,
@@ -228,41 +212,25 @@ test("the answer must decide each candidate once, on its thread, and answer exac
     ...extra,
   });
   const outcomes = [{ key: "outcome-a1-failed", reply: "It failed." }];
-  const stalls = [{ key: "stall-3", action: "wait", reply: null }];
   const parse = (value: unknown) => () => parseRouterAnswer(JSON.stringify(value), batch);
 
-  const parsed = parseRouterAnswer(JSON.stringify({ decisions: [decision([10, 11])], outcomes, stalls }), batch);
+  const parsed = parseRouterAnswer(JSON.stringify({ decisions: [decision([10, 11])], outcomes }), batch);
   assert.equal(parsed.decisions.length, 1);
-  assert.deepEqual(parsed.stalls, [{ key: "stall-3", action: "wait", reply: null }]);
-  assert.throws(parse({ decisions: [decision([10])], outcomes, stalls }), /11 are not decided/);
-  assert.throws(parse({ decisions: [decision([10, 11]), decision([11])], outcomes, stalls }), /decided twice/);
-  assert.throws(parse({ decisions: [decision([10, 11, 12])], outcomes, stalls }), /12 is not a candidate/);
-  assert.throws(parse({ decisions: [decision([10, 11], { thread: 2 })], outcomes, stalls }), /is on thread 1, not 2/);
-  assert.throws(parse({ decisions: [decision([10, 11], { verdict: "accept" })], outcomes, stalls }), /an accept needs a reply/);
-  assert.throws(parse({ decisions: [decision([10, 11], { verdict: "maybe" })], outcomes, stalls }), /verdict/);
-  assert.throws(parse({ decisions: [decision([10, 11], { reason: " " })], outcomes, stalls }), /reason/);
-  assert.throws(parse({ decisions: [decision([10, 11], { extra: 1 })], outcomes, stalls }), /unexpected field extra/);
-  assert.throws(parse({ decisions: [decision([10, 11])], outcomes: [], stalls }), /outcome-a1-failed have no reply/);
+  assert.throws(parse({ decisions: [decision([10])], outcomes }), /11 are not decided/);
+  assert.throws(parse({ decisions: [decision([10, 11]), decision([11])], outcomes }), /decided twice/);
+  assert.throws(parse({ decisions: [decision([10, 11, 12])], outcomes }), /12 is not a candidate/);
+  assert.throws(parse({ decisions: [decision([10, 11], { thread: 2 })], outcomes }), /is on thread 1, not 2/);
+  assert.throws(parse({ decisions: [decision([10, 11], { verdict: "accept" })], outcomes }), /an accept needs a reply/);
+  assert.throws(parse({ decisions: [decision([10, 11], { verdict: "maybe" })], outcomes }), /verdict/);
+  assert.throws(parse({ decisions: [decision([10, 11], { reason: " " })], outcomes }), /reason/);
+  assert.throws(parse({ decisions: [decision([10, 11], { extra: 1 })], outcomes }), /unexpected field extra/);
+  assert.throws(parse({ decisions: [decision([10, 11])], outcomes: [] }), /outcome-a1-failed have no reply/);
   assert.throws(
-    parse({ decisions: [decision([10, 11])], outcomes: [...outcomes, { key: "outcome-a9-failed", reply: "x" }], stalls }),
+    parse({ decisions: [decision([10, 11])], outcomes: [...outcomes, { key: "outcome-a9-failed", reply: "x" }] }),
     /not an outcome of this batch/,
   );
-  assert.throws(parse({ decisions: [decision([10, 11])], stalls }), /missing field outcomes/);
+  assert.throws(parse({ decisions: [decision([10, 11])] }), /missing field outcomes/);
 
-  // Stalls: exactly the batch's, each wait or stop, a stop with a reply, the reply always present.
-  const answer = (stallAnswers: unknown) => ({ decisions: [decision([10, 11])], outcomes, stalls: stallAnswers });
-  assert.deepEqual(
-    parseRouterAnswer(JSON.stringify(answer([{ key: "stall-3", action: "stop", reply: "Stopped." }])), batch).stalls,
-    [{ key: "stall-3", action: "stop", reply: "Stopped." }],
-  );
-  assert.throws(parse({ decisions: [decision([10, 11])], outcomes }), /missing field stalls/);
-  assert.throws(parse(answer([])), /stalls stall-3 have no answer/);
-  assert.throws(parse(answer([...stalls, ...stalls])), /stall-3 is answered twice/);
-  assert.throws(parse(answer([{ key: "stall-9", action: "wait", reply: null }])), /not a stall of this batch/);
-  assert.throws(parse(answer([{ key: "stall-3", action: "stop", reply: null }])), /a stop needs a reply/);
-  assert.throws(parse(answer([{ key: "stall-3", action: "end", reply: null }])), /action: expected wait or stop/);
-  assert.throws(parse(answer([{ key: "stall-3", action: "wait" }])), /missing field reply/);
-  assert.throws(parse(answer([{ key: "stall-3", action: "wait", reply: null, why: "x" }])), /unexpected field why/);
   assert.throws(() => parseRouterAnswer("```json\n{}\n```", batch), /not JSON/);
 });
 
@@ -436,65 +404,4 @@ test("a comment deleted since intake reaches the Router as deleted; long bodies 
   assert.match(deleted!.excerpt, /deleted from GitHub/);
   assert.equal(long!.truncated, true);
   assert.equal(long!.excerpt.length, 601);
-});
-
-test("a flagged stall reaches the Router once; wait leaves the Worker, stop ends the work", async () => {
-  const s = setup();
-  s.comment("please fix the typo", 57);
-  s.comment("and the CONTRIBUTING typo", 58, 8);
-  await s.poll();
-  const first = await routeCandidates(s.options());
-  const [a, b] = first.dispatched;
-  const turns = () => s.routerSessions().length;
-  assert.equal(turns(), 1);
-
-  const waiting = s.store().recordStall({ assignmentId: a!.assignmentId, semonReason: "waiting-question", detail: "Which file?" });
-  s.answer = (batch) => ({
-    decisions: [],
-    outcomes: [],
-    stalls: batch.stalls.map((stall) => ({ key: stall.key, action: "wait" as const, reply: "The Worker asks: which file?" })),
-  });
-  const flagged = await routeCandidates(s.options());
-  const sent = batchOf(s.routerSessions().at(-1)!.prompts[0]!) as unknown as { stalls: Record<string, unknown>[] };
-  assert.deepEqual(sent.stalls, [{
-    key: `stall-${waiting.id}`,
-    thread: first.decisions[0]!.thread,
-    threadUrl: "https://github.com/onsager-ai/ostrom/issues/7",
-    request: "fix the README typo",
-    signals: { semon: "waiting-question" },
-    detail: "Which file?",
-    since: NOW.toISOString(),
-  }]);
-  assert.deepEqual(flagged.stalls, [{
-    key: `stall-${waiting.id}`, action: "wait", ticketId: a!.ticketId, replyId: `stall-${waiting.id}`, ticketEnded: false,
-  }]);
-  assert.equal(s.store().getAssignment(a!.assignmentId).state, "running");
-  assert.equal(s.store().dueReplies().find((r) => r.id === `stall-${waiting.id}`)?.body, "The Worker asks: which file?");
-
-  // The same episode is not flagged again, so the Router is not asked.
-  s.store().recordStall({ assignmentId: a!.assignmentId, semonReason: "waiting-question", detail: null });
-  assert.equal((await routeCandidates(s.options())).router, null);
-  assert.equal(turns(), 2);
-
-  // A Router answer that does not check out records nothing; the stall stays flagged.
-  const gone = s.store().recordStall({ assignmentId: b!.assignmentId, semonReason: "process-gone", detail: null });
-  s.answer = (batch) => ({
-    decisions: [],
-    outcomes: [],
-    stalls: batch.stalls.map((stall) => ({ key: stall.key, action: "stop" as const, reply: null })),
-  });
-  await assert.rejects(routeCandidates(s.options()), /a stop needs a reply/);
-  assert.deepEqual(s.store().unansweredStalls().map((stall) => stall.id), [gone.id]);
-  assert.equal(s.store().getAssignment(b!.assignmentId).state, "running");
-
-  s.answer = (batch) => ({
-    decisions: [],
-    outcomes: [],
-    stalls: batch.stalls.map((stall) => ({ key: stall.key, action: "stop" as const, reply: "The Worker died; work stopped." })),
-  });
-  const stopped = await routeCandidates(s.options());
-  assert.deepEqual(stopped.stalls.map((stall) => [stall.action, stall.ticketEnded]), [["stop", true]]);
-  assert.equal(s.store().getAssignment(b!.assignmentId).state, "ended");
-  assert.equal(s.store().getTicket(b!.ticketId).state, "ended");
-  assert.equal(s.store().getTicket(a!.ticketId).state, "open");
 });

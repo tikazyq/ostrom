@@ -10,7 +10,11 @@ import { rolloutModel } from "../session/rollout.ts";
 import type { Runner, Session, TurnResult } from "../session/runner.ts";
 import { createWorktree } from "../session/worktree.ts";
 import type { Assignment, AssignmentOutcome, Store } from "../store/store.ts";
+import { assessBudget, type BudgetMetric } from "./budget.ts";
 import { workerBrief } from "./dispatch.ts";
+
+export const CHECKPOINT_PROMPT = "This ticket reached its budget. Push your work in progress to its existing branch, then stop and wait for Ostrom to resume you.";
+export const BUDGET_RESUME_PROMPT = "The operator extended this ticket's budget. Continue from your saved work.";
 
 export interface Dispatched {
   assignmentId: number;
@@ -42,6 +46,8 @@ export class Workers {
   readonly #sessions = new Map<number, Session>();
   readonly #chains = new Map<number, Promise<void>>();
   readonly #queued = new Set<string>();
+  readonly #active = new Map<number, AbortController>();
+  readonly #budgetStops = new Map<number, BudgetMetric>();
 
   constructor(deps: WorkersDeps) {
     this.#deps = deps;
@@ -96,15 +102,16 @@ export class Workers {
     assignmentId: number,
     key: string,
     prompt: string,
-    onStart: (turnId: string) => void,
-    onComplete?: (result: TurnResult) => void | Promise<void>,
+    onStart: (turnId: string, store: Store) => void,
+    onComplete?: (result: TurnResult, store: Store) => void | Promise<void>,
+    control = false,
   ): boolean {
     if (this.#queued.has(key)) return false;
     this.#queued.add(key);
     void this.#enqueue(assignmentId, () => this.#turn(assignmentId, prompt, (turnId) => {
-      onStart(turnId);
+      onStart(turnId, this.#deps.store);
       this.#queued.delete(key);
-    }, onComplete)).finally(() => this.#queued.delete(key));
+    }, onComplete, control)).finally(() => this.#queued.delete(key));
     return true;
   }
 
@@ -125,8 +132,11 @@ export class Workers {
       pass.resumed.push(assignment.id);
       if (assignment.turnStartedAt === null) continue;
       store.recordInterruption(assignment.id);
+      store.endTurn(assignment.id, null);
       pass.interrupted.push(assignment.id);
-      void this.#enqueue(assignment.id, () => this.#turn(assignment.id, INTERRUPTED_PROMPT));
+      if (store.getTicket(assignment.ticketId).state !== "open") continue;
+      if (store.openStall(assignment.id) !== null) store.recordOutcome(assignment.id, "failed");
+      else void this.#enqueue(assignment.id, () => this.#turn(assignment.id, INTERRUPTED_PROMPT));
     }
     return pass;
   }
@@ -159,43 +169,117 @@ export class Workers {
     return next;
   }
 
-  async #firstTurn(id: number, session: Session, prompt: string): Promise<void> {
+  /** Checks time limits during a live turn as well as between turns. */
+  enforceBudget(id: number, idleMs = 0): boolean {
     const { store } = this.#deps;
+    const assignment = store.getAssignment(id);
+    const ticket = store.getTicket(assignment.ticketId);
+    if (ticket.state !== "open" || ticket.budgetResume) return false;
+    const { reached } = assessBudget(ticket.budget, store.budgetUsage(ticket.id, idleMs));
+    const metric = reached.find((key) => assignment.turnStartedAt === null || key === "wallMs" || key === "idleMs");
+    if (metric === undefined) return false;
+    if (this.#budgetStops.has(id)) return true;
+    this.#budgetStops.set(id, metric);
+    this.interrupt(id);
+    void this.#enqueue(id, async () => { await this.#checkBudget(id); });
+    return true;
+  }
+
+  interrupt(id: number): void {
+    this.#active.get(id)?.abort();
+  }
+
+  resumeBudget(id: number): void {
+    const { store } = this.#deps;
+    void this.#enqueue(id, async () => {
+      if (!store.beginBudgetResume(id)) return;
+      await this.#runTurn(id, this.#session(store.getAssignment(id)), BUDGET_RESUME_PROMPT);
+      await this.#checkBudget(id);
+    });
+  }
+
+  recoverStall(id: number, stallId: number, prompt: string, interrupt: boolean, onResult: (result: TurnResult, store: Store) => void): void {
+    const { store } = this.#deps;
+    const key = `recovery-${id}`;
+    if (this.#queued.has(key)) return;
+    this.#queued.add(key);
+    if (interrupt) this.interrupt(id);
+    void this.#enqueue(id, async () => {
+      this.#queued.delete(key);
+      if (await this.#checkBudget(id) || !store.beginRecovery(stallId)) return;
+      const assignment = store.getAssignment(id);
+      queueStatusCard(store, assignment.ticketId);
+      const result = await this.#runTurn(id, this.#session(assignment), prompt);
+      if (result?.status === "completed") onResult(result, store);
+      await this.#checkBudget(id);
+    });
+  }
+
+  async #firstTurn(id: number, session: Session, prompt: string): Promise<void> {
+    await this.#runTurn(id, session, prompt);
+    await this.#checkBudget(id);
+  }
+
+  async #turn(
+    id: number,
+    prompt: string,
+    onStart?: (turnId: string, store: Store) => void,
+    onComplete?: (result: TurnResult, store: Store) => void | Promise<void>,
+    control = false,
+  ): Promise<void> {
+    const { store } = this.#deps;
+    const assignment = store.getAssignment(id);
+    const ticket = store.getTicket(assignment.ticketId);
+    if (assignment.state !== "running" || (!control && (ticket.state !== "open" || ticket.budgetResume))) return;
+    if (!control && await this.#checkBudget(id)) return;
+    const session = this.#session(assignment);
+    const turn = store.beginTurn(id);
+    onStart?.(`${assignment.sessionId}:${turn}`, store);
+    const result = await this.#runTurn(id, session, prompt);
+    if (result?.status === "completed") await onComplete?.(result, store);
+    await this.#checkBudget(id);
+  }
+
+  async #checkBudget(id: number): Promise<boolean> {
+    const { store } = this.#deps;
+    const assignment = store.getAssignment(id);
+    const ticket = store.getTicket(assignment.ticketId);
+    const requested = this.#budgetStops.get(id);
+    this.#budgetStops.delete(id);
+    if (assignment.state !== "running" || ticket.state !== "open" || ticket.budgetResume) return false;
+    const metric = requested ?? assessBudget(ticket.budget, store.budgetUsage(ticket.id)).reached[0];
+    if (metric === undefined) return false;
+    await this.#checkpoint(id, metric);
+    return true;
+  }
+
+  async #checkpoint(id: number, metric: BudgetMetric): Promise<void> {
+    const { store } = this.#deps;
+    if (!store.beginBudgetPause(id, metric)) return;
+    const assignment = store.getAssignment(id);
+    queueStatusCard(store, assignment.ticketId);
+    await this.#runTurn(id, this.#session(assignment), CHECKPOINT_PROMPT);
+  }
+
+  async #runTurn(id: number, session: Session, prompt: string): Promise<TurnResult | null> {
+    const { store } = this.#deps;
+    const active = new AbortController();
+    this.#active.set(id, active);
     let result: TurnResult;
     try {
-      result = await session.send(prompt);
+      result = await session.send(prompt, active.signal);
     } catch (error) {
       if (store.getAssignment(id).state === "pending") {
         store.abandonAssignment(id, error instanceof Error ? error.message : String(error));
       } else {
         this.#failed(id, error);
       }
-      return;
+      return null;
+    } finally {
+      this.#active.delete(id);
     }
     this.#finished(id, result);
-  }
-
-  async #turn(
-    id: number,
-    prompt: string,
-    onStart?: (turnId: string) => void,
-    onComplete?: (result: TurnResult) => void | Promise<void>,
-  ): Promise<void> {
-    const { store } = this.#deps;
-    const assignment = store.getAssignment(id);
-    if (assignment.state !== "running") return;
-    const session = this.#session(assignment);
-    const turn = store.beginTurn(id);
-    onStart?.(`${assignment.sessionId}:${turn}`);
-    let result: TurnResult;
-    try {
-      result = await session.send(prompt);
-    } catch (error) {
-      this.#failed(id, error);
-      return;
-    }
-    this.#finished(id, result);
-    if (result.status === "completed") await onComplete?.(result);
+    return result;
   }
 
   #failed(id: number, error: unknown): void {
@@ -211,7 +295,7 @@ export class Workers {
     store.endTurn(id, result.usage);
     const assignment = store.getAssignment(id);
     if (assignment.state !== "running") return;
-    if (assignment.harness === "codex" && this.#deps.codexSessions !== undefined) {
+    if (result.status === "completed" && assignment.harness === "codex" && this.#deps.codexSessions !== undefined) {
       const reason = this.#modelProblem(assignment, this.#deps.codexSessions);
       if (reason !== null) {
         this.#deps.log?.(`assignment ${id}: ended: ${reason}`);

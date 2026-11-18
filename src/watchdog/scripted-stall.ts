@@ -5,7 +5,7 @@
 //   node src/watchdog/scripted-stall.ts <issue-number>
 //
 // Environment: OSTROM_REPO, OSTROM_ALLOWLIST, OSTROM_DB (use a new file), OSTROM_WORKER_REPO and
-// OSTROM_WORKER_BASE. The issue is only where a Router reply would go; nothing is posted unless
+// OSTROM_WORKER_BASE. The issue is only where a Watchdog reply would go; nothing is posted unless
 // `ostromd send` runs on this store, so never run `send` on it.
 
 import { join } from "node:path";

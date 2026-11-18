@@ -82,7 +82,7 @@ specific, honest reply.
 1. **Detect (silent).** The Watchdog spots no progress for N minutes, a repeated error loop, a
    crash, an exhausted budget, or an unanswered question.
 2. **Recover (silent).** Ostrom resumes the same session, then retries, then moves up one tier, with
-   at most two attempts. The card shows "recovering".
+   at most two attempts. Milestone 1 runs both attempts on the same tier. The card shows "recovering".
 3. **Operator.** The stall appears in the operator's status view first. The operator can pause
    the ticket, open the session and unblock it.
 4. **Public.** Ostrom posts one stuck reply, labels the issue `ostrom:stuck` and sets the card to
@@ -136,7 +136,7 @@ line, in the style of `t3`. The CLI and a dashboard are two clients of one local
 | `ostrom status` | Machines, running Workers, stuck tickets, and spend today |
 | `ostrom tickets` / `ostrom show <ticket>` | List tickets, or show one: timeline, decisions, budget used, and the session ID to read with Semon |
 | `ostrom pause` / `resume` / `stop <ticket>` | The same effects as the GitHub commands |
-| `ostrom extend <ticket> --time 1h --cost 2` | Raise a ticket's budget |
+| `ostrom extend <ticket> --time 60 --turns 10` | Raise a ticket's budget |
 | `ostrom pin <ticket> <machine>` | Override where a ticket runs |
 | `ostrom preview` / `ostrom replay <trigger>` | Developer tools (see journey 3) |
 
@@ -152,8 +152,9 @@ estimated cost, and tier escalations. Defaults come per tier and can be overridd
 or per label.
 
 - At 80% of any limit, the status card and dashboard show a warning.
-- At a limit, the Worker **pauses**. It is not killed: it pushes its work in progress, and the stuck
-  ladder starts with the cause "budget reached". The operator can `ostrom extend` it or stop it.
+- At a limit, the Worker **pauses**. It gets a turn to push its work in progress. The
+  operator can `ostrom extend` it or stop it. Milestone 1 handles a budget pause separately from
+  the recovery ladder.
 - Subscription plans have no per-call price, so Ostrom always enforces tokens and time, and treats
   cost as an estimate.
 

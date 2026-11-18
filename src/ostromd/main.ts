@@ -25,10 +25,9 @@ import { loadConfig, loadRouterConfig, loadWatchdogConfig, loadWorkerConfig } fr
  *   review comment polled in the same tick is a follow-up, not a candidate for the Router.
  * - commands: fixed control words are authorized and consumed before any Worker delivery.
  * - route: ordinary follow-ups, including those, reach their Workers.
- * - watchdog: after a follow-up may have unblocked a Worker, and before the Router, so a new
- *   stall is flagged in this tick's batch.
- * - route-candidates: the Router judges candidates, outcomes and stalls and queues replies.
- * - send: replies queued by this tick's Router pass go out in this tick.
+ * - watchdog: check budgets and recover stalled Workers after follow-up routing.
+ * - route-candidates: the Router judges candidates and outcomes and queues replies.
+ * - send: post due outbox replies.
  * Each pass reads and writes only the store and its own neighbour, so none depends on an earlier
  * one succeeding: a failed pass is reported and the rest still run.
  */
@@ -51,11 +50,10 @@ commands:
   route  queue each new trigger on a subscribed thread as a turn on its ticket's Worker session,
          wait for the turns to finish, and print each queued follow-up as a JSON line
   watchdog
-         check every running Worker once with Semon's stalls read; record each new stall episode
-         for the Router's next batch and print each check as a JSON line
+         check budgets and stalls for running Workers, run recovery or queue a blocking reply,
+         and print each check as a JSON line
   route-candidates
-         one Router pass: ask the Router to judge undecided triggers, word outcome replies and
-         answer flagged stalls (wait or stop), record its decisions, dispatch accepted tickets,
+         one Router pass: judge undecided triggers, word outcome replies, dispatch accepted tickets,
          queue replies and end finished or stopped tickets; print each record as a JSON line
   tick   run every pass once: ${TICK.join(" → ")}; a failed pass is reported, the rest still
          run, and the tick exits non-zero
@@ -66,7 +64,7 @@ environment: OSTROM_REPO, OSTROM_ALLOWLIST, OSTROM_DB;
   dispatch also needs OSTROM_WORKER_REPO, OSTROM_WORKER_BASE (optional: OSTROM_WORKER_WORKTREES,
   OSTROM_WORKER_HARNESS=claude|codex, default codex, OSTROM_WORKER_MODEL, default gpt-6-luna);
   route-candidates needs those, optional OSTROM_ROUTER_HARNESS=claude|codex (default codex) and
-  OSTROM_ROUTER_MODEL (default gpt-6-luna); watchdog needs OSTROM_STALL_MINUTES; tick and run
+  OSTROM_ROUTER_MODEL (default gpt-6-luna); watchdog needs worker settings and OSTROM_STALL_MINUTES; tick and run
   need all of them
 `;
 
@@ -286,7 +284,7 @@ export async function main(argv: readonly string[], deps: MainDeps = defaults): 
     }
     if (command === "watchdog") {
       const { idleMinutes } = loadWatchdogConfig(deps.env);
-      const pass = await watchdog({ store, semon: deps.semon, idleMinutes });
+      const pass = await watchdog({ store, semon: deps.semon, idleMinutes, workers: workers() });
       for (const checked of pass.checked) deps.stdout(JSON.stringify(checked));
       for (const failure of pass.failed) deps.stderr(`ostromd watchdog: ${failure.what} failed: ${failure.error}`);
       const flagged = pass.checked.filter((checked) => checked.newEpisode).length;
@@ -310,12 +308,11 @@ export async function main(argv: readonly string[], deps: MainDeps = defaults): 
       if (pass.router !== null) deps.stdout(JSON.stringify({ type: "router", ...pass.router }));
       for (const decision of pass.decisions) deps.stdout(JSON.stringify({ type: "decision", ...decision }));
       for (const outcome of pass.outcomes) deps.stdout(JSON.stringify({ type: "outcome", ...outcome }));
-      for (const stall of pass.stalls) deps.stdout(JSON.stringify({ type: "stall", ...stall }));
       for (const dispatched of pass.dispatched) deps.stdout(JSON.stringify({ type: "dispatch", ...dispatched }));
       for (const failure of pass.failed) deps.stderr(`ostromd route-candidates: ${failure.what} failed: ${failure.error}`);
       deps.stderr(
         `ostromd route-candidates: ${pass.decisions.length} decisions, ${pass.outcomes.length} outcome replies, ` +
-          `${pass.stalls.length} stalls answered, ${pass.dispatched.length} dispatched, ${pass.failed.length} failed`,
+          `${pass.dispatched.length} dispatched, ${pass.failed.length} failed`,
       );
       return pass.failed.length === 0 ? 0 : 1;
     }

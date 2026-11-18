@@ -125,8 +125,15 @@ noted.
 5. **Commands.** One command table in code for redirect, `@ostrom pause`/`resume`/`stop`, and
    closing the issue or PR, with permissions and reactions.
 6. **Budgets and the stuck ladder.** Time, idle time, turns and tokens, with pause at a limit and
-   `ostrom extend`. The Watchdog feeds the ladder (detect, recover, then the public stuck reply from
-   the fixed template).
+   `ostrom extend`. Each ticket starts with 120 minutes of Worker turn time, 30 minutes without
+   output in a running turn, 40 attempts, two million tokens (including cache reads), and one
+   reserved tier escalation. Milestone 1 records the escalation allowance and leaves it unused.
+   The card warns at 80%. At a limit the Worker gets one checkpoint turn asking it to push work in
+   progress. The ticket retains the assignment and session. The checkpoint counts toward usage.
+   `ostrom extend <ticket> [--time M] [--turns N] [--tokens N]` adds positive increments and requests
+   a resume on the next Watchdog pass once all cumulative limits have headroom. A new turn starts
+   a fresh idle window. The Watchdog also owns the two same-session recovery attempts and the
+   validated blocking reply, as detailed in [The Watchdog](watchdog.md).
 7. **The `ostrom` CLI.** `status`, `tickets`, `show`, `pause`/`resume`/`stop`, `extend` and
    `preview` over `ostromd`'s local API, all with `--json`. `ostromd` keeps only `run`; a systemd
    user unit runs it, with logs in journald.

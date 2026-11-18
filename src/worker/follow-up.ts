@@ -2,6 +2,7 @@
 // session. A submitted review and all of its inline comments are one logical follow-up: one turn,
 // one acknowledgement reaction, and one summary reply after the Worker completes.
 
+import { queueStatusCard } from "../github/cards.ts";
 import { renderReviewReply } from "../github/review-reply.ts";
 import type { Store, Thread, Trigger } from "../store/store.ts";
 import type { Workers } from "./workers.ts";
@@ -39,11 +40,12 @@ export function routeFollowUps(store: Store, workers: Workers): RoutePass {
         assignmentId,
         `review-${key}`,
         reviewFollowUpMessage(ticketId, store.getThread(trigger.threadId), review.map((item) => item.trigger)),
-        (turnId) => {
+        (turnId, store) => {
           store.recordReviewDelivery(review.map((item) => item.trigger.id), assignmentId, turnId);
+          queueStatusCard(store, ticketId);
           for (const item of review) enqueueReceivedReaction(store, item.trigger);
         },
-        (result) => {
+        (result, store) => {
           store.enqueueReply({
             id: `review-${assignmentId}-${trigger.reviewId}`,
             threadId: trigger.threadId,
@@ -58,8 +60,9 @@ export function routeFollowUps(store: Store, workers: Workers): RoutePass {
       assignmentId,
       `${trigger.id}:${assignmentId}`,
       followUpMessage(ticketId, trigger, store.getThread(trigger.threadId)),
-      (turnId) => {
+      (turnId, store) => {
         store.recordDelivery(trigger.id, assignmentId, turnId);
+        queueStatusCard(store, ticketId);
         enqueueReceivedReaction(store, trigger);
       },
     );

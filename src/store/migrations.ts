@@ -325,6 +325,23 @@ export const migrations: readonly string[] = [
     SELECT RAISE(ABORT, 'only an accept decision creates a ticket');
   END;
   `,
+
+  // 15: Ticket budgets and the Watchdog's recovery attempts.
+  `
+  ALTER TABLE ticket ADD COLUMN wall_limit_ms INTEGER NOT NULL DEFAULT 7200000 CHECK (wall_limit_ms > 0);
+  ALTER TABLE ticket ADD COLUMN idle_limit_ms INTEGER NOT NULL DEFAULT 1800000 CHECK (idle_limit_ms > 0);
+  ALTER TABLE ticket ADD COLUMN turn_limit INTEGER NOT NULL DEFAULT 40 CHECK (turn_limit > 0);
+  ALTER TABLE ticket ADD COLUMN token_limit INTEGER NOT NULL DEFAULT 2000000 CHECK (token_limit > 0);
+  ALTER TABLE ticket ADD COLUMN escalation_limit INTEGER NOT NULL DEFAULT 1 CHECK (escalation_limit >= 0);
+  ALTER TABLE ticket ADD COLUMN budget_pause TEXT CHECK (budget_pause IN ('wallMs', 'idleMs', 'turns', 'tokens'));
+  ALTER TABLE ticket ADD COLUMN budget_resume INTEGER NOT NULL DEFAULT 0 CHECK (budget_resume IN (0, 1));
+  ALTER TABLE assignment ADD COLUMN wall_ms INTEGER NOT NULL DEFAULT 0;
+  ALTER TABLE assignment ADD COLUMN last_turn_at TEXT;
+  ALTER TABLE stall ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts BETWEEN 0 AND 2);
+  ALTER TABLE stall ADD COLUMN recovery_reply TEXT;
+  ALTER TABLE stall ADD COLUMN blocked_at TEXT;
+  UPDATE stall SET cleared_at = COALESCE(answered_at, detected_at) WHERE cleared_at IS NULL;
+  `,
 ];
 
 /** Applies every migration newer than the database's version. Returns the resulting version. */
