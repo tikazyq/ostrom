@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { defaultSocketPath, localApi } from "../api/server.ts";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -57,6 +58,70 @@ test("show renders turn model, effort and kind in text and JSON", async () => {
     assert.deepEqual(view.turns.map((turn) => [turn.kind, turn.observedModel, turn.observedEffort]), [["dispatch", "luna", "low"]]);
   } finally {
     process.stdout.write = original;
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("models manages selections over the socket and reads or exports them offline", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "ostrom-cli-models-"));
+  const path = join(directory, "ostrom.db");
+  const file = join(directory, "selections.json");
+  const env = { OSTROM_DB: path, HOME: directory, XDG_RUNTIME_DIR: directory };
+  const store = Store.open(path);
+  const refreshed: string[][] = [];
+  const api = localApi(store, {
+    socketPath: defaultSocketPath(env),
+    control: { pause: async () => {}, resume: async () => {}, stop: async () => {}, extend: async () => {}, preview: async () => "" },
+    refreshModels: async (harnesses) => {
+      refreshed.push([...(harnesses ?? [])]);
+      throw new Error("codex: unavailable");
+    },
+  });
+  const original = process.stdout.write;
+  let output = "";
+  try {
+    const model = { id: "test/model", displayName: "Test", description: "", efforts: ["low", "high"], defaultEffort: "high" };
+    const key = `codex/${model.id}`;
+    store.saveModelCatalog("codex", [model]);
+    process.stdout.write = ((chunk: string) => { output += chunk; return true; }) as typeof process.stdout.write;
+    await api.start();
+    assert.equal(await main(["models"], env), 0);
+    assert.match(output, /codex\/test\/model  not allowed/);
+    assert.equal(await main(["models", "allow", key], env), 0);
+    assert.equal(await main(["models", "set", key, "--efforts", "low", "--approval", "true", "--cost", "2.5", "--note", "Rust work"], env), 0);
+    assert.equal(await main(["models", "objective", "quality"], env), 0);
+    const expected = { objective: "quality", selections: [{ model: key, efforts: ["low"], approval: true, cost: 2.5, note: "Rust work" }] };
+    assert.deepEqual(store.modelSelections(), expected);
+    assert.equal(await main(["models", "set", key, "--efforts", "max"], env), 1);
+    assert.equal(await main(["models", "refresh", "codex"], env), 1);
+    assert.deepEqual(refreshed, [["codex"]]);
+    writeFileSync(file, JSON.stringify({ objective: "cost", selections: [...expected.selections, { model: "codex/missing" }] }));
+    assert.equal(await main(["models", "import", file], env), 1);
+    assert.deepEqual(store.modelSelections(), expected);
+
+    store.saveModelCatalog("codex", []);
+    output = "";
+    assert.equal(await main(["models"], env), 0);
+    assert.match(output, /codex\/test\/model  allowed but unavailable/);
+    assert.equal(await main(["models", "remove", key], env), 0);
+    assert.deepEqual(store.modelSelections().selections, []);
+    store.saveModelCatalog("codex", [model]);
+    writeFileSync(file, JSON.stringify(expected));
+    assert.equal(await main(["models", "import", file], env), 0);
+    await api.close();
+
+    output = "";
+    assert.equal(await main(["models", "export"], env), 0);
+    assert.deepEqual(JSON.parse(output), expected);
+    output = "";
+    assert.equal(await main(["models", "--json"], env), 0);
+    assert.deepEqual(JSON.parse(output).catalogs[0].models, [model]);
+    assert.equal(await main(["models", "remove", key], env), 1);
+    assert.deepEqual(store.modelSelections(), expected);
+  } finally {
+    process.stdout.write = original;
+    await api.close();
+    store.close();
     rmSync(directory, { recursive: true, force: true });
   }
 });

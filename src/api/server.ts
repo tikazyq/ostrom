@@ -6,6 +6,8 @@ import { chmod, mkdir, rm } from "node:fs/promises";
 import { availableParallelism } from "node:os";
 import { createServer, type Server } from "node:http";
 import { dirname, join } from "node:path";
+import { object, type Harness } from "../models/catalog.ts";
+import { changeModels } from "../models/selections.ts";
 import type { Store } from "../store/store.ts";
 
 export interface LocalApi {
@@ -27,6 +29,7 @@ export interface LocalApiOptions {
   temperature?: () => Promise<number | null>;
   watchdog?: () => { lastAttemptAt: string | null; lastSuccess: boolean | null; lastSuccessAt: string | null; error: string | null };
   tickIntervalSeconds?: number;
+  refreshModels?: (harnesses?: readonly Harness[]) => Promise<void>;
 }
 
 export function defaultSocketPath(env: Record<string, string | undefined> = process.env): string {
@@ -55,6 +58,21 @@ export function localApi(store: Store, options: LocalApiOptions): LocalApi {
         if (!Number.isInteger(limit) || limit < 1 || limit > 200) return reply(response, 400, { error: "limit must be a whole number from 1 to 200" });
         return reply(response, 200, store.operatorIntake(limit));
       }
+      if (request.method === "GET" && url.pathname === "/v1/models") return reply(response, 200, store.operatorModels());
+      if (request.method === "GET" && url.pathname === "/v1/models/export") return reply(response, 200, store.modelSelections());
+      if (request.method === "POST" && url.pathname.startsWith("/v1/models/")) {
+        const action = url.pathname.slice("/v1/models/".length);
+        if (action === "refresh" && options.refreshModels !== undefined) {
+          const harness = (await json(request))["harness"];
+          if (harness !== undefined && harness !== "claude" && harness !== "codex") throw new Error("expected claude or codex");
+          await options.refreshModels(harness === undefined ? undefined : [harness]);
+          return reply(response, 200, store.operatorModels());
+        }
+        if (action === "allow" || action === "remove" || action === "set" || action === "objective" || action === "import") {
+          changeModels(store, action, await json(request));
+          return reply(response, 200, store.operatorModels());
+        }
+      }
       const ticket = /^\/v1\/tickets\/([1-9]\d*)$/.exec(url.pathname);
       if (request.method === "GET" && ticket !== null) return reply(response, 200, store.operatorTicket(Number(ticket[1])));
       if (request.method === "GET" && url.pathname === "/v1/preview") return reply(response, 200, { markdown: await options.control.preview() });
@@ -64,7 +82,7 @@ export function localApi(store: Store, options: LocalApiOptions): LocalApi {
         if (action[2] === "pause") await options.control.pause(ticketId);
         else if (action[2] === "resume") await options.control.resume(ticketId);
         else if (action[2] === "stop") await options.control.stop(ticketId);
-        else if (action[2] === "extend") await options.control.extend(ticketId, await json(request));
+        else if (action[2] === "extend") await options.control.extend(ticketId, await budgetIncreases(request));
         else return reply(response, 404, { error: "not found" });
         return reply(response, 200, store.operatorTicket(ticketId));
       }
@@ -76,12 +94,15 @@ export function localApi(store: Store, options: LocalApiOptions): LocalApi {
   return { start: () => listen(server, socketPath), close: () => close(server, socketPath) };
 }
 
-async function json(request: import("node:http").IncomingMessage): Promise<{ timeMinutes?: number; turns?: number; tokens?: number }> {
+async function json(request: import("node:http").IncomingMessage): Promise<Record<string, unknown>> {
+  request.setEncoding("utf8");
   let body = "";
   for await (const chunk of request) body += chunk;
-  const parsed: unknown = JSON.parse(body);
-  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) throw new Error("expected a JSON object");
-  const value = parsed as Record<string, unknown>;
+  return object(JSON.parse(body));
+}
+
+async function budgetIncreases(request: import("node:http").IncomingMessage): Promise<{ timeMinutes?: number; turns?: number; tokens?: number }> {
+  const value = await json(request);
   for (const key of ["timeMinutes", "turns", "tokens"]) {
     if (value[key] !== undefined && (!Number.isSafeInteger(value[key]) || (value[key] as number) <= 0)) {
       throw new Error(`${key} must be a positive whole number`);

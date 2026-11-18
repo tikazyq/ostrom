@@ -30,6 +30,7 @@ function deps(
     sleep: async () => {},
     stop: new AbortController().signal,
     runners: { claude: runner, codex: runner },
+    discoverModels: async () => [],
     addWorktree: async (_repo, _path, _base, ticket, assignment) => `ostrom/ticket-${ticket}-${assignment}`,
   };
   return { out, err, deps: d, runner };
@@ -466,6 +467,15 @@ test(
     const waits: number[] = [];
     const run = deps(tickEnv(dbPath), github.gh, semonAnswer(20, []));
     run.deps.stop = stop.signal;
+    const discovered: string[] = [];
+    run.deps.discoverModels = async (harness, signal) => {
+      discovered.push(harness);
+      if (harness === "claude") return [{ id: "sonnet", displayName: "Sonnet", description: "", efforts: [], defaultEffort: null }];
+      // This probe never finishes on its own. The tick still runs and shutdown cancels it.
+      await new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
+      signal.throwIfAborted();
+      return [];
+    };
     run.deps.sleep = async (ms) => {
       waits.push(ms);
       // The second tick fails; the operator stops the loop during the following wait.
@@ -475,5 +485,10 @@ test(
     assert.equal(await main(["run", "--interval", "30"], run.deps), 1);
     assert.deepEqual(waits, [30_000, 30_000]);
     assert.equal(run.err.filter((line) => line.startsWith("ostromd tick:")).length, 2);
+    assert.deepEqual(discovered, ["claude", "codex"]);
+    const after = Store.open(dbPath);
+    try {
+      assert.deepEqual(after.operatorModels().catalogs.map((entry) => [entry.harness, entry.models[0]?.id]), [["claude", "sonnet"]]);
+    } finally { after.close(); }
   }),
 );

@@ -69,6 +69,38 @@ The sandbox matrix in `merging.md` remains a separate, unperformed verification 
 Set `OSTROM_WORKER_RULES_FILE` to a file of the machine's house rules (for example its heat
 limits, and that tests run in CI rather than locally). Its text closes every Worker's brief.
 
+## Model discovery and selections
+
+Run `ostrom models` to see each harness's last successful refresh time, its offered models and
+reasoning efforts, and your selections. `ostrom models --json` gives the same data as JSON.
+Discovery starts in the background when `ostromd` starts and uses the daemon's Claude and Codex
+authentication and provider settings. Each probe has a 15-second timeout. Refresh both catalogs
+with `ostrom models refresh`, or pass `claude` or `codex` to refresh one. A failed probe keeps that
+harness's previous list and timestamp. Startup failures appear in the journal, and a manual
+refresh exits non-zero if any requested probe fails.
+
+Use the full `harness/model` key printed by the list. Newly discovered models start disallowed.
+
+```sh
+ostrom models allow codex/gpt-6-luna
+ostrom models set codex/gpt-6-luna --efforts low,high --approval false --cost 1 --note 'Routine changes'
+ostrom models objective balanced
+ostrom models export > selections.json
+ostrom models remove codex/gpt-6-luna
+ostrom models import selections.json
+```
+
+`set` changes only the supplied settings on an allowed model. Defaults are all advertised efforts,
+`--approval false`, relative `--cost 1`, and an empty `--note`. Use `--efforts all` to restore all
+advertised efforts or `--efforts ''` for an empty subset. `remove` clears the model's selection and
+custom settings. A previously allowed model missing from a new catalog is listed as unavailable and
+can still be removed. Objectives are `cost` (the default), `balanced`, and `quality`.
+
+Listing and JSON export can read `OSTROM_DB` with the daemon stopped. Changes, refresh, and import
+require the daemon's Unix socket. Export contains the objective and selections. Import replaces both
+in one update after validating every model and explicit effort against this machine's cached catalogs.
+These choices are stored for later model selection. Workers still use the configured Worker model.
+
 ## GitHub App identity
 
 Set both `OSTROM_GITHUB_APP_ID=4544316` and `OSTROM_GITHUB_APP_KEY_FILE=/absolute/path/to/key.pem`

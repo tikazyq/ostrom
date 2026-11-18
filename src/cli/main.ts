@@ -3,6 +3,8 @@
 // views can still inspect the SQLite store directly.
 
 import { request } from "node:http";
+import { readFile } from "node:fs/promises";
+import { HARNESSES, modelKey, type ModelView } from "../models/catalog.ts";
 
 import { startDashboard } from "./dashboard.ts";
 
@@ -25,13 +27,26 @@ commands:
   extend <ticket> --time M [--turns N] [--tokens N]
   preview
   dashboard
+  models [export]
+  models allow|remove <harness/model>
+  models set <harness/model> [--efforts LIST|all] [--approval true|false] [--cost WEIGHT] [--note TEXT]
+  models objective cost|balanced|quality
+  models refresh [claude|codex]
+  models import <file>
 
 Read-only commands fall back to OSTROM_DB when ostromd is not running.`;
 
 type Command =
   | { name: "status" | "tickets" | "preview"; json: boolean }
   | { name: "show" | "pause" | "resume" | "stop"; ticketId: number; json: boolean }
-  | { name: "extend"; ticketId: number; increases: { timeMinutes?: number; turns?: number; tokens?: number }; json: boolean };
+  | { name: "extend"; ticketId: number; increases: { timeMinutes?: number; turns?: number; tokens?: number }; json: boolean }
+  | ModelCommand;
+
+type ModelCommand = { name: "models"; json: boolean } & (
+  | { action: "list" | "export" }
+  | { action: "import"; file: string }
+  | { action: "allow" | "remove" | "set" | "refresh" | "objective"; body: Record<string, unknown> }
+);
 
 export async function main(argv: readonly string[], env: Record<string, string | undefined> = process.env): Promise<number> {
   if (argv.length === 1 && argv[0] === "dashboard") {
@@ -49,7 +64,7 @@ export async function main(argv: readonly string[], env: Record<string, string |
   const command = parse(argv);
   if (command === null) return usage();
   try {
-    loadAppConfig(env);
+    if (command.name !== "models") loadAppConfig(env);
     const result = await api(command, env);
     output(command, result);
     return 0;
@@ -80,6 +95,7 @@ function failure(error: unknown): number {
 function parse(argv: readonly string[]): Command | null {
   const json = argv.at(-1) === "--json";
   const args = json ? argv.slice(0, -1) : argv;
+  if (args[0] === "models") return parseModels(args.slice(1), json);
   if (args.length === 1 && (args[0] === "status" || args[0] === "tickets" || args[0] === "preview")) return { name: args[0], json };
   if (args.length === 2 && (args[0] === "show" || args[0] === "pause" || args[0] === "resume" || args[0] === "stop") && /^[1-9]\d*$/.test(args[1]!)) {
     return { name: args[0], ticketId: Number(args[1]), json };
@@ -98,8 +114,42 @@ function parse(argv: readonly string[]): Command | null {
   return Object.keys(increases).length === 0 ? null : { name: "extend", ticketId: Number(args[1]), increases, json };
 }
 
+function parseModels(args: readonly string[], json: boolean): ModelCommand | null {
+  const [action, value, ...flags] = args;
+  const base = { name: "models" as const, json };
+  if (action === undefined) return { ...base, action: "list" };
+  if (action === "export" && args.length === 1) return { ...base, action };
+  if (action === "refresh" && flags.length === 0 && (value === undefined || value === "claude" || value === "codex")) {
+    return { ...base, action, body: { harness: value } };
+  }
+  if (value === undefined) return null;
+  if (action === "import" && flags.length === 0) return { ...base, action, file: value };
+  if (action === "objective" && flags.length === 0) return { ...base, action, body: { objective: value } };
+  if ((action === "allow" || action === "remove") && flags.length === 0) return { ...base, action, body: { model: value } };
+  if (action !== "set" || flags.length === 0) return null;
+  const body: Record<string, unknown> = { model: value };
+  for (let index = 0; index < flags.length; index += 2) {
+    const flag = flags[index];
+    const setting = flags[index + 1];
+    if (setting === undefined) return null;
+    if (flag === "--efforts") body["efforts"] = setting === "all" ? null : setting === "" ? [] : setting.split(",");
+    else if (flag === "--approval" && (setting === "true" || setting === "false")) body["approval"] = setting === "true";
+    else if (flag === "--cost" && Number.isFinite(Number(setting))) body["cost"] = Number(setting);
+    else if (flag === "--note") body["note"] = setting;
+    else return null;
+  }
+  return { ...base, action, body };
+}
+
 async function api(command: Command, env: Record<string, string | undefined>): Promise<unknown> {
   const socketPath = defaultSocketPath(env);
+  if (command.name === "models") {
+    const action = command.action;
+    if (action === "list") return call(socketPath, "GET", "/v1/models");
+    if (action === "export") return call(socketPath, "GET", "/v1/models/export");
+    if (action === "import") return call(socketPath, "POST", "/v1/models/import", JSON.parse(await readFile(command.file, "utf8")));
+    if ("body" in command) return call(socketPath, "POST", `/v1/models/${action}`, command.body);
+  }
   if (command.name === "status") return call(socketPath, "GET", "/v1/status");
   if (command.name === "tickets") return call(socketPath, "GET", "/v1/tickets");
   if (command.name === "show") return call(socketPath, "GET", `/v1/tickets/${command.ticketId}`);
@@ -135,7 +185,8 @@ function call(socketPath: string, method: "GET" | "POST", path: string, body?: u
 }
 
 function readOnly(command: Command): boolean {
-  return command.name === "status" || command.name === "tickets" || command.name === "show" || command.name === "preview";
+  return command.name === "status" || command.name === "tickets" || command.name === "show" || command.name === "preview" ||
+    (command.name === "models" && (command.action === "list" || command.action === "export"));
 }
 
 function unavailable(error: unknown): boolean {
@@ -148,6 +199,8 @@ async function direct(command: Command, path: string, env: Record<string, string
     if (command.name === "status") return store.operatorStatus();
     if (command.name === "tickets") return store.operatorTickets();
     if (command.name === "show") return store.operatorTicket(command.ticketId);
+    if (command.name === "models" && command.action === "list") return store.operatorModels();
+    if (command.name === "models" && command.action === "export") return store.modelSelections();
     if (command.name === "preview") {
       const config = loadConfig(env);
       const appConfig = loadAppConfig(env);
@@ -162,14 +215,50 @@ async function direct(command: Command, path: string, env: Record<string, string
 }
 
 function output(command: Command, value: unknown): void {
+  if (command.name === "models" && command.action === "export") {
+    process.stdout.write(`${JSON.stringify(value, null, 2)}\n`);
+    return;
+  }
   if (command.json) {
     process.stdout.write(`${JSON.stringify(value)}\n`);
     return;
   }
+  if (command.name === "models") return models(value as ModelView);
   if (command.name === "status") return status(value as OperatorStatus);
   if (command.name === "tickets") return tickets(value as OperatorTicket[]);
   if (command.name === "show" || command.name === "pause" || command.name === "resume" || command.name === "stop" || command.name === "extend") return show(value as OperatorTicketDetail);
   process.stdout.write((value as { markdown: string }).markdown);
+}
+
+function models(view: ModelView): void {
+  process.stdout.write(`objective  ${view.objective}\n`);
+  const selections = new Map(view.selections.map((selection) => [selection.model, selection]));
+  for (const harness of HARNESSES) {
+    const catalog = view.catalogs.find((entry) => entry.harness === harness);
+    process.stdout.write(`${harness}  ${catalog === undefined ? "no catalog" : `refreshed ${catalog.refreshedAt}`}\n`);
+    for (const model of catalog?.models ?? []) {
+      const key = modelKey(harness, model.id);
+      const selection = selections.get(key);
+      const efforts = model.efforts.join(",") || "none reported";
+      const defaultEffort = model.defaultEffort === null ? "" : ` (default ${model.defaultEffort})`;
+      process.stdout.write(`  ${key}  ${selection === undefined ? "not allowed" : "allowed"}  ${model.displayName}  efforts ${efforts}${defaultEffort}\n`);
+      if (selection !== undefined) {
+        const unavailable = selection.efforts?.filter((effort) => !model.efforts.includes(effort)) ?? [];
+        renderSelection(selection, unavailable);
+        selections.delete(key);
+      }
+    }
+  }
+  for (const selection of selections.values()) {
+    process.stdout.write(`  ${selection.model}  allowed but unavailable\n`);
+    renderSelection(selection, []);
+  }
+}
+
+function renderSelection(selection: ModelView["selections"][number], unavailable: string[]): void {
+  const efforts = selection.efforts === null ? "all" : selection.efforts.join(",") || "none";
+  const stale = unavailable.length === 0 ? "" : ` (unavailable: ${unavailable.join(",")})`;
+  process.stdout.write(`    allowed efforts ${efforts}${stale}  approval ${selection.approval}  cost ${selection.cost}  note ${JSON.stringify(selection.note)}\n`);
 }
 
 function status(view: OperatorStatus): void {

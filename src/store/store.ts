@@ -5,6 +5,7 @@ import { DatabaseSync, type SQLInputValue } from "node:sqlite";
 import { budgetReached, budgetUsage, budgetWarning } from "../budget/budgets.ts";
 import type { BudgetDefaults } from "../budget/budgets.ts";
 import { migrate } from "./migrations.ts";
+import type { Catalog, Harness, Model, ModelView, Selections } from "../models/catalog.ts";
 
 export type SourceKind = "github";
 export type ThreadKind = "issue" | "pull_request";
@@ -383,6 +384,30 @@ export class Store {
 
   close(): void {
     this.#db.close();
+  }
+
+  // --- model discovery and selections -------------------------------------------------------
+
+  saveModelCatalog(harness: Harness, models: Model[]): void {
+    this.#run(`INSERT INTO model_catalog (harness, refreshed_at, models) VALUES (?, ?, ?)
+      ON CONFLICT (harness) DO UPDATE SET refreshed_at = excluded.refreshed_at, models = excluded.models`,
+    harness, this.#stamp(), JSON.stringify(models));
+  }
+
+  modelSelections(): Selections {
+    return JSON.parse(this.#get("SELECT settings FROM model_selections WHERE id = 1")!["settings"] as string) as Selections;
+  }
+
+  saveModelSelections(selections: Selections): void {
+    this.#run("UPDATE model_selections SET settings = ? WHERE id = 1", JSON.stringify(selections));
+  }
+
+  operatorModels(): ModelView {
+    const catalogs = this.#all("SELECT * FROM model_catalog ORDER BY harness").map((row): Catalog => ({
+      harness: row["harness"] as Harness, refreshedAt: row["refreshed_at"] as string,
+      models: JSON.parse(row["models"] as string) as Model[],
+    }));
+    return { ...this.modelSelections(), catalogs };
   }
 
   // --- sources and threads -------------------------------------------------------------------

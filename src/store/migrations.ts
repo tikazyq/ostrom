@@ -586,6 +586,20 @@ export const migrations: readonly string[] = [
   CREATE INDEX turn_by_ticket ON turn(ticket_id, id);
   CREATE UNIQUE INDEX turn_running ON turn(assignment_id) WHERE status = 'running';
   `,
+
+  // 31: Discovery snapshots and operator choices have independent lifetimes.
+  `
+  CREATE TABLE model_catalog (
+    harness TEXT PRIMARY KEY CHECK (harness IN ('claude', 'codex')),
+    refreshed_at TEXT NOT NULL,
+    models TEXT NOT NULL
+  ) STRICT;
+  CREATE TABLE model_selections (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    settings TEXT NOT NULL
+  ) STRICT;
+  INSERT INTO model_selections VALUES (1, '{"objective":"cost","selections":[]}');
+  `,
 ];
 
 /** Applies every migration newer than the database's version. Returns the resulting version. */

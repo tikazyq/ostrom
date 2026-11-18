@@ -14,6 +14,7 @@ import { sendDueReplies } from "../github/outbox.ts";
 import { processRunner, type ProcessRunner } from "../process.ts";
 import { pollOnce } from "../github/poller.ts";
 import { routeCandidates } from "../router/router.ts";
+import { modelDiscovery, modelRefresh, type DiscoverModels } from "../models/discovery.ts";
 import { sessionConfig } from "../session/config.ts";
 import { codexSessionsDir } from "../session/rollout.ts";
 import { claudeRunner, codexRunner, type Runner } from "../session/runner.ts";
@@ -70,6 +71,7 @@ export interface MainDeps {
   stop: AbortSignal;
   /** Session runners; default to the real Claude and Codex SDKs configured from `env`. */
   runners?: Record<"claude" | "codex", Runner>;
+  discoverModels?: DiscoverModels;
   /** Where Codex rollout records live; default ~/.codex/sessions. */
   codexSessions?: string;
   addWorktree?: WorkersDeps["addWorktree"];
@@ -162,11 +164,16 @@ async function run(intervalSeconds: number, deps: MainDeps): Promise<number> {
   let code = 0;
   const owned = openWorkers(deps);
   const controls = operatorControls(owned.store, owned.workers, deps.gh, config.repo);
+  const discoveryShutdown = new AbortController();
+  const discoveryStop = AbortSignal.any([deps.stop, discoveryShutdown.signal]);
+  const discover = deps.discoverModels ?? modelDiscovery(deps.env);
+  const refreshModels = modelRefresh(owned.store, discover, discoveryStop);
   const watchdogHealth = { lastAttemptAt: null as string | null, lastSuccess: null as boolean | null, lastSuccessAt: null as string | null, error: null as string | null };
   const api = localApi(owned.store, {
     socketPath: defaultSocketPath(deps.env),
     watchdog: () => ({ ...watchdogHealth }),
     tickIntervalSeconds: intervalSeconds,
+    refreshModels,
     control: {
       ...controls,
       extend: async (ticketId, increases) => {
@@ -181,14 +188,20 @@ async function run(intervalSeconds: number, deps: MainDeps): Promise<number> {
   logRecovery(owned.workers.recover(), deps);
   // A stop cuts off running turns rather than waiting for them; recovery resumes them on the next start.
   deps.stop.addEventListener("abort", () => owned.workers.stop(), { once: true });
+  let startupDiscovery: Promise<void> | undefined;
   try {
     await api.start();
+    startupDiscovery = refreshModels().catch((error: unknown) => {
+      if (!discoveryStop.aborted) deps.stderr(`ostromd model discovery: ${error instanceof Error ? error.message : String(error)}`);
+    });
     while (!deps.stop.aborted) {
       code = await tick({ ...deps, workers: owned.workers, store: owned.store, watchdogHealth });
       if (deps.stop.aborted) break;
       await deps.sleep(intervalSeconds * 1000, deps.stop);
     }
   } finally {
+    discoveryShutdown.abort();
+    await startupDiscovery;
     await api.close();
     await owned.close();
   }
