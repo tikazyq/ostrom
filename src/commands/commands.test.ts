@@ -147,8 +147,10 @@ test("an open issue-state trigger is consumed without closing its open ticket", 
 test("closing the issue cancels a hung turn, gets the graceful stop prompt and ends with the distinct card state", async () => {
   const { github, runner, store, workers, ticketId, assignmentId } = fixture();
   runner.hold = true;
-  workers.deliver(assignmentId, "hung", "work", () => {});
-  await Promise.resolve();
+  await new Promise<void>((started) => {
+    workers.deliver(assignmentId, "hung", "work", () => started());
+  });
+  assert.equal(runner.sessions[0]?.running, 1);
   const source = store.ensureSource("github", REPO);
   store.insertTrigger({
     sourceId: source.id, sourceEventId: "closed-state", threadId: store.ticketContext(ticketId).thread.id,
@@ -158,6 +160,7 @@ test("closing the issue cancels a hung turn, gets the graceful stop prompt and e
   runner.sessions[0]!.auto = true;
   await workers.drain();
   assert.match(runner.sessions[0]!.prompts.at(-1)!, /issue was closed/);
+  assert.equal(store.ticketTurns(ticketId)[0]?.status, "cancelled");
   assert.equal(store.getTicket(ticketId).state, "ended");
   assert.ok(store.dueReplies().some((reply) => reply.id === `stopped-issue-closed-${ticketId}`));
 });

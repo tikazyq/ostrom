@@ -656,6 +656,12 @@ export class Store {
     }));
   }
 
+  /** The model requiring approval before dispatch, if any. */
+  modelApproval(ticketId: number): string | null {
+    const next = nextModel(this.models.view(), this.ticketSelections(ticketId));
+    return next?.needsApproval ? modelKey(next.model) : null;
+  }
+
   /** Tickets in operator-list order, with the fields needed by CLI and dashboard clients. */
   operatorTickets(): OperatorTicket[] {
     const tickets = this.#all("SELECT id FROM ticket ORDER BY id DESC").map((row) => this.#operatorTicket(row["id"] as number));
@@ -730,7 +736,7 @@ export class Store {
       at: (row["outcome_at"] ?? row["ended_at"]) as string }));
     const latestFailure = recentFailures[0];
     const merge = assignment === null ? null : this.mergeCandidateForAssignment(assignment.id);
-    const next = assignment === null && ticket.state !== "ended" ? nextModel(this.models.view(), this.ticketSelections(ticketId)) : null;
+    const modelApproval = assignment === null && ticket.state !== "ended" ? this.modelApproval(ticketId) : null;
     const prs = this.#all(
       `SELECT thread.url FROM subscription JOIN thread ON thread.id = subscription.thread_id
        WHERE subscription.ticket_id = ? AND thread.kind = 'pull_request' ORDER BY thread.number`, ticketId,
@@ -738,7 +744,7 @@ export class Store {
     return {
       ...ticket, thread: context.thread, assignment, budget,
       currentTurn: assignment === null ? null : this.latestWorkerTurn(assignment.id),
-      modelApproval: next?.needsApproval ? modelKey(next.model) : null,
+      modelApproval,
       budgetUsage: { time: budgetUsage(budget, "time", now), idle: budgetUsage(budget, "idle", now),
         turns: budgetUsage(budget, "turns", now), tokens: budgetUsage(budget, "tokens", now),
         escalations: budgetUsage(budget, "escalations", now) },

@@ -520,6 +520,11 @@ test("Router model choice waits for operator approval and stays fixed while effo
     assert.deepEqual(waiting.dispatched, []);
     assert.equal(store.latestAssignment(ticketId), null);
     assert.equal(store.operatorTicket(ticketId).modelApproval, "claude/premium");
+    s.comment("one more detail for the Worker", 59);
+    await s.poll();
+    assert.equal(store.pendingDeliveries().length, 1);
+    assert.deepEqual(routeFollowUps(store, options.workers), { queued: [], failed: [] });
+    assert.equal(store.pendingDeliveries().length, 1);
     assert.deepEqual((await routeCandidates(options)).failed, []);
     assert.equal(store.dueReplies().filter(({ id }) => id.startsWith("model-approval-")).length, 1);
     assert.throws(() => options.workers.override(ticketId, "model", "claude/premium", { login: "alice", triggerId: 1 }), /local CLI/);
