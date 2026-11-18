@@ -128,6 +128,12 @@ export async function pollOnce(options: PollOptions): Promise<PollResult> {
       result.droppedOwn++;
       continue;
     }
+    if (event.kind === "issue_opened" && (verdict === "not_allowed" || !/@ostrom\b/i.test(event.body))) {
+      store.recordIntakeReceipt({ sourceId: source.id, sourceEventId: event.id, url: event.url,
+        reason: verdict === "not_allowed" ? "unauthorized_author" : "missing_mention" });
+      if (verdict === "not_allowed") result.droppedNotAllowed++;
+      continue;
+    }
     const existing = store.findThread(source.id, event.number);
     if (verdict === "not_allowed" && event.kind !== "issue_state" && (existing === null || !store.ticketsForThread(existing.id).some((ticket) => ticket.state === "open" || ticket.state === "paused"))) {
       result.droppedNotAllowed++;
@@ -273,13 +279,12 @@ function issueCommentEvent(item: Item): GitHubEvent {
   };
 }
 
-/** A newly opened issue asks the Router only when it explicitly mentions Ostrom in its body. */
+/** Normalize new issues before filtering, so excluded issues can receive a body-free receipt. */
 function issueOpenedEvent(item: Item, since: Date): GitHubEvent[] {
   if (item["pull_request"] != null || item["state"] !== "open") return [];
   const createdAt = new Date(field(item, "created_at", "string"));
   if (createdAt.getTime() < since.getTime()) return [];
   const body = bodyOf(item);
-  if (!/@ostrom\b/i.test(body)) return [];
   const url = field(item, "html_url", "string");
   return [{
     id: `${field(item, "node_id", "string")}:opened`,

@@ -18,7 +18,7 @@ import { codexSessionsDir } from "../session/rollout.ts";
 import { claudeRunner, codexRunner, type Runner } from "../session/runner.ts";
 import { Store } from "../store/store.ts";
 import { advanceStuckLadder } from "../watchdog/stuck.ts";
-import { watchdog } from "../watchdog/watchdog.ts";
+import { watchdog, unknownWatchdogHealth, type WatchdogReadHealth } from "../watchdog/watchdog.ts";
 import { observe } from "../worker/dispatch.ts";
 import { routeFollowUps } from "../worker/follow-up.ts";
 import { Workers, type WorkersDeps } from "../worker/workers.ts";
@@ -81,6 +81,7 @@ export interface MainDeps {
   mergeAllowed?: boolean;
   appReady?: boolean;
   appBotId?: number;
+  watchdogHealth?: WatchdogReadHealth;
 }
 
 function sleep(ms: number, stop: AbortSignal): Promise<void> {
@@ -154,8 +155,11 @@ async function run(intervalSeconds: number, deps: MainDeps): Promise<number> {
   let code = 0;
   const owned = openWorkers(deps);
   const controls = operatorControls(owned.store, owned.workers, deps.gh, config.repo);
+  const watchdogHealth = unknownWatchdogHealth();
   const api = localApi(owned.store, {
     socketPath: defaultSocketPath(deps.env),
+    watchdogHealth,
+    tickIntervalSeconds: intervalSeconds,
     control: {
       ...controls,
       extend: async (ticketId, increases) => { owned.store.extendTicketBudget(ticketId, increases); },
@@ -168,7 +172,7 @@ async function run(intervalSeconds: number, deps: MainDeps): Promise<number> {
   try {
     await api.start();
     while (!deps.stop.aborted) {
-      code = await tick({ ...deps, workers: owned.workers, store: owned.store });
+      code = await tick({ ...deps, workers: owned.workers, store: owned.store, watchdogHealth });
       if (deps.stop.aborted) break;
       await deps.sleep(intervalSeconds * 1000, deps.stop);
     }
@@ -318,7 +322,8 @@ export async function main(argv: readonly string[], deps: MainDeps = defaults): 
     }
     if (command === "watchdog") {
       const { idleMinutes } = loadWatchdogConfig(deps.env);
-      const pass = await watchdog({ store, semon: deps.semon, idleMinutes });
+      const pass = await watchdog({ store, semon: deps.semon, idleMinutes,
+        ...(deps.watchdogHealth === undefined ? {} : { health: deps.watchdogHealth }) });
       const ladder = await advanceStuckLadder(store, workers());
       for (const checked of pass.checked) deps.stdout(JSON.stringify(checked));
       for (const failure of pass.failed) deps.stderr(`ostromd watchdog: ${failure.what} failed: ${failure.error}`);

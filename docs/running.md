@@ -25,6 +25,24 @@ The operator uses `ostrom status`, `tickets`, `show`, `pause`, `resume`, `stop`,
 read-only commands can inspect `OSTROM_DB` directly while the daemon is down;
 mutating controls require the daemon.
 
+The same socket serves `GET /v1/intake?limit=50` (default 50; a positive whole number),
+returning newest observations first. Each row has `sourceId`, `sourceEventId`, `url`,
+`observedAt`, `disposition`, `reason`, and nullable `triggerId`/`decisionId` pointers.
+Dispositions include Router `accept`, `ignore`, `stop`, `awaiting_decision` for stored triggers
+without a Router decision, and `excluded` for newly opened issues missing an `@ostrom` mention
+or having an unauthorized author (`missing_mention` / `unauthorized_author`). Exclusion receipts
+keep the first observation time across polling replays and store no issue body. Own replies and
+other filtered comments have no receipt. This is polling coverage, not a complete GitHub audit;
+observed time is when the daemon stored the event, not when GitHub created it.
+
+Ticket list and detail responses include subscribed `prUrls`, the latest assignment's stored
+`mergeCandidate`, `latestFailure`, the newest 20 `failures`, and server-computed `budgetUsage`
+and `budgetWarning` (80% of a positive limit). Failure history survives a successful turn or a
+replacement assignment. `/v1/status` includes `tickIntervalSeconds`, a `CPU parallelism` label
+on machine slots (not configured Worker capacity), and `watchdog` read health: `lastAttemptAt`,
+`status` (`unknown`, `success`, `failure`), `lastSuccessAt`, and a concise `error`. Health is kept
+in daemon memory and resets to unknown after a restart; no stalls does not imply a healthy read.
+
 Developer-only one-shot passes remain available as `ostromd dev <pass>`:
 `poll`, `send`, `dispatch <ticket>`, `observe`, `commands`, `route`, `watchdog`,
 `merge`, `route-candidates`, and `tick`. They are retained for their existing tests and

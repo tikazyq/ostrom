@@ -54,6 +54,81 @@ function fixture() {
   };
 }
 
+test("intake receipts preserve first observation and combine with decisions newest first", () => {
+  const { store, source, issue, trigger, advance } = fixture();
+  const receipt = { sourceId: source.id, sourceEventId: "issue:opened", url: "https://example.test/issues/8", reason: "missing_mention" as const };
+  store.recordIntakeReceipt(receipt);
+  const first = store.operatorIntake()[0]!;
+  advance(60_000);
+  store.recordIntakeReceipt(receipt);
+  assert.deepEqual(store.operatorIntake(), [first]);
+  const ignored = trigger();
+  store.recordDecision({ threadId: issue, triggerIds: [ignored], verdict: "ignore", reason: "no work requested" });
+  advance(60_000);
+  const awaiting = trigger();
+  assert.deepEqual(store.operatorIntake().map((entry) => entry.disposition), ["awaiting_decision", "ignore", "excluded"]);
+  assert.equal(store.operatorIntake(1)[0]!.triggerId, awaiting);
+  assert.equal(store.operatorIntake()[1]!.reason, "no work requested");
+  assert.equal(store.operatorIntake()[2]!.observedAt, first.observedAt);
+  assert.throws(() => store.operatorIntake(0), /positive whole number/);
+});
+
+test("intake defaults to the newest 50 receipts", () => {
+  const { store, source, advance } = fixture();
+  for (let i = 0; i < 55; i++) {
+    advance(1_000);
+    store.recordIntakeReceipt({ sourceId: source.id, sourceEventId: `issue-${i}`, url: `https://example.test/issues/${i}`, reason: "unauthorized_author" });
+  }
+  assert.equal(store.operatorIntake().length, 50);
+  assert.equal(store.operatorIntake()[0]!.sourceEventId, "issue-54");
+  assert.equal(store.operatorIntake().at(-1)!.sourceEventId, "issue-5");
+  assert.equal(store.operatorIntake(100).length, 55);
+});
+
+test("operator tickets retain failures across successful turns and replacement assignments", () => {
+  const { store, source, accept, advance } = fixture();
+  const ticket = accept();
+  const failedDispatch = store.createAssignment(ticket);
+  store.abandonAssignment(failedDispatch, "worktree failed");
+  const assignment = store.createAssignment(ticket);
+  store.configureNativeAssignment(assignment, { harness: "codex", model: "m", worktree: "/w", branch: "b", machine: "host" });
+  store.startNativeAssignment(assignment, "session");
+  const pr = store.ensureThread({ sourceId: source.id, kind: "pull_request", number: 8, url: "https://example.test/pull/8" });
+  store.subscribe(ticket, pr);
+  const candidate = store.upsertMergeCandidate({ assignmentId: assignment, repository: source.name, prNumber: 8,
+    headSha: "head", baseSha: "base", policy: "approvals", activityFingerprint: null, activityAt: null,
+    readyReplyId: null, readySentAt: null, quietDeadline: null, blockingReason: "policy approvals are not satisfied" });
+  for (let i = 0; i < 21; i++) {
+    advance(1_000);
+    store.recordTurnError(assignment, `failure ${i}`);
+  }
+  store.clearTurnError(assignment);
+  advance(384 * 60_000);
+  const summary = store.operatorTickets()[0]!;
+  assert.deepEqual(summary.prUrls, ["https://example.test/pull/8"]);
+  assert.deepEqual(summary.mergeCandidate, candidate);
+  assert.equal(summary.failures.length, 20);
+  assert.equal(summary.latestFailure!.error, "failure 20");
+  assert.equal(summary.failures[19]!.error, "failure 1");
+  assert.equal(summary.budgetUsage.time, 384);
+  assert.equal(summary.budgetUsage.tokens, 0);
+  assert.equal(summary.budgetWarning, "time");
+  assert.deepEqual(store.operatorTicket(ticket).failures, summary.failures);
+  store.endAssignment(assignment);
+  const replacement = store.createAssignment(ticket);
+  store.abandonAssignment(replacement, "replacement failed");
+  assert.equal(store.operatorTicket(ticket).latestFailure!.kind, "dispatch");
+  assert.equal(store.operatorTicket(ticket).latestFailure!.error, "replacement failed");
+});
+
+test("abandoning a pending assignment during shutdown is not a dispatch failure", () => {
+  const { store, accept } = fixture();
+  const ticket = accept();
+  store.abandonAssignment(store.createAssignment(ticket), "ostromd stopped before the session started", false);
+  assert.deepEqual(store.operatorTicket(ticket).failures, []);
+  assert.equal(store.operatorTicket(ticket).latestFailure, null);
+});
+
 test("migrations apply once and record their version", () => {
   const db = database();
   assert.equal(migrate(db), migrations.length);
@@ -63,6 +138,26 @@ test("migrations apply once and record their version", () => {
     rows.map((r) => r["version"]),
     migrations.map((_, i) => i + 1),
   );
+});
+
+test("operator migration preserves existing dispatch and turn failure evidence", () => {
+  const db = database();
+  db.exec("CREATE TABLE schema_version (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL) STRICT");
+  for (const [index, sql] of migrations.slice(0, 28).entries()) {
+    db.exec(sql);
+    db.prepare("INSERT INTO schema_version VALUES (?, ?)").run(index + 1, "2026-11-10T00:00:00Z");
+  }
+  db.exec(`INSERT INTO source (id, kind, name) VALUES (1, 'github', 'o/r');
+    INSERT INTO thread (id, source_id, kind, number, url) VALUES (1, 1, 'issue', 1, 'url');
+    INSERT INTO decision (id, thread_id, verdict, reason, decided_at) VALUES (1, 1, 'accept', 'work', '2026-11-10T00:00:00Z');
+    INSERT INTO ticket (id, decision_id, state, opened_at) VALUES (1, 1, 'open', '2026-11-10T00:00:00Z');
+    INSERT INTO assignment (id, ticket_id, state, created_at, ended_at, end_reason)
+      VALUES (1, 1, 'ended', '2026-11-10T00:00:00Z', '2026-11-10T00:01:00Z', 'dispatch failed');
+    INSERT INTO assignment (id, ticket_id, state, created_at, started_at, session_id, last_error, outcome, outcome_at)
+      VALUES (2, 1, 'running', '2026-11-10T00:00:00Z', '2026-11-10T00:00:00Z', 'session', 'resume failed', 'failed', '2026-11-10T00:02:00Z');`);
+  migrate(db);
+  const rows = db.prepare("SELECT kind, error FROM worker_failure ORDER BY occurred_at DESC").all();
+  assert.deepEqual(rows.map((row) => [row["kind"], row["error"]]), [["turn", "resume failed"], ["dispatch", "dispatch failed"]]);
 });
 
 test("queued-turn migration preserves every prior state and supports honest cancellation", () => {

@@ -184,7 +184,7 @@ export class Workers {
     const { store } = this.#deps;
     const pass = { resumed: [] as number[], interrupted: [] as number[], abandoned: [] as number[] };
     for (const pending of store.pendingAssignments()) {
-      store.abandonAssignment(pending.id, "ostromd stopped before the session started");
+      store.abandonAssignment(pending.id, "ostromd stopped before the session started", false);
       pass.abandoned.push(pending.id);
     }
     for (const assignment of store.runningAssignments()) {

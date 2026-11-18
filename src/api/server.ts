@@ -5,7 +5,14 @@ import { chmod, mkdir, readFile, rm } from "node:fs/promises";
 import { availableParallelism } from "node:os";
 import { createServer, type Server } from "node:http";
 import { dirname, join } from "node:path";
-import type { Store } from "../store/store.ts";
+import type { Store, OperatorStatus } from "../store/store.ts";
+import { unknownWatchdogHealth, type WatchdogReadHealth } from "../watchdog/watchdog.ts";
+
+export interface ApiStatus extends OperatorStatus {
+  watchdog: WatchdogReadHealth;
+  tickIntervalSeconds: number | null;
+  machine: { slots: { total: number; used: number; label: "CPU parallelism" }; temperature: number | null };
+}
 
 export interface LocalApi {
   start(): Promise<void>;
@@ -24,6 +31,8 @@ export interface LocalApiOptions {
   socketPath?: string;
   control: ApiControl;
   temperature?: () => Promise<number | null>;
+  watchdogHealth?: WatchdogReadHealth;
+  tickIntervalSeconds?: number;
 }
 
 export function defaultSocketPath(env: Record<string, string | undefined> = process.env): string {
@@ -40,10 +49,19 @@ export function localApi(store: Store, options: LocalApiOptions): LocalApi {
     const url = new URL(request.url ?? "/", "http://localhost");
     try {
       if (request.method === "GET" && url.pathname === "/v1/status") {
-        return reply(response, 200, { ...store.operatorStatus(), machine: {
-          slots: { total: availableParallelism(), used: store.runningAssignments().length },
-          temperature: await (options.temperature ?? latestTemperature)(),
-        } });
+        const status: ApiStatus = { ...store.operatorStatus(),
+          watchdog: options.watchdogHealth ?? unknownWatchdogHealth(),
+          tickIntervalSeconds: options.tickIntervalSeconds ?? null,
+          machine: {
+            slots: { total: availableParallelism(), used: store.runningAssignments().length, label: "CPU parallelism" },
+            temperature: await (options.temperature ?? latestTemperature)(),
+          } };
+        return reply(response, 200, status);
+      }
+      if (request.method === "GET" && url.pathname === "/v1/intake") {
+        const raw = url.searchParams.get("limit");
+        if (raw !== null && !/^[1-9]\d*$/.test(raw)) throw new Error("limit must be a positive whole number");
+        return reply(response, 200, store.operatorIntake(raw === null ? 50 : Number(raw)));
       }
       if (request.method === "GET" && url.pathname === "/v1/tickets") return reply(response, 200, store.operatorTickets());
       const ticket = /^\/v1\/tickets\/([1-9]\d*)$/.exec(url.pathname);

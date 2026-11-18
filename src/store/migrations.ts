@@ -548,6 +548,33 @@ export const migrations: readonly string[] = [
   ALTER TABLE queued_turn_v28 RENAME TO queued_turn;
   CREATE INDEX queued_turn_unfinished ON queued_turn (assignment_id, state) WHERE state IN ('queued', 'running');
   `,
+
+  // 29: Compact observations for operator intake and durable Worker failure history.
+  `
+  CREATE TABLE intake_receipt (
+    source_id INTEGER NOT NULL REFERENCES source(id),
+    source_event_id TEXT NOT NULL,
+    url TEXT NOT NULL,
+    observed_at TEXT NOT NULL,
+    reason TEXT NOT NULL CHECK (reason IN ('missing_mention', 'unauthorized_author')),
+    PRIMARY KEY (source_id, source_event_id)
+  ) STRICT, WITHOUT ROWID;
+  CREATE TABLE worker_failure (
+    id INTEGER PRIMARY KEY,
+    assignment_id INTEGER NOT NULL REFERENCES assignment(id),
+    kind TEXT NOT NULL CHECK (kind IN ('dispatch', 'turn')),
+    error TEXT NOT NULL,
+    occurred_at TEXT NOT NULL
+  ) STRICT;
+  CREATE INDEX worker_failure_assignment ON worker_failure(assignment_id, occurred_at DESC, id DESC);
+  INSERT INTO worker_failure (assignment_id, kind, error, occurred_at)
+    SELECT id, 'dispatch', end_reason, ended_at FROM assignment
+    WHERE started_at IS NULL AND ended_at IS NOT NULL AND end_reason IS NOT NULL
+      AND end_reason <> 'ostromd stopped before the session started';
+  INSERT INTO worker_failure (assignment_id, kind, error, occurred_at)
+    SELECT id, 'turn', last_error, outcome_at FROM assignment
+    WHERE outcome = 'failed' AND last_error IS NOT NULL AND outcome_at IS NOT NULL;
+  `,
 ];
 
 /** Applies every migration newer than the database's version. Returns the resulting version. */

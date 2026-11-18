@@ -77,10 +77,23 @@ export function parseSemonStalls(stdout: string, idleMinutes: number): SemonStal
   });
 }
 
+export interface WatchdogReadHealth {
+  lastAttemptAt: string | null;
+  status: "unknown" | "success" | "failure";
+  lastSuccessAt: string | null;
+  error: string | null;
+}
+
+export function unknownWatchdogHealth(): WatchdogReadHealth {
+  return { lastAttemptAt: null, status: "unknown", lastSuccessAt: null, error: null };
+}
+
 export interface WatchdogOptions {
   store: Store;
   semon: ProcessRunner;
   idleMinutes: number;
+  /** Daemon-owned health, shared across ticks and reset on restart. */
+  health?: WatchdogReadHealth;
   /** Clock used for budget evaluation; injectable for deterministic checks. */
   now?: () => Date;
 }
@@ -107,11 +120,23 @@ export async function watchdog(options: WatchdogOptions): Promise<WatchdogPass> 
   const { store, idleMinutes, now = () => new Date() } = options;
   const pass: WatchdogPass = { checked: [], failed: [] };
   let semon: SemonStall[] | null;
+  const health = options.health;
+  if (health !== undefined) health.lastAttemptAt = now().toISOString();
   try {
     semon = await readSemonStalls(options.semon, idleMinutes);
+    if (health !== undefined) {
+      health.status = "success";
+      health.lastSuccessAt = now().toISOString();
+      health.error = null;
+    }
   } catch (error) {
     semon = null;
-    pass.failed.push({ what: "semon stalls", error: message(error) });
+    const detail = message(error);
+    if (health !== undefined) {
+      health.status = "failure";
+      health.error = detail.slice(0, DETAIL_CHARS);
+    }
+    pass.failed.push({ what: "semon stalls", error: detail });
   }
   for (const assignment of store.runningAssignments()) {
     const found = assignment.branch === null ? undefined : semon?.find((stall) => stall.branch === assignment.branch);

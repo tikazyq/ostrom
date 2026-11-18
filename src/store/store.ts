@@ -2,7 +2,7 @@
 // See docs/direction.md, "Data model". Only the operations milestone 1 needs live here.
 
 import { DatabaseSync, type SQLInputValue } from "node:sqlite";
-import type { BudgetDefaults } from "../budget/budgets.ts";
+import { BUDGET_LIMITS, budgetUsage, budgetWarning, type BudgetDefaults, type BudgetLimit } from "../budget/budgets.ts";
 import { migrate } from "./migrations.ts";
 
 export type SourceKind = "github";
@@ -148,11 +148,38 @@ export interface TicketBudget {
   turnStartedAt: string | null;
 }
 
+export type IntakeExclusion = "missing_mention" | "unauthorized_author";
+
+export interface IntakeEntry {
+  sourceId: number;
+  sourceEventId: string;
+  url: string;
+  observedAt: string;
+  disposition: "excluded" | "awaiting_decision" | Verdict;
+  reason: string | null;
+  triggerId: number | null;
+  decisionId: number | null;
+}
+
+export interface WorkerFailure {
+  id: number;
+  assignmentId: number;
+  kind: "dispatch" | "turn";
+  error: string;
+  occurredAt: string;
+}
+
 /** The compact records displayed by the local operator API. */
 export interface OperatorTicket extends Ticket {
   thread: Thread;
   assignment: Assignment | null;
   budget: TicketBudget;
+  budgetUsage: Record<BudgetLimit, number>;
+  budgetWarning: BudgetLimit | null;
+  prUrls: string[];
+  mergeCandidate: MergeCandidate | null;
+  latestFailure: WorkerFailure | null;
+  failures: WorkerFailure[];
 }
 
 export interface OperatorTicketDetail extends OperatorTicket {
@@ -543,6 +570,34 @@ export class Store {
     return toTicket(row);
   }
 
+  /** First observation survives cursor overlap and restarts; excluded issue bodies never enter storage. */
+  recordIntakeReceipt(input: { sourceId: number; sourceEventId: string; url: string; reason: IntakeExclusion }): void {
+    this.#run(
+      `INSERT INTO intake_receipt (source_id, source_event_id, url, observed_at, reason)
+       VALUES (?, ?, ?, ?, ?) ON CONFLICT (source_id, source_event_id) DO NOTHING`,
+      input.sourceId, input.sourceEventId, input.url, this.#stamp(), input.reason,
+    );
+  }
+
+  operatorIntake(limit = 50): IntakeEntry[] {
+    if (!Number.isSafeInteger(limit) || limit <= 0) throw new Error("limit must be a positive whole number");
+    return this.#all(
+      `SELECT * FROM (
+         SELECT source_id, source_event_id, url, observed_at, 'excluded' AS disposition, reason,
+           NULL AS trigger_id, NULL AS decision_id FROM intake_receipt
+         UNION ALL
+         SELECT t.source_id, t.source_event_id, t.url, t.received_at AS observed_at,
+           COALESCE(d.verdict, 'awaiting_decision') AS disposition, d.reason,
+           t.id AS trigger_id, d.id AS decision_id
+         FROM "trigger" t LEFT JOIN decision_trigger dt ON dt.trigger_id = t.id
+         LEFT JOIN decision d ON d.id = dt.decision_id
+       ) ORDER BY observed_at DESC, source_id DESC, source_event_id DESC, decision_id DESC LIMIT ?`,
+      limit,
+    ).map((row) => ({ sourceId: row["source_id"] as number, sourceEventId: row["source_event_id"] as string,
+      url: row["url"] as string, observedAt: row["observed_at"] as string, disposition: row["disposition"] as IntakeEntry["disposition"],
+      reason: row["reason"] as string | null, triggerId: row["trigger_id"] as number | null, decisionId: row["decision_id"] as number | null }));
+  }
+
   /** Tickets in operator-list order, with the fields needed by CLI and dashboard clients. */
   operatorTickets(): OperatorTicket[] {
     return this.#all("SELECT id FROM ticket ORDER BY id DESC").map((row) => this.#operatorTicket(row["id"] as number));
@@ -592,7 +647,23 @@ export class Store {
   #operatorTicket(ticketId: number): OperatorTicket {
     const ticket = this.getTicket(ticketId);
     const context = this.ticketContext(ticketId);
-    return { ...ticket, thread: context.thread, assignment: this.latestAssignment(ticketId), budget: this.ticketBudget(ticketId) };
+    const assignment = this.latestAssignment(ticketId);
+    const budget = this.ticketBudget(ticketId);
+    const now = this.#now();
+    const usage = Object.fromEntries(BUDGET_LIMITS.map((limit) => [limit, budgetUsage(budget, limit, now)])) as Record<BudgetLimit, number>;
+    const prUrls = this.#all(
+      `SELECT thread.url FROM thread JOIN subscription ON subscription.thread_id = thread.id
+       WHERE subscription.ticket_id = ? AND thread.kind = 'pull_request' ORDER BY thread.id`, ticketId,
+    ).map((row) => row["url"] as string);
+    const failures = this.#all(
+      `SELECT worker_failure.* FROM worker_failure JOIN assignment ON assignment.id = worker_failure.assignment_id
+       WHERE assignment.ticket_id = ? ORDER BY worker_failure.occurred_at DESC, worker_failure.id DESC LIMIT 20`, ticketId,
+    ).map((row): WorkerFailure => ({ id: row["id"] as number, assignmentId: row["assignment_id"] as number,
+      kind: row["kind"] as WorkerFailure["kind"], error: row["error"] as string, occurredAt: row["occurred_at"] as string }));
+    return { ...ticket, thread: context.thread, assignment, budget, budgetUsage: usage,
+      budgetWarning: budgetWarning(budget, now), prUrls,
+      mergeCandidate: assignment === null ? null : this.mergeCandidateForAssignment(assignment.id),
+      latestFailure: failures[0] ?? null, failures };
   }
 
   /** The ticket with the thread, decision reason and trigger URLs that opened it. */
@@ -773,7 +844,7 @@ export class Store {
   }
 
   /** `pending → ended`: the Worker never started, for the reason given. */
-  abandonAssignment(assignmentId: number, reason: string): void {
+  abandonAssignment(assignmentId: number, reason: string, failed = true): void {
     if (reason === "") throw new Error("reason must not be empty");
     this.#transaction(() => {
       const { changes } = this.#run(
@@ -781,6 +852,7 @@ export class Store {
         this.#stamp(), reason, assignmentId,
       );
       if (Number(changes) !== 1) this.#illegalAssignment(assignmentId, "ended");
+      if (failed) this.#run("INSERT INTO worker_failure (assignment_id, kind, error, occurred_at) VALUES (?, 'dispatch', ?, ?)", assignmentId, reason, this.#stamp());
       this.#finishAssignmentTurns(assignmentId);
     });
   }
@@ -825,11 +897,14 @@ export class Store {
 
   /** Records whether this failure repeats the immediately preceding failure. */
   recordTurnError(assignmentId: number, error: string): void {
-    this.#run(
-      `UPDATE assignment SET consecutive_errors = CASE WHEN last_error = ? THEN consecutive_errors + 1 ELSE 1 END,
-       last_error = ? WHERE id = ?`,
-      error, error, assignmentId,
-    );
+    this.#transaction(() => {
+      this.#run(
+        `UPDATE assignment SET consecutive_errors = CASE WHEN last_error = ? THEN consecutive_errors + 1 ELSE 1 END,
+         last_error = ? WHERE id = ?`,
+        error, error, assignmentId,
+      );
+      this.#run("INSERT INTO worker_failure (assignment_id, kind, error, occurred_at) VALUES (?, 'turn', ?, ?)", assignmentId, error, this.#stamp());
+    });
   }
 
   /** Clears the repeated-error detector after a successful turn. */

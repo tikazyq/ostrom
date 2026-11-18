@@ -6,7 +6,8 @@ import { join } from "node:path";
 import { test } from "node:test";
 
 import { Store } from "../store/store.ts";
-import { defaultSocketPath, localApi } from "./server.ts";
+import { defaultSocketPath, localApi, type ApiStatus } from "./server.ts";
+import type { OperatorTicket } from "../store/store.ts";
 
 function get(socketPath: string, path: string): Promise<{ status: number; body: unknown }> {
   return call(socketPath, "GET", path);
@@ -44,6 +45,14 @@ function fixture(path: string): number {
     store.startNativeAssignment(assignment, "sess-1");
     store.beginTurn(assignment);
     store.endTurn(assignment, { inputTokens: 12, cachedInputTokens: 3, outputTokens: 4 });
+    store.recordTurnError(assignment, "resume failed");
+    store.clearTurnError(assignment);
+    const pr = store.ensureThread({ sourceId: source.id, kind: "pull_request", number: 8, url: "https://example.test/pull/8" });
+    store.subscribe(ticket, pr);
+    store.upsertMergeCandidate({ assignmentId: assignment, repository: source.name, prNumber: 8,
+      headSha: "head", baseSha: "base", policy: "unattended", activityFingerprint: null, activityAt: null,
+      readyReplyId: null, readySentAt: null, quietDeadline: null, blockingReason: "quiet period has not elapsed" });
+    store.recordIntakeReceipt({ sourceId: source.id, sourceEventId: "excluded", url: "https://example.test/issues/9", reason: "missing_mention" });
     store.enqueueReply({ id: "reply-1", threadId: thread, body: "Taking this." });
     return ticket;
   } finally {
@@ -60,6 +69,7 @@ test("the local API serves status, tickets and a ticket over a 0600 Unix socket"
   const api = localApi(store, {
     socketPath,
     temperature: async () => 42,
+    tickIntervalSeconds: 15,
     control: {
       pause: async (id) => { store.pauseTicket(id); },
       resume: async (id) => { store.resumeTicket(id); }, stop: async () => {},
@@ -84,6 +94,17 @@ test("the local API serves status, tickets and a ticket over a 0600 Unix socket"
     })), [{ sessionId: "sess-1", turns: 1, inputTokens: 12, outputTokens: 4 }]);
     assert.deepEqual(statusBody.stuckTickets, []);
     assert.equal(statusBody.tokensToday, 16);
+    const health = status.body as ApiStatus;
+    assert.deepEqual(health.watchdog, { lastAttemptAt: null, status: "unknown", lastSuccessAt: null, error: null });
+    assert.equal(health.tickIntervalSeconds, 15);
+    assert.equal(health.machine.slots.label, "CPU parallelism");
+    const intake = await get(socketPath, "/v1/intake?limit=1");
+    assert.equal(intake.status, 200);
+    assert.equal((intake.body as unknown[]).length, 1);
+    assert.equal(((await get(socketPath, "/v1/intake")).body as unknown[]).length, 2);
+    for (const limit of ["0", "-1", "1.5", "foo", "9007199254740992"]) {
+      assert.equal((await get(socketPath, `/v1/intake?limit=${limit}`)).status, 400);
+    }
 
     const tickets = await get(socketPath, "/v1/tickets");
     assert.equal(tickets.status, 200);
@@ -91,6 +112,13 @@ test("the local API serves status, tickets and a ticket over a 0600 Unix socket"
     assert.equal(list.length, 1);
     assert.equal(list[0]!.id, ticketId);
     assert.equal(list[0]!.assignment.sessionId, "sess-1");
+    const projected = (tickets.body as OperatorTicket[])[0]!;
+    assert.deepEqual(projected.prUrls, ["https://example.test/pull/8"]);
+    assert.equal(projected.mergeCandidate!.blockingReason, "quiet period has not elapsed");
+    assert.equal(projected.latestFailure!.error, "resume failed");
+    assert.equal(projected.failures.length, 1);
+    assert.equal(projected.budgetUsage.tokens, 16);
+    assert.equal(projected.budgetWarning, null);
 
     const detail = await get(socketPath, `/v1/tickets/${ticketId}`);
     assert.equal(detail.status, 200);
@@ -98,6 +126,8 @@ test("the local API serves status, tickets and a ticket over a 0600 Unix socket"
     assert.equal(shown.context.reason, "requested fix");
     assert.equal(shown.triggers[0]!.body, "please fix it");
     assert.equal(shown.outbox[0]!.id, "reply-1");
+    assert.deepEqual((detail.body as OperatorTicket).failures, projected.failures);
+    assert.deepEqual((detail.body as OperatorTicket).mergeCandidate, projected.mergeCandidate);
 
     const paused = await call(socketPath, "POST", `/v1/tickets/${ticketId}/pause`);
     assert.equal(paused.status, 200);

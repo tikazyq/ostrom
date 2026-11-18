@@ -101,7 +101,7 @@ test("a newly opened issue that asks Ostrom becomes one allowlisted trigger", as
 });
 
 test("only an allowlisted opened issue that asks Ostrom becomes a trigger", async () => {
-  const { github, poll, count, setNow } = await fixture();
+  const { store, github, poll, count, setNow } = await fixture();
   github.issue(7, false, { login: "alice", body: "please fix this", at: at(1) });
   github.issue(8, false, { login: "mallory", body: "@ostrom please fix this", at: at(2) });
   github.issue(9, false, { login: "alice", body: `@ostrom please fix this\n\n${replyMarker("ack-1")}`, at: at(3) });
@@ -112,6 +112,13 @@ test("only an allowlisted opened issue that asks Ostrom becomes a trigger", asyn
   assert.equal(result.droppedOwn, 1);
   assert.equal(result.droppedNotAllowed, 1);
   assert.equal(count("trigger"), 0);
+  const intake = store.operatorIntake();
+  assert.equal(intake.length, 2);
+  assert.deepEqual(intake.map((entry) => entry.reason).sort(), ["missing_mention", "unauthorized_author"]);
+  assert.ok(intake.every((entry) => entry.disposition === "excluded" && !("body" in entry)));
+  await poll();
+  assert.deepEqual(store.operatorIntake(), intake);
+  assert.equal(count("intake_receipt"), 2);
 });
 
 test("an open issue update after its ticket ended does not become a reopen", async () => {

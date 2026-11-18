@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
+import { request } from "node:http";
+import { defaultSocketPath, type ApiStatus } from "../api/server.ts";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { test } from "node:test";
@@ -385,6 +387,58 @@ test(
     }
   }),
 );
+
+function daemonStatus(socketPath: string): Promise<ApiStatus> {
+  return new Promise((resolve, reject) => {
+    const client = request({ socketPath, path: "/v1/status" }, (response) => {
+      let body = "";
+      response.setEncoding("utf8");
+      response.on("data", (chunk: string) => { body += chunk; });
+      response.on("end", () => resolve(JSON.parse(body) as ApiStatus));
+    });
+    client.on("error", reject);
+    client.end();
+  });
+}
+
+test("run exposes Watchdog failure, recovery and fresh health after restart", withDb(async (dbPath) => {
+  const env = { ...tickEnv(dbPath), XDG_RUNTIME_DIR: `${dbPath}-runtime` };
+  const snapshots: ApiStatus[] = [];
+  for (let restart = 0; restart < 2; restart++) {
+    const stop = new AbortController();
+    let reads = 0;
+    const github = new FakeGitHub(() => new Date());
+    const run = deps(env, github.gh, async () => {
+      // The API is already listening, but this read has not completed yet.
+      snapshots.push(await daemonStatus(defaultSocketPath(env)));
+      reads++;
+      if (restart === 0 && reads === 1) throw new Error("Semon unavailable");
+      if (restart === 0 && reads === 3) throw new Error("Semon failed again");
+      return semonAnswer(20, [])();
+    });
+    run.deps.stop = stop.signal;
+    run.deps.sleep = async () => {
+      const status = await daemonStatus(defaultSocketPath(env));
+      snapshots.push(status);
+      assert.equal(status.tickIntervalSeconds, 17);
+      assert.equal(status.machine.slots.label, "CPU parallelism");
+      if (restart === 1 || reads === 3) stop.abort();
+    };
+    await main(["run", "--interval", "17"], run.deps);
+  }
+  assert.equal(snapshots[0]!.watchdog.status, "unknown");
+  const failure = snapshots.find((status) => status.watchdog.status === "failure")!;
+  assert.equal(failure.watchdog.error, "Semon unavailable");
+  assert.notEqual(failure.watchdog.lastAttemptAt, null);
+  assert.equal(failure.watchdog.lastSuccessAt, null);
+  const success = snapshots.find((status) => status.watchdog.status === "success")!;
+  assert.notEqual(success.watchdog.lastSuccessAt, null);
+  assert.equal(success.watchdog.error, null);
+  const laterFailure = snapshots.find((status) => status.watchdog.error === "Semon failed again")!;
+  assert.equal(laterFailure.watchdog.lastSuccessAt, success.watchdog.lastSuccessAt);
+  assert.equal(snapshots.at(-2)!.watchdog.status, "unknown");
+  assert.equal(snapshots.at(-2)!.watchdog.lastSuccessAt, null);
+}));
 
 test("tick and run check every variable before any pass", async () => {
   for (const argv of [["dev", "tick"], ["run", "--interval", "60"]]) {
