@@ -69,6 +69,48 @@ The sandbox matrix in `merging.md` remains a separate, unperformed verification 
 Set `OSTROM_WORKER_RULES_FILE` to a file of the machine's house rules (for example its heat
 limits, and that tests run in CI rather than locally). Its text closes every Worker's brief.
 
+## Model discovery and selections
+
+`ostromd` discovers the models offered by both harnesses in the background at startup. Claude uses
+its Agent SDK's `supportedModels()` call; Codex uses the SDK-pinned CLI's app-server over stdio,
+including initialization and every `model/list` page. Each discovery has a 30-second timeout.
+Discovery uses the same `OSTROM_CLAUDE_AUTH` and `OSTROM_CODEX_PROVIDER` settings as sessions.
+A successful refresh stores that harness's complete catalog and timestamp in SQLite. A failure
+is logged and retains its last good catalog; a startup failure makes the daemon's eventual exit
+non-zero without stopping intake. Explicit refresh failures return non-zero immediately.
+
+```sh
+ostrom models
+ostrom models refresh
+ostrom models allow codex/gpt-6.1-sol
+ostrom models set codex/gpt-6.1-sol --efforts low,high --approval true --cost 3 --note "Use for Rust changes"
+ostrom models objective cost
+ostrom models remove codex/gpt-6.1-sol
+ostrom models export > models.json
+ostrom models import models.json
+```
+
+All commands accept a final `--json`. Listing shows discovered names, descriptions, supported and
+default efforts, allowed status and settings, plus each catalog's last successful timestamp.
+Models that are still selected but no longer offered are marked unavailable; changed effort lists
+are flagged too. Newly discovered models are never allowed automatically. `allow` defaults to all
+discovered efforts, no approval, relative cost 1 and an empty note. Repeated `allow` preserves existing
+settings. `set` requires an allowed model; efforts must be a nonempty subset of discovered efforts
+(or an empty list for a model without effort controls). Approval takes `true` or `false`, cost must
+be positive, and note is free text. `objective` takes `cost` (the default), `balanced` or `quality`.
+
+Listing and export read the cached store when the daemon is down. Changes, import and refresh
+require the daemon and go through its Unix socket. JSON export contains `{ "objective": "cost",
+"selections": [...] }`; each selection has `harness`, `modelId`, `efforts`, `approval`, `cost` and
+`note`. Import replaces all selections and the objective atomically, validating every entry against
+the destination machine's cached catalog first. Refresh the destination before importing; an unknown
+model or unsupported effort rejects the entire import.
+
+The API provides `GET /v1/models`, `GET /v1/models/export`, `POST /v1/models` for allow/remove/set/objective
+changes, `POST /v1/models/import`, and `POST /v1/models/refresh`. These settings are stored for the
+next model-selection step: Worker and Router model choices still use the existing environment
+configuration; approval flags and cost weights do not affect execution yet.
+
 ## GitHub App identity
 
 Set both `OSTROM_GITHUB_APP_ID=4544316` and `OSTROM_GITHUB_APP_KEY_FILE=/absolute/path/to/key.pem`

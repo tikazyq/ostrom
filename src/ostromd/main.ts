@@ -18,6 +18,7 @@ import { sessionConfig } from "../session/config.ts";
 import { codexSessionsDir } from "../session/rollout.ts";
 import { claudeRunner, codexRunner, type Runner } from "../session/runner.ts";
 import { Store } from "../store/store.ts";
+import { discovery, refreshModels, type Discovery } from "../models/discovery.ts";
 import { advanceStuckLadder } from "../watchdog/stuck.ts";
 import { watchdog } from "../watchdog/watchdog.ts";
 import { observe } from "../worker/dispatch.ts";
@@ -70,6 +71,7 @@ export interface MainDeps {
   stop: AbortSignal;
   /** Session runners; default to the real Claude and Codex SDKs configured from `env`. */
   runners?: Record<"claude" | "codex", Runner>;
+  discovery?: Discovery;
   /** Where Codex rollout records live; default ~/.codex/sessions. */
   codexSessions?: string;
   addWorktree?: WorkersDeps["addWorktree"];
@@ -163,8 +165,15 @@ async function run(intervalSeconds: number, deps: MainDeps): Promise<number> {
   const owned = openWorkers(deps);
   const controls = operatorControls(owned.store, owned.workers, deps.gh, config.repo);
   const watchdogHealth = { lastAttemptAt: null as string | null, lastSuccess: null as boolean | null, lastSuccessAt: null as string | null, error: null as string | null };
+  // Serialize startup and operator refreshes so an older response cannot replace a newer catalog.
+  const discover = deps.discovery ?? discovery(deps.env);
+  let refreshing: Promise<void> | undefined;
+  const refresh = () => refreshing ??= refreshModels(owned.store, discover).finally(() => { refreshing = undefined; });
+  let startupDiscovery: Promise<void> | undefined;
+  let discoveryFailed = false;
   const api = localApi(owned.store, {
     socketPath: defaultSocketPath(deps.env),
+    refreshModels: refresh,
     watchdog: () => ({ ...watchdogHealth }),
     tickIntervalSeconds: intervalSeconds,
     control: {
@@ -183,6 +192,10 @@ async function run(intervalSeconds: number, deps: MainDeps): Promise<number> {
   deps.stop.addEventListener("abort", () => owned.workers.stop(), { once: true });
   try {
     await api.start();
+    startupDiscovery = refresh().catch((error: unknown) => {
+      discoveryFailed = true;
+      deps.stderr(`ostromd models: ${error instanceof Error ? error.message : String(error)}`);
+    });
     while (!deps.stop.aborted) {
       code = await tick({ ...deps, workers: owned.workers, store: owned.store, watchdogHealth });
       if (deps.stop.aborted) break;
@@ -190,9 +203,10 @@ async function run(intervalSeconds: number, deps: MainDeps): Promise<number> {
     }
   } finally {
     await api.close();
+    await startupDiscovery;
     await owned.close();
   }
-  return code;
+  return discoveryFailed ? 1 : code;
 }
 
 function makeWorkers(deps: MainDeps, store: Store): Workers {

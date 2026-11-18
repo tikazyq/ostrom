@@ -5,6 +5,7 @@
 import { request } from "node:http";
 
 import { startDashboard } from "./dashboard.ts";
+import { parseModels, modelsApi, modelsDirect, modelsOutput, type ModelsCommand } from "./models.ts";
 
 import { defaultSocketPath } from "../api/server.ts";
 import { GitHubApp, loadAppConfig } from "../github/app.ts";
@@ -25,10 +26,16 @@ commands:
   extend <ticket> --time M [--turns N] [--tokens N]
   preview
   dashboard
+  models [list|export|refresh]
+  models allow|remove <harness/model>
+  models set <harness/model> [--efforts low,high] [--approval true|false] [--cost N] [--note TEXT]
+  models objective cost|balanced|quality
+  models import <file.json>
 
 Read-only commands fall back to OSTROM_DB when ostromd is not running.`;
 
 type Command =
+  | ModelsCommand
   | { name: "status" | "tickets" | "preview"; json: boolean }
   | { name: "show" | "pause" | "resume" | "stop"; ticketId: number; json: boolean }
   | { name: "extend"; ticketId: number; increases: { timeMinutes?: number; turns?: number; tokens?: number }; json: boolean };
@@ -46,7 +53,8 @@ export async function main(argv: readonly string[], env: Record<string, string |
       return 0;
     } catch (error) { return failure(error); }
   }
-  const command = parse(argv);
+  let command: Command | null;
+  try { command = parse(argv); } catch (error) { return failure(error); }
   if (command === null) return usage();
   try {
     loadAppConfig(env);
@@ -80,6 +88,7 @@ function failure(error: unknown): number {
 function parse(argv: readonly string[]): Command | null {
   const json = argv.at(-1) === "--json";
   const args = json ? argv.slice(0, -1) : argv;
+  if (args[0] === "models") return parseModels(args.slice(1), json);
   if (args.length === 1 && (args[0] === "status" || args[0] === "tickets" || args[0] === "preview")) return { name: args[0], json };
   if (args.length === 2 && (args[0] === "show" || args[0] === "pause" || args[0] === "resume" || args[0] === "stop") && /^[1-9]\d*$/.test(args[1]!)) {
     return { name: args[0], ticketId: Number(args[1]), json };
@@ -100,6 +109,7 @@ function parse(argv: readonly string[]): Command | null {
 
 async function api(command: Command, env: Record<string, string | undefined>): Promise<unknown> {
   const socketPath = defaultSocketPath(env);
+  if (command.name === "models") return modelsApi(command, (method, path, body) => call(socketPath, method, path, body));
   if (command.name === "status") return call(socketPath, "GET", "/v1/status");
   if (command.name === "tickets") return call(socketPath, "GET", "/v1/tickets");
   if (command.name === "show") return call(socketPath, "GET", `/v1/tickets/${command.ticketId}`);
@@ -135,6 +145,7 @@ function call(socketPath: string, method: "GET" | "POST", path: string, body?: u
 }
 
 function readOnly(command: Command): boolean {
+  if (command.name === "models") return command.action === "list" || command.action === "export";
   return command.name === "status" || command.name === "tickets" || command.name === "show" || command.name === "preview";
 }
 
@@ -145,6 +156,7 @@ function unavailable(error: unknown): boolean {
 async function direct(command: Command, path: string, env: Record<string, string | undefined>): Promise<unknown> {
   const store = Store.open(path);
   try {
+    if (command.name === "models") return modelsDirect(store, command);
     if (command.name === "status") return store.operatorStatus();
     if (command.name === "tickets") return store.operatorTickets();
     if (command.name === "show") return store.operatorTicket(command.ticketId);
@@ -162,6 +174,7 @@ async function direct(command: Command, path: string, env: Record<string, string
 }
 
 function output(command: Command, value: unknown): void {
+  if (command.name === "models") return modelsOutput(command, value);
   if (command.json) {
     process.stdout.write(`${JSON.stringify(value)}\n`);
     return;

@@ -27,6 +27,7 @@ export interface LocalApiOptions {
   temperature?: () => Promise<number | null>;
   watchdog?: () => { lastAttemptAt: string | null; lastSuccess: boolean | null; lastSuccessAt: string | null; error: string | null };
   tickIntervalSeconds?: number;
+  refreshModels?: () => Promise<void>;
 }
 
 export function defaultSocketPath(env: Record<string, string | undefined> = process.env): string {
@@ -47,6 +48,17 @@ export function localApi(store: Store, options: LocalApiOptions): LocalApi {
           slots: { total: availableParallelism(), used: store.runningAssignments().length, meaning: "CPU parallelism" },
           temperature: await (options.temperature ?? latestTemperature)(),
         } });
+      }
+      if (request.method === "GET" && url.pathname === "/v1/models") return reply(response, 200, store.models());
+      if (request.method === "GET" && url.pathname === "/v1/models/export") return reply(response, 200, store.exportModels());
+      if (request.method === "POST" && url.pathname.startsWith("/v1/models")) {
+        if (url.pathname === "/v1/models/refresh") {
+          if (options.refreshModels === undefined) throw new Error("model discovery is unavailable");
+          await options.refreshModels();
+        } else if (url.pathname === "/v1/models/import") store.importModels(await bodyJson(request));
+        else if (url.pathname === "/v1/models") store.changeModels(await bodyJson(request));
+        else return reply(response, 404, { error: "not found" });
+        return reply(response, 200, store.models());
       }
       if (request.method === "GET" && url.pathname === "/v1/tickets") return reply(response, 200, store.operatorTickets());
       if (request.method === "GET" && url.pathname === "/v1/intake") {
@@ -77,9 +89,7 @@ export function localApi(store: Store, options: LocalApiOptions): LocalApi {
 }
 
 async function json(request: import("node:http").IncomingMessage): Promise<{ timeMinutes?: number; turns?: number; tokens?: number }> {
-  let body = "";
-  for await (const chunk of request) body += chunk;
-  const parsed: unknown = JSON.parse(body);
+  const parsed = await bodyJson(request);
   if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) throw new Error("expected a JSON object");
   const value = parsed as Record<string, unknown>;
   for (const key of ["timeMinutes", "turns", "tokens"]) {
@@ -88,6 +98,12 @@ async function json(request: import("node:http").IncomingMessage): Promise<{ tim
     }
   }
   return value as { timeMinutes?: number; turns?: number; tokens?: number };
+}
+
+async function bodyJson(request: import("node:http").IncomingMessage): Promise<unknown> {
+  let body = "";
+  for await (const chunk of request) body += chunk;
+  return JSON.parse(body);
 }
 
 // The operator's `thermal now` prints e.g. "30C sensor=/sys/...". It exits non-zero when the host

@@ -586,6 +586,29 @@ export const migrations: readonly string[] = [
   CREATE INDEX turn_by_ticket ON turn(ticket_id, id);
   CREATE UNIQUE INDEX turn_running ON turn(assignment_id) WHERE status = 'running';
   `,
+
+  // 31: Last good harness catalogs and operator choices. Selections survive catalog changes.
+  `
+  CREATE TABLE model_catalog (
+    harness TEXT PRIMARY KEY CHECK (harness IN ('claude', 'codex')),
+    refreshed_at TEXT NOT NULL,
+    models TEXT NOT NULL
+  ) STRICT;
+  CREATE TABLE model_selection (
+    harness TEXT NOT NULL CHECK (harness IN ('claude', 'codex')),
+    model_id TEXT NOT NULL,
+    efforts TEXT NOT NULL,
+    approval INTEGER NOT NULL CHECK (approval IN (0, 1)),
+    cost REAL NOT NULL CHECK (cost > 0),
+    note TEXT NOT NULL,
+    PRIMARY KEY (harness, model_id)
+  ) STRICT, WITHOUT ROWID;
+  CREATE TABLE model_objective (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    objective TEXT NOT NULL CHECK (objective IN ('cost', 'balanced', 'quality'))
+  ) STRICT;
+  INSERT INTO model_objective VALUES (1, 'cost');
+  `,
 ];
 
 /** Applies every migration newer than the database's version. Returns the resulting version. */

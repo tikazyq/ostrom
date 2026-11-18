@@ -5,6 +5,7 @@ import { DatabaseSync, type SQLInputValue } from "node:sqlite";
 import { budgetReached, budgetUsage, budgetWarning } from "../budget/budgets.ts";
 import type { BudgetDefaults } from "../budget/budgets.ts";
 import { migrate } from "./migrations.ts";
+import { harness, objective, object, strings, text, type Harness, type Model, type ModelsView, type ModelSettings, type Selection } from "../models/types.ts";
 
 export type SourceKind = "github";
 export type ThreadKind = "issue" | "pull_request";
@@ -383,6 +384,87 @@ export class Store {
 
   close(): void {
     this.#db.close();
+  }
+
+  models(): ModelsView {
+    return {
+      objective: objective(this.#get("SELECT objective FROM model_objective WHERE id = 1")!["objective"]),
+      catalogs: this.#all("SELECT * FROM model_catalog ORDER BY harness").map((row) => ({
+        harness: harness(row["harness"]), refreshedAt: row["refreshed_at"] as string,
+        models: JSON.parse(row["models"] as string) as Model[],
+      })),
+      selections: this.#all("SELECT * FROM model_selection ORDER BY harness, model_id").map((row) => ({
+        harness: harness(row["harness"]), modelId: row["model_id"] as string,
+        efforts: JSON.parse(row["efforts"] as string) as string[], approval: row["approval"] === 1,
+        cost: row["cost"] as number, note: row["note"] as string,
+      })),
+    };
+  }
+
+  cacheModels(harness: Harness, models: Model[]): void {
+    this.#run("INSERT INTO model_catalog VALUES (?, ?, ?) ON CONFLICT(harness) DO UPDATE SET refreshed_at = excluded.refreshed_at, models = excluded.models",
+      harness, this.#now().toISOString(), JSON.stringify(models));
+  }
+
+  exportModels(): ModelSettings {
+    const { objective, selections } = this.models();
+    return { objective, selections };
+  }
+
+  /** Validates the entire import before replacing any settings. */
+  importModels(input: unknown): void {
+    const value = object(input);
+    const goal = objective(value["objective"]);
+    if (!Array.isArray(value["selections"])) throw new Error("selections must be an array");
+    const selections = value["selections"].map((entry: unknown) => this.#validateSelection(entry));
+    if (new Set(selections.map((entry) => `${entry.harness}/${entry.modelId}`)).size !== selections.length) throw new Error("duplicate model selection");
+    this.#transaction(() => {
+      this.#run("DELETE FROM model_selection");
+      for (const selection of selections) this.#saveSelection(selection);
+      this.#run("UPDATE model_objective SET objective = ? WHERE id = 1", goal);
+    });
+  }
+
+  changeModels(input: unknown): void {
+    const value = object(input);
+    if (value["action"] === "objective") {
+      this.#run("UPDATE model_objective SET objective = ? WHERE id = 1", objective(value["objective"]));
+      return;
+    }
+    const kind = harness(value["harness"]);
+    const modelId = text(value["modelId"]);
+    if (value["action"] === "remove") {
+      this.#run("DELETE FROM model_selection WHERE harness = ? AND model_id = ?", kind, modelId);
+      return;
+    }
+    const view = this.models();
+    const model = view.catalogs.find((entry) => entry.harness === kind)?.models.find((entry) => entry.id === modelId);
+    if (model === undefined) throw new Error(`model not discovered: ${kind}/${modelId}`);
+    const prior = view.selections.find((entry) => entry.harness === kind && entry.modelId === modelId);
+    if (value["action"] !== "allow" && value["action"] !== "set") throw new Error("unknown models action");
+    if (value["action"] === "set" && prior === undefined) throw new Error("allow the model before setting its options");
+    const patch = value["action"] === "set" ? object(value["settings"]) : {};
+    for (const key of Object.keys(patch)) if (!["efforts", "approval", "cost", "note"].includes(key)) throw new Error(`unknown model setting: ${key}`);
+    this.#saveSelection(this.#validateSelection({ harness: kind, modelId, efforts: model.efforts,
+      approval: false, cost: 1, note: "", ...prior, ...patch }));
+  }
+
+  #validateSelection(input: unknown): Selection {
+    const value = object(input);
+    const kind = harness(value["harness"]);
+    const modelId = text(value["modelId"]);
+    const model = this.models().catalogs.find((entry) => entry.harness === kind)?.models.find((entry) => entry.id === modelId);
+    if (model === undefined) throw new Error(`model not discovered: ${kind}/${modelId}`);
+    const efforts = strings(value["efforts"]);
+    if ((model.efforts.length > 0 && efforts.length === 0) || efforts.some((effort) => !model.efforts.includes(effort))) throw new Error("efforts must be an allowed subset of discovered efforts");
+    if (typeof value["approval"] !== "boolean") throw new Error("approval must be a boolean");
+    if (typeof value["cost"] !== "number" || !Number.isFinite(value["cost"]) || value["cost"] <= 0) throw new Error("cost must be a positive finite number");
+    return { harness: kind, modelId, efforts, approval: value["approval"], cost: value["cost"], note: text(value["note"]) };
+  }
+
+  #saveSelection(value: Selection): void {
+    this.#run("INSERT INTO model_selection VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(harness, model_id) DO UPDATE SET efforts = excluded.efforts, approval = excluded.approval, cost = excluded.cost, note = excluded.note",
+      value.harness, value.modelId, JSON.stringify(value.efforts), Number(value.approval), value.cost, value.note);
   }
 
   // --- sources and threads -------------------------------------------------------------------

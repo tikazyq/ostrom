@@ -30,6 +30,7 @@ function deps(
     sleep: async () => {},
     stop: new AbortController().signal,
     runners: { claude: runner, codex: runner },
+    discovery: { claude: async () => [], codex: async () => [] },
     addWorktree: async (_repo, _path, _base, ticket, assignment) => `ostrom/ticket-${ticket}-${assignment}`,
   };
   return { out, err, deps: d, runner };
@@ -414,6 +415,35 @@ test("tick and run check every variable before any pass", async () => {
     assert.match(run.err[0]!, /OSTROM_ROUTER_HARNESS/);
   }
 });
+
+test("startup discovery runs in the background, caches successes and reports failure without losing the catalog", withDb(async (dbPath) => {
+  const store = Store.open(dbPath);
+  const model = { id: "old", displayName: "Old", description: "Cached", efforts: ["low"], defaultEffort: "low" };
+  store.cacheModels("codex", [model]);
+  const previous = store.models().catalogs[0];
+  store.close();
+  const github = new FakeGitHub(() => new Date());
+  const stop = new AbortController();
+  const run = deps(tickEnv(dbPath), github.gh, semonAnswer(20, []));
+  let release: (() => void) | undefined;
+  run.deps.discovery = {
+    claude: () => new Promise((resolve) => { release = () => resolve([{ ...model, id: "new" }]); }),
+    codex: async () => { throw new Error("offline"); },
+  };
+  run.deps.stop = stop.signal;
+  run.deps.sleep = async () => {
+    assert.ok(release, "discovery started before the first tick finished");
+    release(); // Reaching sleep while discovery is pending proves it did not block the tick.
+    stop.abort();
+  };
+  assert.equal(await main(["run", "--interval", "30"], run.deps), 1);
+  assert.ok(run.err.some((line) => /ostromd models:.*codex: offline/.test(line)));
+  const after = Store.open(dbPath);
+  try {
+    assert.deepEqual(after.models().catalogs.find((entry) => entry.harness === "codex"), previous);
+    assert.equal(after.models().catalogs.find((entry) => entry.harness === "claude")!.models[0]!.id, "new");
+  } finally { after.close(); }
+}));
 
 test("run needs --interval with whole seconds", async () => {
   for (const argv of [["run"], ["run", "60"], ["run", "--interval"], ["run", "--interval", "0"], ["run", "--interval", "1.5"], ["tick", "x"], ["watchdog", "1"]]) {
