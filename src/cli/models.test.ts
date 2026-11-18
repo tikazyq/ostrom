@@ -23,7 +23,13 @@ test("models CLI reads offline, mutates through the socket, and exports/imports 
   });
   const original = process.stdout.write;
   let output = "";
-  process.stdout.write = ((chunk: string) => { output += chunk; return true; }) as typeof process.stdout.write;
+  // Node's test runner also writes binary protocol frames to stdout. Preserve those writes
+  // while capturing the strings emitted by the CLI.
+  process.stdout.write = ((...args: Parameters<typeof process.stdout.write>) => {
+    if (typeof args[0] !== "string") return Reflect.apply(original, process.stdout, args);
+    output += args[0];
+    return true;
+  }) as typeof process.stdout.write;
   try {
     assert.equal(await main(["models", "--json"], env), 0);
     assert.equal(JSON.parse(output).catalogs[0].models[0].id, "model");
