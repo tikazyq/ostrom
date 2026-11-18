@@ -13,9 +13,8 @@ test("scripted stall only seeds an accepted ticket for daemon dispatch", () => {
     assert.equal(store.latestAssignment(ticketId), null);
     assert.equal(store.ticketContext(ticketId).reason, STALL_BRIEF);
     assert.match(STALL_BRIEF, /sleep 3600/);
-    assert.match(STALL_BRIEF, /red or blue/);
     assert.match(STALL_BRIEF, /never commit, push or open a pull request/);
-    assert.match(STALL_BRIEF, /run `sleep 3600` again/);
+    assert.match(STALL_BRIEF, /asks you to save work, finish the turn immediately/);
   } finally {
     store.close();
   }

@@ -1,8 +1,8 @@
-# The Watchdog and scripted stall
+# The Watchdog
 
-Milestone 1 step 6 (`docs/direction.md`). `ostromd watchdog` checks every running native Worker once; `ostromd tick` runs it after follow-up routing and before the Router pass.
+`ostromd tick` runs the Watchdog after follow-up routing and before the Router pass. It checks running Workers on open tickets.
 
-## Signal
+## Stall signals
 
 The Watchdog makes one deterministic Semon read:
 
@@ -10,40 +10,30 @@ The Watchdog makes one deterministic Semon read:
 semon query stalls --idle-minutes <OSTROM_STALL_MINUTES> --since 1d --json
 ```
 
-Semon reports native sessions waiting on a question, whose process has gone, or which produce no output. A Worker is matched by its worktree branch, `ostrom/ticket-<ticket>-<assignment>`. A failed Semon read makes the pass fail and does not clear an existing episode.
+Semon reports sessions waiting on a question, whose process has gone, or which produce no output. The Watchdog matches the session to its Worker by worktree branch. A verdict during a turn counts after the turn itself has run for `OSTROM_STALL_MINUTES`, because Semon's clock can predate that turn. Between turns, only an unanswered question counts. A Worker waiting for review is expected to produce no output. Two consecutive occurrences of the same turn error can also open a stall.
 
-Workers are driven turn by turn, so Semon's verdicts are read against the turn. Between turns no process runs and a Worker that waits for review produces no output, so only an unanswered question counts. During a turn, a verdict counts only once the turn itself has run for `OSTROM_STALL_MINUTES`, because Semon's idle clock starts at the session's last write, which may predate the turn.
+A stall records one episode. A successful Semon read can clear a silent episode when the signal disappears. The recovery ladder can try up to two recoveries on the same Worker session before pausing the ticket and queuing one public stuck reply. The Router can also judge an open episode with `wait` or `stop`.
 
-## Episodes and the Router
+`ostrom resume` and replies from authors on `OSTROM_ALLOWLIST` can clear a public stall. An issue comment or submitted PR review reopens the ticket only when the stall caused the pause. Other pauses are preserved. Clearing a stall on an ended ticket starts no Worker turn.
 
-A stall opens one `stall` row and remains one episode until Semon no longer reports it. The Router sees each unanswered, uncleared episode once and answers `wait` or `stop`; a stop needs a reply and ends the assignment only after that Router answer.
+## Budget pauses
 
-## Scripted stall
+The Watchdog checks wall-clock and idle limits even when the Semon read fails. Wall-clock time runs from ticket opening, including time waiting for review or paused. Idle time counts only during a running turn. The Worker checks turn and token limits after each turn.
 
-Semon reports a completed Codex exec turn as `ended`, not `waiting-question`, even when its last
-Worker message says it is waiting for an answer. Nor does a hung command look idle to Semon: Codex
-polls a long-running command about once a minute, so the session keeps writing and Semon reports it
-working. The exercise therefore hangs an *open* turn (`sleep 3600`) under a short idle budget. Idle
-time is how long the running turn has gone without finishing; between turns a Worker waits on people
-and is not idle. The budget flags the hung turn as `budget reached: idle`. Each ladder step cancels
-the turn and starts a recovery turn, so each of the two recoveries and the public reply comes one
-idle budget after the last, as long as the Worker keeps hanging.
+A reached limit pauses the ticket as `budget reached: <limit>`. The Watchdog cancels any in-flight turn and queues a cleanup turn on the same session to save work. The status card shows the reason. Budget exhaustion never starts recovery or a public stuck reply. On upgrade, old budget stalls are cleared and pauses they caused keep their budget reason.
 
-Use a throwaway database. Start `ostromd run` against that store first; the script only seeds an
-accepted decision, whose ticket takes its budget from the environment as a Router-accepted one does.
-The daemon dispatches the ticket in its normal `route-candidates` pass and owns the turn it later
-cancels. Its public stuck reply is queued in the outbox and posts to the supplied issue when the
-daemon reaches its `send` pass.
+`ostrom extend` raises the given limits. It reopens a budget pause only when the extension clears every remaining reached limit. After an idle pause, the idle clock clears when cleanup finishes. Use `ostrom resume` to continue after cleanup.
+
+## Exercise the idle budget
+
+Codex polls a long-running command about once a minute, so Semon can see it as active. Use the existing `scripted-stall.ts` seed to verify that an idle budget still pauses a hung turn. Use a throwaway database and a sandbox issue. Start the daemon first so it dispatches and owns the turn.
 
 ```sh
-export OSTROM_REPO=onsager-ai/ostrom OSTROM_ALLOWLIST=<login> OSTROM_DB=/tmp/ostrom-stall/ostrom.sqlite
-export OSTROM_WORKER_REPO=<main-checkout> OSTROM_WORKER_BASE=main OSTROM_STALL_MINUTES=2
+export OSTROM_REPO=<sandbox-repo> OSTROM_ALLOWLIST=<login> OSTROM_DB=/tmp/ostrom-stall/ostrom.sqlite
+export OSTROM_WORKER_REPO=<sandbox-checkout> OSTROM_WORKER_BASE=main OSTROM_STALL_MINUTES=2
 node src/ostromd/main.ts run --interval 15
 # in another terminal, with the same environment:
 OSTROM_BUDGET_IDLE_MIN=3 node src/watchdog/scripted-stall.ts <issue-number>
 ```
 
-The seeded Worker brief runs `sleep 3600` again after every interruption and never commits or opens a
-pull request, so the ladder's recovery prompts cannot end the stall; it then asks which colour to
-use, red or blue. Stop the
-daemon and remove its scratch worktree and branch after the exercise.
+The Worker runs `sleep 3600` and makes no edits. Verify that the card shows `Paused: budget reached: idle`, that the cleanup turn finishes, and that no public stuck reply is queued. Stop the daemon and remove its scratch worktree and branch after the exercise.

@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, test } from "node:test";
 import { migrate, migrations } from "./migrations.ts";
-import { IllegalTransition, Store } from "./store.ts";
+import { IllegalTransition, STALL_PAUSE_CAUSE, Store } from "./store.ts";
 
 const stores: Store[] = [];
 const databases: DatabaseSync[] = [];
@@ -19,9 +19,9 @@ function database(options: ConstructorParameters<typeof DatabaseSync>[1] = {}): 
 }
 
 /** A store on an in-memory database with a clock the test moves by hand. */
-function fixture() {
+function fixture(db = new DatabaseSync(":memory:")) {
   let now = new Date("2026-11-09T12:00:00.000Z");
-  const store = Store.open(":memory:", { now: () => now });
+  const store = new Store(db, { now: () => now });
   stores.push(store);
   const source = store.ensureSource("github", "onsager-ai/ostrom");
   const issue = store.ensureThread({
@@ -94,6 +94,63 @@ test("queued-turn migration preserves every prior state and supports honest canc
   assert.throws(() => db.exec("UPDATE queued_turn SET state = 'finished' WHERE state = 'cancelled'"), /CHECK constraint/);
   assert.throws(() => db.exec("UPDATE queued_turn SET started_at = 'invented' WHERE state = 'cancelled'"), /CHECK constraint/);
   assert.equal(db.prepare("PRAGMA foreign_key_check").get(), undefined);
+});
+
+test("upgrade clears legacy budget stalls and preserves genuine stalls and operator pauses", () => {
+  const db = new DatabaseSync(":memory:");
+  const { store, accept, advance } = fixture(db);
+  const legacy = (cause: string, pause: string | null) => {
+    const ticket = accept();
+    const assignment = store.createAssignment(ticket);
+    store.configureNativeAssignment(assignment, { harness: "codex", model: "m", worktree: "/w", branch: `b${ticket}`, machine: "h" });
+    store.startNativeAssignment(assignment, `s${ticket}`);
+    const stall = store.recordStall({ assignmentId: assignment, semonReason: null, detail: null, cause }).id;
+    store.publishStall(stall);
+    store.enqueueTurn({ assignmentId: assignment, deliveryKey: `stuck-public-${stall}`, kind: "stuck", prompt: "prepare a reply" });
+    if (pause !== null) store.pauseTicket(ticket, pause);
+    return { ticket, assignment, stall };
+  };
+  const budget = legacy("budget reached: time", STALL_PAUSE_CAUSE);
+  const resumed = legacy("budget reached: time", null);
+  const operator = legacy("budget reached: idle", "paused by the operator");
+  const actualStall = legacy("same turn error twice", STALL_PAUSE_CAUSE);
+  db.prepare("DELETE FROM schema_version WHERE version = ?").run(migrations.length);
+  migrate(db);
+
+  assert.equal(store.getTicket(budget.ticket).pauseCause, "budget reached: time");
+  assert.equal(store.getTicket(resumed.ticket).state, "open");
+  assert.equal(store.getTicket(operator.ticket).pauseCause, "paused by the operator");
+  assert.equal(store.getTicket(actualStall.ticket).pauseCause, STALL_PAUSE_CAUSE);
+  assert.deepEqual(store.stuckTickets().map(({ stall }) => stall.id), [actualStall.stall]);
+  assert.equal(store.queuedTurn(budget.assignment, `stuck-public-${budget.stall}`)?.state, "cancelled");
+  assert.equal(store.queuedTurn(actualStall.assignment, `stuck-public-${actualStall.stall}`)?.state, "queued");
+  advance(480 * 60_000);
+  assert.equal(store.extendTicketBudget(budget.ticket, { timeMinutes: 60 }), true);
+});
+
+test("budget extension reopens only when it clears every reached limit", () => {
+  const { store, accept, advance } = fixture();
+  const id = accept();
+  store.setTicketBudget(id, { timeMinutes: 10, idleMinutes: 30, turns: 1, tokens: 10, escalations: 0 });
+  const assignment = store.createAssignment(id);
+  store.configureNativeAssignment(assignment, { harness: "codex", model: "m", worktree: "/w", branch: "b", machine: "h" });
+  store.startNativeAssignment(assignment, "s");
+  store.beginTurn(assignment);
+  store.endTurn(assignment, { inputTokens: 8, outputTokens: 2, cachedInputTokens: 0 });
+  advance(15 * 60_000);
+  store.pauseTicketForBudget(id, "time");
+  assert.equal(store.extendTicketBudget(id, { timeMinutes: 5 }), false, "at the new limit is still exhausted");
+  assert.equal(store.extendTicketBudget(id, { turns: 1 }), false, "a different limit does not clear time");
+  assert.equal(store.extendTicketBudget(id, { timeMinutes: 1 }), false, "tokens are still exhausted");
+  assert.equal(store.getTicket(id).pauseCause, "budget reached: time");
+  assert.equal(store.extendTicketBudget(id, { tokens: 1 }), true);
+  assert.equal(store.getTicket(id).state, "open");
+  assert.equal(store.getTicket(id).pauseCause, null);
+
+  store.pauseTicket(id, "paused by the operator");
+  advance(10 * 60_000);
+  assert.equal(store.extendTicketBudget(id, { timeMinutes: 30 }), false);
+  assert.equal(store.getTicket(id).pauseCause, "paused by the operator");
 });
 
 test("assignment terminal paths cancel queued prompts and finish started ones", () => {

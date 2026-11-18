@@ -18,17 +18,30 @@ export interface RoutePass {
   failed: { triggerId: number; ticketId: number; error: string }[];
 }
 
-export function routeFollowUps(store: Store, workers: Workers): RoutePass {
+export function clearStallForReply(store: Store, workers: Workers, ticketId: number): void {
+  const cleared = store.clearStallsByHuman(ticketId, true);
+  if (cleared === null) return;
+  if (cleared.resumed) {
+    const assignment = store.latestAssignment(ticketId);
+    if (assignment?.state === "running") workers.wake(assignment.id);
+  }
+  if (store.getTicket(ticketId).state !== "ended") queueStatusCard(store, ticketId);
+}
+
+export function routeFollowUps(store: Store, workers: Workers, allowlist: readonly string[]): RoutePass {
   const pass: RoutePass = { queued: [], failed: [] };
+  const trusted = new Set(allowlist.map((login) => login.toLowerCase()));
   const pending = store.pendingDeliveries();
   const grouped = new Set<string>();
   for (const delivery of pending) {
     const { trigger, ticketId, assignmentId } = delivery;
-    const cleared = assignmentId === null ? null : store.clearStallForHumanReply(assignmentId);
-    // Only the public stuck step pauses the ticket; a silent recovery leaves it open.
-    if (cleared !== null && store.getStall(cleared).publicAt !== null) {
-      store.resumeTicket(ticketId);
-      queueStatusCard(store, ticketId);
+    const trustedReply = trusted.has(trigger.actor.toLowerCase());
+    if (trustedReply && (trigger.kind === "issue_comment" || trigger.kind === "pull_request_review")) {
+      clearStallForReply(store, workers, ticketId);
+    }
+    if (store.getTicket(ticketId).state === "ended") {
+      if (trustedReply) store.recordCommandReceipt(trigger.id, ticketId, "redirect", false);
+      continue;
     }
     if (assignmentId === null) {
       pass.failed.push({ triggerId: trigger.id, ticketId, error: `ticket ${ticketId} has no running Worker` });

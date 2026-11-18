@@ -2,7 +2,7 @@
 // session recovery attempts, then ask the Worker for one validated public reply.
 
 import { queueStatusCard } from "../github/cards.ts";
-import type { Store, Stall } from "../store/store.ts";
+import { STALL_PAUSE_CAUSE, type Store, type Stall } from "../store/store.ts";
 import type { Workers } from "../worker/workers.ts";
 
 export interface StuckReply {
@@ -58,6 +58,8 @@ export function parseStuckReply(text: string, cause: string): StuckReply {
 export async function advanceStuckLadder(store: Store, workers: Workers): Promise<{ recovered: number[]; published: number[] }> {
   const result = { recovered: [] as number[], published: [] as number[] };
   for (const stall of store.unansweredStalls()) {
+    const ticket = store.getTicket(store.getAssignment(stall.assignmentId).ticketId);
+    if (ticket.state !== "open" || ticket.stopRequestedAt !== null) continue;
     if (stall.recoveryAttempts < 2 && stall.publicAt === null) {
       const started = store.beginStallRecovery(stall.id);
       if (started === null) continue;
@@ -85,7 +87,7 @@ async function publish(store: Store, workers: Workers, stall: Stall): Promise<vo
   const assignment = store.getAssignment(stall.assignmentId);
   const context = store.ticketContext(assignment.ticketId);
   store.publishStall(stall.id);
-  if (store.getTicket(assignment.ticketId).state === "open") store.pauseTicket(assignment.ticketId, "stuck turn reported by the Watchdog");
+  store.pauseTicket(assignment.ticketId, STALL_PAUSE_CAUSE);
   workers.cancel(assignment.id);
   workers.deliver(
     assignment.id,
@@ -98,6 +100,7 @@ async function publish(store: Store, workers: Workers, stall: Stall): Promise<vo
     ].join(" "),
     () => {},
     async (turn) => {
+      if (store.getStall(stall.id).clearedAt !== null) return;
       const reply = renderStuckReply(parseStuckReply(turn.text, stall.cause ?? stall.semonReason ?? "unknown"));
       store.enqueueReply({ id: `stuck-${stall.id}`, threadId: context.thread.id, body: reply, blocking: true });
       queueStatusCard(store, assignment.ticketId);

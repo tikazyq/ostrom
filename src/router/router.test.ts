@@ -446,12 +446,12 @@ test("a follow-up on the accepted issue goes to its Worker, not to the Router", 
 
   // The follow-up pass queues it as a turn on the Worker's session.
   const workers = s.workers();
-  const routed = routeFollowUps(s.store(), workers);
+  const routed = routeFollowUps(s.store(), workers, ["alice"]);
   assert.deepEqual(routed.failed, []);
   assert.deepEqual(routed.queued.map((d) => [d.ticketId, d.assignmentId]), [[ticketId, assignmentId]]);
   await workers.drain();
   assert.equal(s.runner.sessions.at(-1)?.prompts.length, 1);
-  assert.deepEqual(routeFollowUps(s.store(), workers), { queued: [], failed: [] });
+  assert.deepEqual(routeFollowUps(s.store(), workers, ["alice"]), { queued: [], failed: [] });
 });
 
 test("a trigger's body is fetched by the id in its URL", () => {

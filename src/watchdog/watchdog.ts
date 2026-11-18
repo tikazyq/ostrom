@@ -12,6 +12,7 @@
 import { watchdogBudgetReached } from "../budget/budgets.ts";
 import type { ProcessRunner } from "../process.ts";
 import type { Store } from "../store/store.ts";
+import type { Workers } from "../worker/workers.ts";
 
 /** The window of session logs Semon reads. */
 export const SEMON_WINDOW = "1d";
@@ -79,6 +80,7 @@ export function parseSemonStalls(stdout: string, idleMinutes: number): SemonStal
 
 export interface WatchdogOptions {
   store: Store;
+  workers: Pick<Workers, "pauseForBudget">;
   semon: ProcessRunner;
   idleMinutes: number;
   /** Clock used for budget evaluation; injectable for deterministic checks. */
@@ -124,13 +126,20 @@ export async function watchdog(options: WatchdogOptions): Promise<WatchdogPass> 
       newEpisode: false,
       clearedStallId: null,
     };
+    const ticket = store.getTicket(assignment.ticketId);
+    if (ticket.state !== "open" || ticket.stopRequestedAt !== null) {
+      pass.checked.push(checked);
+      continue;
+    }
     const budget = watchdogBudgetReached(store.ticketBudget(assignment.ticketId), now());
     const repeatedError = assignment.consecutiveErrors >= 2;
-    if (semonReason !== null || budget !== null || repeatedError) {
+    if (budget !== null) {
+      options.workers.pauseForBudget(assignment, budget);
+    } else if (semonReason !== null || repeatedError) {
       const question = matched?.openQuestion ?? null;
       const detail =
         question === null ? assignment.lastError : question.length > DETAIL_CHARS ? `${question.slice(0, DETAIL_CHARS)}…` : question;
-      const cause = budget === null ? repeatedError ? "same turn error twice" : semonReason! : `budget reached: ${budget}`;
+      const cause = repeatedError ? "same turn error twice" : semonReason!;
       const recorded = store.recordStall({ assignmentId: assignment.id, semonReason, detail, cause });
       checked.stallId = recorded.id;
       checked.newEpisode = !recorded.duplicate;

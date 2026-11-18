@@ -2,14 +2,17 @@
 // See docs/direction.md, "Data model". Only the operations milestone 1 needs live here.
 
 import { DatabaseSync, type SQLInputValue } from "node:sqlite";
-import { budgetUsage, budgetWarning } from "../budget/budgets.ts";
-import type { BudgetDefaults } from "../budget/budgets.ts";
+import { budgetReached, budgetUsage, budgetWarning, type BudgetDefaults, type BudgetLimit } from "../budget/budgets.ts";
 import { migrate } from "./migrations.ts";
 
 export type SourceKind = "github";
 export type ThreadKind = "issue" | "pull_request";
 export type Verdict = "accept" | "ignore" | "stop";
 export type TicketState = "open" | "paused" | "ended";
+export const STALL_PAUSE_CAUSE = "stuck turn reported by the Watchdog";
+const HAS_PUBLIC_STALL = `EXISTS (
+  SELECT 1 FROM stall JOIN assignment AS stalled ON stalled.id = stall.assignment_id
+  WHERE stalled.ticket_id = ticket.id AND stall.public_at IS NOT NULL AND stall.cleared_at IS NULL)`;
 export type AssignmentState = "pending" | "running" | "ended";
 /** What the last observation of a running Worker found worth flagging. */
 export type AssignmentOutcome = "waiting" | "failed" | "cancelled";
@@ -769,31 +772,33 @@ export class Store {
   }
 
   /** Pauses an open ticket with a durable explanation shown to the operator and status card. */
-  pauseTicketForBudget(ticketId: number, limit: string): void {
-    const cause = `budget reached: ${limit}`;
-    const { changes } = this.#run(
-      "UPDATE ticket SET state = 'paused', pause_cause = ? WHERE id = ? AND state = 'open'",
-      cause, ticketId,
-    );
-    if (Number(changes) !== 1) throw new IllegalTransition(`ticket ${ticketId}: ${this.getTicket(ticketId).state} → paused is not allowed`);
+  pauseTicketForBudget(ticketId: number, limit: BudgetLimit): void {
+    this.pauseTicket(ticketId, `budget reached: ${limit}`);
   }
 
-  /** Raises one or more ticket limits. A paused budget ticket resumes on its existing session. */
-  extendTicketBudget(ticketId: number, increases: { timeMinutes?: number; turns?: number; tokens?: number }): void {
+  /** Raises limits and returns whether this extension reopened a ticket paused for budget. */
+  extendTicketBudget(ticketId: number, increases: { timeMinutes?: number; turns?: number; tokens?: number }): boolean {
     if (Object.keys(increases).length === 0) throw new Error("at least one budget extension is required");
     for (const [name, value] of Object.entries(increases)) {
       if (!Number.isSafeInteger(value) || value! <= 0) throw new Error(`budget ${name} extension must be a positive whole number`);
     }
-    const ticket = this.getTicket(ticketId);
-    if (ticket.state !== "open" && ticket.state !== "paused") {
-      throw new IllegalTransition(`ticket ${ticketId} is ${ticket.state}; it cannot be extended`);
-    }
-    this.#run(
-      `UPDATE ticket SET budget_time_minutes = budget_time_minutes + ?, budget_turns = budget_turns + ?,
-       budget_tokens = budget_tokens + ?, state = CASE WHEN pause_cause LIKE 'budget reached:%' THEN 'open' ELSE state END,
-       pause_cause = CASE WHEN pause_cause LIKE 'budget reached:%' THEN NULL ELSE pause_cause END WHERE id = ?`,
-      increases.timeMinutes ?? 0, increases.turns ?? 0, increases.tokens ?? 0, ticketId,
-    );
+    return this.#transaction(() => {
+      const ticket = this.getTicket(ticketId);
+      if (ticket.state !== "open" && ticket.state !== "paused") {
+        throw new IllegalTransition(`ticket ${ticketId} is ${ticket.state}; it cannot be extended`);
+      }
+      const now = this.#now();
+      const wasOverBudget = ticket.state === "paused" && ticket.pauseCause?.startsWith("budget reached: ") &&
+        budgetReached(this.ticketBudget(ticketId), now) !== null;
+      this.#run(
+        `UPDATE ticket SET budget_time_minutes = budget_time_minutes + ?, budget_turns = budget_turns + ?,
+         budget_tokens = budget_tokens + ? WHERE id = ?`,
+        increases.timeMinutes ?? 0, increases.turns ?? 0, increases.tokens ?? 0, ticketId,
+      );
+      if (!wasOverBudget || budgetReached(this.ticketBudget(ticketId), now) !== null) return false;
+      this.resumeTicket(ticketId);
+      return true;
+    });
   }
 
   /** Returns stored limits and usage accumulated from every assignment on this ticket. */
@@ -1070,15 +1075,17 @@ export class Store {
 
   // --- deliveries ----------------------------------------------------------------------------
 
-  /** Commands and redirects on open or paused tickets that no earlier pass consumed. */
+  /** Commands and redirects, including replies that could clear a public stall. */
   pendingCommands(): PendingCommand[] {
     return this.#all(
       `SELECT t.*, ticket.id AS p_ticket_id
        FROM "trigger" AS t
        JOIN subscription ON subscription.thread_id = t.thread_id
-       JOIN ticket ON ticket.id = subscription.ticket_id AND ticket.state IN ('open', 'paused')
+       JOIN ticket ON ticket.id = subscription.ticket_id
        WHERE t.kind IN ('issue_comment', 'issue_state')
-         AND (ticket.state = 'open' OR t.kind = 'issue_state' OR lower(ltrim(COALESCE(t.body, ''))) GLOB '@ostrom *')
+         AND (ticket.state = 'open'
+           OR ticket.state = 'paused' AND (t.kind = 'issue_state' OR lower(ltrim(COALESCE(t.body, ''))) GLOB '@ostrom *')
+           OR t.kind = 'issue_comment' AND ${HAS_PUBLIC_STALL})
          AND NOT EXISTS (SELECT 1 FROM decision_trigger WHERE trigger_id = t.id)
          AND NOT EXISTS (SELECT 1 FROM delivery WHERE delivery.trigger_id = t.id)
          AND NOT EXISTS (
@@ -1110,9 +1117,7 @@ export class Store {
        FROM "trigger" AS t
        JOIN subscription ON subscription.thread_id = t.thread_id
        JOIN ticket ON ticket.id = subscription.ticket_id AND (
-         ticket.state = 'open' OR ticket.state = 'paused' AND EXISTS (
-           SELECT 1 FROM stall JOIN assignment AS stalled ON stalled.id = stall.assignment_id
-           WHERE stalled.ticket_id = ticket.id AND stall.public_at IS NOT NULL AND stall.cleared_at IS NULL))
+         ticket.state = 'open' OR (t.kind IN ('issue_comment', 'pull_request_review', 'pull_request_review_comment') AND ${HAS_PUBLIC_STALL}))
        LEFT JOIN assignment AS worker ON worker.id = (
          SELECT id FROM assignment WHERE ticket_id = ticket.id AND state = 'running' ORDER BY id DESC LIMIT 1)
        WHERE NOT EXISTS (SELECT 1 FROM decision_trigger WHERE trigger_id = t.id)
@@ -1501,17 +1506,23 @@ export class Store {
     return toStall(row);
   }
 
-  /** A human reply clears the open stuck state and restarts the Worker recovery ladder. */
-  clearStallForHumanReply(assignmentId: number): number | null {
+  /** Clears this ticket's stall episodes, optionally reopening a pause caused by public Stuck. */
+  clearStallsByHuman(ticketId: number, resumeStallPause = false): { resumed: boolean } | null {
     return this.#transaction(() => {
-      const row = this.#get(
+      const stamp = this.#stamp();
+      const rows = this.#all(
         `UPDATE stall SET cleared_by_human_at = ?, cleared_at = ?
-         WHERE assignment_id = ? AND cleared_at IS NULL RETURNING id`,
-        this.#stamp(), this.#stamp(), assignmentId,
+         WHERE cleared_at IS NULL AND assignment_id IN (SELECT id FROM assignment WHERE ticket_id = ?)
+         RETURNING assignment_id, public_at`,
+        stamp, stamp, ticketId,
       );
-      if (row === undefined) return null;
-      this.#run("UPDATE assignment SET stall_recovery_attempts = 0 WHERE id = ?", assignmentId);
-      return row["id"] as number;
+      if (rows.length === 0) return null;
+      for (const row of rows) this.#run("UPDATE assignment SET stall_recovery_attempts = 0 WHERE id = ?", row["assignment_id"] as number);
+      const ticket = this.getTicket(ticketId);
+      const resumed = resumeStallPause && ticket.state === "paused" && ticket.pauseCause === STALL_PAUSE_CAUSE &&
+        rows.some((row) => row["public_at"] !== null);
+      if (resumed) this.resumeTicket(ticketId);
+      return { resumed };
     });
   }
 

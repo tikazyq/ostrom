@@ -124,9 +124,9 @@ noted.
    batching; one reply per review. Snapshot tests of everything posted, and `ostrom preview`.
 5. **Commands.** One command table in code for redirect, `@ostrom pause`/`resume`/`stop`, and
    closing the issue or PR, with permissions and reactions.
-6. **Budgets and the stuck ladder.** Time, idle time, turns and tokens, with pause at a limit and
-   `ostrom extend`. The Watchdog feeds the ladder (detect, recover, then the public stuck reply from
-   the fixed template).
+6. **Budgets and the stuck ladder.** A reached limit pauses the ticket and queues a turn to save work.
+   `ostrom extend` reopens a budget pause when the extension clears all reached limits. The Watchdog
+   sends genuine stalls through the recovery ladder and up to one public stuck reply.
 7. **The `ostrom` CLI.** `status`, `tickets`, `show`, `pause`/`resume`/`stop`, `extend` and
    `preview` over `ostromd`'s local API, all with `--json`. `ostromd` keeps only `run`; a systemd
    user unit runs it, with logs in journald.

@@ -4,7 +4,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 
-import { Store } from "../store/store.ts";
+import { defaultSocketPath, localApi } from "../api/server.ts";
+import { operatorControls } from "../commands/commands.ts";
+import { STALL_PAUSE_CAUSE, Store } from "../store/store.ts";
+import { FakeRunner } from "../worker/fake-runner.ts";
+import { Workers } from "../worker/workers.ts";
 import { main } from "./main.ts";
 
 function ticket(path: string): number {
@@ -57,6 +61,43 @@ test("show renders turn model, effort and kind in text and JSON", async () => {
     assert.deepEqual(view.turns.map((turn) => [turn.kind, turn.observedModel, turn.observedEffort]), [["dispatch", "luna", "low"]]);
   } finally {
     process.stdout.write = original;
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("CLI resume clears public stalls and only resumes a paused Worker", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "ostrom-cli-resume-"));
+  const env = { XDG_RUNTIME_DIR: directory };
+  const path = join(directory, "ostrom.db");
+  const id = ticket(path);
+  const store = Store.open(path);
+  const runner = new FakeRunner();
+  const workers = new Workers({ store, config: { repo: "/repo", base: "main", worktrees: "/wt", harness: "codex", model: "m", machine: "h" },
+    runners: { codex: runner, claude: runner } });
+  const control = operatorControls(store, workers, async () => "[]", "onsager-ai/ostrom");
+  const api = localApi(store, { socketPath: defaultSocketPath(env), control: { ...control, preview: async () => "" } });
+  try {
+    const assignment = store.createAssignment(id);
+    store.configureNativeAssignment(assignment, { harness: "codex", model: "m", worktree: "/w", branch: "b", machine: "h" });
+    store.startNativeAssignment(assignment, "s");
+    await api.start();
+    for (const state of ["paused", "open", "ended"] as const) {
+      const stall = store.recordStall({ assignmentId: assignment, semonReason: "waiting-question", detail: null }).id;
+      store.publishStall(stall);
+      if (state === "paused") store.pauseTicket(id, STALL_PAUSE_CAUSE);
+      if (state === "ended") {
+        store.endAssignment(assignment, "stopped by operator");
+        store.endTicket(id);
+      }
+      assert.equal(await main(["resume", String(id), "--json"], env), 0);
+      await workers.drain();
+      assert.equal(store.getTicket(id).state, state === "ended" ? "ended" : "open");
+      assert.notEqual(store.getStall(stall).clearedAt, null);
+      assert.equal(runner.sessions[0]!.prompts.length, 1);
+    }
+  } finally {
+    await api.close();
+    store.close();
     rmSync(directory, { recursive: true, force: true });
   }
 });

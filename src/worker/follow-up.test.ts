@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { afterEach, test } from "node:test";
 
-import { Store } from "../store/store.ts";
+import { STALL_PAUSE_CAUSE, Store } from "../store/store.ts";
 import { FakeRunner } from "./fake-runner.ts";
 import { followUpMessage, routeFollowUps } from "./follow-up.ts";
 import { workerTurnPrompt, Workers } from "./workers.ts";
@@ -38,7 +38,7 @@ function fixture() {
   const trigger = (
     threadId: number,
     kind = "issue_comment",
-    extra: Partial<{ reviewId: string; body: string; path: string; line: number }> = {},
+    extra: Partial<{ actor: string; reviewId: string; body: string; path: string; line: number }> = {},
   ) =>
     store.insertTrigger({
       sourceId: source.id,
@@ -75,7 +75,7 @@ test("a review on a subscribed PR goes to the ticket's Worker session, with no d
     trigger: review, ticketId, assignmentId,
   });
 
-  const pass = routeFollowUps(store, workers);
+  const pass = routeFollowUps(store, workers, ["alice"]);
   assert.deepEqual(pass, { queued: [{ triggerId: review, ticketId, assignmentId }], failed: [] });
   await workers.drain();
   const [session] = runner.sessions;
@@ -87,6 +87,35 @@ test("a review on a subscribed PR goes to the ticket's Worker session, with no d
   assert.equal(store.getAssignment(assignmentId).turns, 1);
 });
 
+for (const state of ["stuck", "open", "operator pause", "budget pause", "ended"] as const) {
+  test(`only an allowlisted PR review clears a public stall on a ${state} ticket`, async () => {
+    const { store, runner, workers, pr, trigger, ticketId, assignmentId } = fixture();
+    const stall = store.recordStall({ assignmentId, semonReason: "waiting-question", detail: null }).id;
+    store.publishStall(stall);
+    if (state === "stuck") store.pauseTicket(ticketId, STALL_PAUSE_CAUSE);
+    if (state === "operator pause") store.pauseTicket(ticketId, "paused by the operator");
+    if (state === "budget pause") store.pauseTicketForBudget(ticketId, "time");
+    if (state === "ended") {
+      store.endAssignment(assignmentId, "stopped by operator");
+      store.endTicket(ticketId);
+    }
+    const before = store.getTicket(ticketId);
+    trigger(pr, "pull_request_review", { reviewId: "44", actor: "mallory" });
+    assert.deepEqual(routeFollowUps(store, workers, ["Alice"]).failed, []);
+    assert.equal(store.getStall(stall).clearedAt, null);
+    assert.deepEqual(store.getTicket(ticketId), before);
+
+    trigger(pr, "pull_request_review", { reviewId: "45" });
+    assert.deepEqual(routeFollowUps(store, workers, ["Alice"]).failed, []);
+    await workers.drain();
+    assert.notEqual(store.getStall(stall).clearedByHumanAt, null);
+    assert.equal(store.getTicket(ticketId).state, state === "stuck" ? "open" : before.state);
+    assert.equal(store.getTicket(ticketId).pauseCause, state === "stuck" ? null : before.pauseCause);
+    if (state === "open" || state === "stuck") assert.equal(runner.sessions[0]!.prompts.length, 2);
+    else assert.deepEqual(runner.sessions, []);
+  });
+}
+
 test("a review with three inline comments gets one Worker turn, one reply, and receipt reactions", async () => {
   const { store, runner, workers, pr, trigger, ticketId, assignmentId } = fixture();
   runner.hold = true;
@@ -96,7 +125,7 @@ test("a review with three inline comments gets one Worker turn, one reply, and r
     trigger(pr, "pull_request_review_comment", { reviewId: "44", body: "Handle null.", path: "src/b.ts", line: 31 }),
     trigger(pr, "pull_request_review_comment", { reviewId: "44", body: "Add coverage.", path: "src/c.ts", line: 8 }),
   ];
-  const pass = routeFollowUps(store, workers);
+  const pass = routeFollowUps(store, workers, ["alice"]);
   assert.deepEqual(pass, { queued: [{ triggerId: review, ticketId, assignmentId }], failed: [] });
   await tick();
   runner.sessions[0]!.release();
@@ -124,7 +153,7 @@ test("a restart during a review turn posts its one reply when recovery completes
   runner.hold = true;
   trigger(pr, "pull_request_review", { reviewId: "44", body: "Please make these changes." });
   trigger(pr, "pull_request_review_comment", { reviewId: "44", body: "Rename this.", path: "src/a.ts", line: 12 });
-  routeFollowUps(store, workers);
+  routeFollowUps(store, workers, ["alice"]);
   await tick();
 
   workers.stop();
@@ -160,9 +189,9 @@ test("a replayed pass sends nothing twice", async () => {
   const { store, runner, workers, pr, trigger, worker, ticketId, assignmentId } = fixture();
   trigger(pr);
   trigger(pr);
-  assert.equal(routeFollowUps(store, workers).queued.length, 2);
+  assert.equal(routeFollowUps(store, workers, ["alice"]).queued.length, 2);
   await workers.drain();
-  assert.deepEqual(routeFollowUps(store, workers), { queued: [], failed: [] });
+  assert.deepEqual(routeFollowUps(store, workers, ["alice"]), { queued: [], failed: [] });
   assert.equal(runner.sessions[0]?.prompts.length, 2);
 
   // A new Worker on the same ticket does not get the ticket's old follow-ups again.
@@ -170,7 +199,7 @@ test("a replayed pass sends nothing twice", async () => {
   const second = worker(ticketId, "session-2");
   assert.deepEqual(store.pendingDeliveries(), []);
   const later = trigger(pr);
-  const pass = routeFollowUps(store, workers);
+  const pass = routeFollowUps(store, workers, ["alice"]);
   assert.deepEqual(pass.queued.map((d) => [d.triggerId, d.assignmentId]), [[later, second]]);
 });
 
@@ -179,12 +208,12 @@ test("follow-ups queue behind a running turn, one at a time, and are never queue
   runner.hold = true;
   const first = trigger(pr);
   const second = trigger(pr);
-  assert.equal(routeFollowUps(store, workers).queued.length, 2);
+  assert.equal(routeFollowUps(store, workers, ["alice"]).queued.length, 2);
   await tick();
   const session = runner.sessions[0]!;
   assert.equal(session.prompts.length, 1, "the second waits for the first turn");
   assert.deepEqual(store.pendingDeliveries().map((p) => p.trigger.id), [second], "delivery is recorded as the turn starts");
-  assert.deepEqual(routeFollowUps(store, workers), { queued: [], failed: [] }, "the queued one is not queued again");
+  assert.deepEqual(routeFollowUps(store, workers, ["alice"]), { queued: [], failed: [] }, "the queued one is not queued again");
 
   session.release();
   await tick();
@@ -199,7 +228,7 @@ test("follow-ups queue behind a running turn, one at a time, and are never queue
 test("a trigger on an unsubscribed thread is left for the Router", async () => {
   const { store, runner, workers, thread, trigger } = fixture();
   const other = trigger(thread("issue", 8));
-  assert.deepEqual(routeFollowUps(store, workers), { queued: [], failed: [] });
+  assert.deepEqual(routeFollowUps(store, workers, ["alice"]), { queued: [], failed: [] });
   assert.deepEqual(runner.sessions, []);
   assert.deepEqual(store.undecidedTriggers().map((t) => t.id), [other]);
 });
@@ -234,7 +263,7 @@ test("undecided triggers: no decision, no delivery, and no open ticket subscribe
 
   // While the Worker cannot take them, the triggers still belong to it, not the Router.
   store.endAssignment(assignmentId);
-  assert.equal(routeFollowUps(store, workers).failed.length, 2, "the issue's and the PR's follow-ups");
+  assert.equal(routeFollowUps(store, workers, ["alice"]).failed.length, 2, "the issue's and the PR's follow-ups");
   assert.ok(!store.undecidedTriggers().some((t) => t.id === onPr));
   assert.equal(store.getTicket(ticketId).state, "open");
 });
@@ -242,13 +271,13 @@ test("undecided triggers: no decision, no delivery, and no open ticket subscribe
 test("when every subscribed ticket has ended, the trigger goes to the Router, not to the old Worker", async () => {
   const { store, runner, workers, pr, trigger, ticketId, assignmentId } = fixture();
   trigger(pr);
-  routeFollowUps(store, workers);
+  routeFollowUps(store, workers, ["alice"]);
   await workers.drain();
   store.endAssignment(assignmentId);
   store.endTicket(ticketId);
 
   const afterEnd = trigger(pr);
-  assert.deepEqual(routeFollowUps(store, workers), { queued: [], failed: [] });
+  assert.deepEqual(routeFollowUps(store, workers, ["alice"]), { queued: [], failed: [] });
   assert.equal(runner.sessions[0]?.prompts.length, 1);
   assert.deepEqual(store.undecidedTriggers().map((t) => t.id), [afterEnd], "already delivered stays delivered");
 });
@@ -263,7 +292,7 @@ test("a trigger fans out to every open subscribed ticket; ended ones are skipped
   store.endTicket(third);
 
   const id = trigger(pr);
-  const pass = routeFollowUps(store, workers);
+  const pass = routeFollowUps(store, workers, ["alice"]);
   assert.deepEqual(pass.queued.map((d) => [d.triggerId, d.ticketId, d.assignmentId]), [
     [id, ticketId, assignmentId],
     [id, second, secondWorker],
@@ -280,14 +309,14 @@ test("a ticket ended while paused at public Stuck is owed no follow-up", () => {
   trigger(pr);
 
   assert.deepEqual(store.pendingDeliveries(), []);
-  assert.deepEqual(routeFollowUps(store, workers), { queued: [], failed: [] });
+  assert.deepEqual(routeFollowUps(store, workers, ["alice"]), { queued: [], failed: [] });
 });
 
 test("an open ticket with no running Worker holds its follow-up and reports it", () => {
   const { store, runner, workers, pr, trigger, ticketId, assignmentId } = fixture();
   store.endAssignment(assignmentId);
   const id = trigger(pr);
-  assert.deepEqual(routeFollowUps(store, workers), {
+  assert.deepEqual(routeFollowUps(store, workers, ["alice"]), {
     queued: [],
     failed: [{ triggerId: id, ticketId, error: `ticket ${ticketId} has no running Worker` }],
   });

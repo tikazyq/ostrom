@@ -1,8 +1,8 @@
 import { queueStatusCard } from "../github/cards.ts";
 import { ghGet, type GhRunner } from "../github/gh.ts";
-import type { Store, Trigger } from "../store/store.ts";
+import { STALL_PAUSE_CAUSE, type Store, type Trigger } from "../store/store.ts";
 import { pullRequestsForBranch } from "../worker/dispatch.ts";
-import { followUpMessage } from "../worker/follow-up.ts";
+import { clearStallForReply, followUpMessage } from "../worker/follow-up.ts";
 import type { Workers } from "../worker/workers.ts";
 import { parseComment } from "./parser.ts";
 
@@ -16,6 +16,7 @@ export function operatorControls(store: Store, workers: Workers, gh: GhRunner, r
   pause(ticketId: number): Promise<void>;
   resume(ticketId: number): Promise<void>;
   stop(ticketId: number): Promise<void>;
+  extend(ticketId: number, increases: Parameters<Store["extendTicketBudget"]>[1]): Promise<void>;
 } {
   const running = (ticketId: number) => {
     const assignment = store.latestAssignment(ticketId);
@@ -30,11 +31,26 @@ export function operatorControls(store: Store, workers: Workers, gh: GhRunner, r
       workers.deliver(assignment.id, `operator-pause-${ticketId}`, "Pause this ticket after the current work finishes. Push your work in progress, then stop and wait for Ostrom to resume you.", () => {});
     },
     async resume(ticketId) {
+      const ticket = store.getTicket(ticketId);
+      if (ticket.state !== "paused") {
+        if (store.clearStallsByHuman(ticketId) === null) throw new Error(`ticket ${ticketId} is ${ticket.state}; it cannot resume`);
+        if (ticket.state === "open") queueStatusCard(store, ticketId);
+        return;
+      }
       const assignment = running(ticketId);
+      store.clearStallsByHuman(ticketId);
       store.resumeTicket(ticketId);
       queueStatusCard(store, ticketId);
       workers.wake(assignment.id);
       workers.deliver(assignment.id, `operator-resume-${ticketId}`, "This ticket has resumed. Continue your work.", () => {});
+    },
+    async extend(ticketId, increases) {
+      const reopened = store.extendTicketBudget(ticketId, increases);
+      queueStatusCard(store, ticketId);
+      if (reopened) {
+        const assignment = store.latestAssignment(ticketId);
+        if (assignment?.state === "running") workers.wake(assignment.id);
+      }
     },
     async stop(ticketId) {
       const assignment = running(ticketId);
@@ -66,8 +82,10 @@ export async function routeCommands(
   workers: Workers,
   gh: GhRunner,
   repo: string,
+  allowlist: readonly string[],
 ): Promise<CommandPass> {
   const pass: CommandPass = { handled: [], failed: [] };
+  const trusted = new Set(allowlist.map((login) => login.toLowerCase()));
   const permissions = new Map<string, Promise<boolean>>();
   const authors = new Map<number, Promise<string>>();
   for (const pending of store.pendingCommands()) {
@@ -81,9 +99,12 @@ export async function routeCommands(
         pass.handled.push({ triggerId: pending.trigger.id, ticketId: pending.ticketId, command, allowed: true });
         continue;
       }
-      const allowed = command === "redirect" || command === "close_issue" || command === "close_pull_request" || await mayControl(
-        store, gh, repo, pending.trigger, pending.ticketId, permissions, authors,
-      );
+      const ticket = store.getTicket(pending.ticketId);
+      const trustedReply = trusted.has(pending.trigger.actor.toLowerCase());
+      if (ticket.state === "ended" && command !== "redirect" && command !== "resume") continue;
+      const allowed = command === "redirect" || command === "close_issue" || command === "close_pull_request" ||
+        (!(command === "resume" && !trustedReply && ticket.pauseCause === STALL_PAUSE_CAUSE) &&
+          await mayControl(store, gh, repo, pending.trigger, pending.ticketId, permissions, authors));
       if (!allowed) {
         store.recordCommandReceipt(pending.trigger.id, pending.ticketId, "forbidden", false);
         enqueueReaction(store, pending.trigger, "confused");
@@ -124,6 +145,14 @@ export async function routeCommands(
         store.recordCommandReceipt(pending.trigger.id, pending.ticketId, "close_issue", true);
         if (queued) workers.cancel(assignment.id);
       } else if (command === "redirect") {
+        if (trustedReply) clearStallForReply(store, workers, pending.ticketId);
+        if (ticket.state === "ended") {
+          if (trustedReply) {
+            store.recordCommandReceipt(pending.trigger.id, pending.ticketId, "redirect", false);
+            pass.handled.push({ triggerId: pending.trigger.id, ticketId: pending.ticketId, command, allowed });
+          }
+          continue;
+        }
         const assignment = store.latestAssignment(pending.ticketId);
         if (assignment?.state !== "running") throw new Error(`ticket ${pending.ticketId} has no running Worker`);
         const instruction = await collaborator(gh, repo, pending.trigger.actor, permissions);
@@ -155,11 +184,15 @@ export async function routeCommands(
         enqueueReaction(store, pending.trigger, "+1");
         queueStatusCard(store, pending.ticketId);
       } else if (command === "resume") {
-        const assignment = store.latestAssignment(pending.ticketId);
-        if (assignment?.state !== "running") throw new Error(`ticket ${pending.ticketId} has no running Worker`);
-        store.resumeTicket(pending.ticketId);
-        workers.wake(assignment.id);
-        workers.deliver(assignment.id, `resume-${pending.trigger.id}-${assignment.id}`, "This ticket has resumed. Continue your work.", () => {});
+        const state = store.getTicket(pending.ticketId).state;
+        if (state === "paused") {
+          const assignment = store.latestAssignment(pending.ticketId);
+          if (assignment?.state !== "running") throw new Error(`ticket ${pending.ticketId} has no running Worker`);
+          store.resumeTicket(pending.ticketId);
+          workers.wake(assignment.id);
+          workers.deliver(assignment.id, `resume-${pending.trigger.id}-${assignment.id}`, "This ticket has resumed. Continue your work.", () => {});
+        }
+        if (trustedReply) store.clearStallsByHuman(pending.ticketId);
         store.recordCommandReceipt(pending.trigger.id, pending.ticketId, "resume", true);
         enqueueReaction(store, pending.trigger, "+1");
         queueStatusCard(store, pending.ticketId);

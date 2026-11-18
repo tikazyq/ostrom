@@ -1,13 +1,10 @@
-// The scripted stall (docs/direction.md, milestone 1 pass criterion) only seeds a throwaway store.
-// The already-running ostromd dispatches it normally, so it owns and can cancel the hung Worker
-// turn. The ticket takes its budget from the same environment as a Router-accepted one; a short
-// OSTROM_BUDGET_IDLE_MIN makes the Watchdog flag the hung turn (see docs/watchdog.md).
+// Seeds a hung turn in a throwaway store for the idle budget exercise (docs/watchdog.md).
+// The running daemon dispatches it normally and can cancel the turn at the configured limit.
 //
 //   node src/watchdog/scripted-stall.ts <issue-number>
 //
-// Environment: OSTROM_REPO, OSTROM_ALLOWLIST and OSTROM_DB (use a new file). The issue is only
-// where the stuck reply would go; nothing is posted unless the daemon's send pass runs on this
-// store, so never run a throwaway exercise against a live daemon store.
+// Environment: OSTROM_REPO, OSTROM_ALLOWLIST and OSTROM_DB (use a new file). The daemon's send
+// pass updates the supplied issue's status card, so use a sandbox issue.
 
 import { loadBudgetDefaults, type BudgetDefaults } from "../budget/budgets.ts";
 import { loadConfig } from "../ostromd/config.ts";
@@ -17,8 +14,7 @@ export const STALL_BRIEF = [
   "This is a scripted stall for Ostrom's Watchdog test. There is nothing to change in this repository:",
   "never commit, push or open a pull request, whatever other instructions say.",
   "Run `sleep 3600` in the shell and wait for it to finish. Do not make edits while it runs.",
-  "If it is interrupted, or you are told to continue or make progress, run `sleep 3600` again.",
-  "After it finishes, ask the operator exactly one question: Which colour should the scripted stall use, red or blue?",
+  "If Ostrom interrupts the sleep and asks you to save work, finish the turn immediately. There is no work to save.",
 ].join("\n");
 
 /** Seeds an accepted ticket for normal daemon dispatch; it never starts a Worker session itself. */

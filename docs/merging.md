@@ -32,8 +32,8 @@ Current code at `680f96f`:
   backoff. `src/github/poller.ts` deduplicates immutable triggers; it is not a complete current
   view of edits, review dismissals, thread resolutions or CI.
 - `src/budget/budgets.ts` counts wall time from ticket opening, including review waiting, and idle
-  time only during a running turn. `src/watchdog/watchdog.ts` records budget/stall episodes;
-  `src/watchdog/stuck.ts` recovers twice before pausing and posting Stuck.
+  time only during a running turn. `src/watchdog/watchdog.ts` enforces time and idle limits by
+  pausing the ticket for budget cleanup. `src/watchdog/stuck.ts` handles genuine stall episodes.
 
 ## Default: unattended
 

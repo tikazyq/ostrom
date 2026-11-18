@@ -5,7 +5,7 @@
 import { randomUUID } from "node:crypto";
 import { basename, join } from "node:path";
 
-import { turnBudgetReached } from "../budget/budgets.ts";
+import { turnBudgetReached, type BudgetLimit } from "../budget/budgets.ts";
 import { queueStatusCard } from "../github/cards.ts";
 import { ghGet, type GhRunner } from "../github/gh.ts";
 import { renderReviewReply } from "../github/review-reply.ts";
@@ -77,7 +77,6 @@ export class Workers {
     onStart: ((turnId: string) => void) | undefined;
     onComplete: ((result: TurnResult) => void | Promise<void>) | undefined;
   }>();
-  readonly #budgetPauses = new Set<number>();
   readonly #inFlight = new Map<number, AbortController>();
   #stopping = false;
 
@@ -146,6 +145,21 @@ export class Workers {
     this.#callbacksByKey.set(this.#callbackKey(assignmentId, key), { onStart, onComplete });
     this.#schedule(assignmentId, key);
     return true;
+  }
+
+  /** Pauses the ticket and gives the same Worker one turn to save its work. */
+  pauseForBudget(assignment: Assignment, limit: BudgetLimit): void {
+    const { store } = this.#deps;
+    store.pauseTicketForBudget(assignment.ticketId, limit);
+    store.clearStall(assignment.id);
+    this.deliver(
+      assignment.id,
+      `budget-pause-${assignment.ticketId}-${limit}-${assignment.turns}`,
+      "The ticket budget has been reached. Push your work in progress, then stop and wait for Ostrom to resume you.",
+      () => {},
+    );
+    this.cancel(assignment.id);
+    queueStatusCard(store, assignment.ticketId);
   }
 
   /** Releases a merge reservation and wakes every queued turn on that assignment. */
@@ -330,6 +344,7 @@ export class Workers {
     return {
       onComplete: (turn) => {
         const stall = store.getStall(stallId);
+        if (stall.clearedAt !== null) return;
         const cause = stall.cause ?? stall.semonReason ?? "unknown";
         const reply = renderStuckReply(parseStuckReply(turn.text, cause));
         store.enqueueReply({ id: `stuck-${stall.id}`, threadId: store.ticketContext(assignment.ticketId).thread.id, body: reply, blocking: true });
@@ -459,19 +474,10 @@ export class Workers {
       store.clearTurnError(id);
       // A cancelled turn still counts toward the turn and token limits.
       const reached = turnBudgetReached(store.ticketBudget(assignment.ticketId), new Date());
-      if (store.getTicket(assignment.ticketId).state === "open" && reached !== null && !this.#budgetPauses.has(id)) {
-        this.#budgetPauses.add(id);
-        store.pauseTicketForBudget(assignment.ticketId, reached);
-        this.deliver(
-          id,
-          `budget-pause-${assignment.ticketId}-${reached}`,
-          "The ticket budget has been reached. Push your work in progress, then stop and wait for Ostrom to resume you.",
-          () => {},
-        );
-        queueStatusCard(store, assignment.ticketId);
+      if (store.getTicket(assignment.ticketId).state === "open" && reached !== null) {
+        this.pauseForBudget(store.getAssignment(id), reached);
         return;
       }
-      if (store.getTicket(assignment.ticketId).state === "open") this.#budgetPauses.delete(id);
       if (result.status === "cancelled") {
         queueStatusCard(store, assignment.ticketId);
         return;

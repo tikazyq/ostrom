@@ -82,13 +82,15 @@ The guarantee: no ticket goes quiet. Every stall ends in automatic recovery or i
 specific, honest reply.
 
 1. **Detect (silent).** The Watchdog spots no progress for N minutes, a repeated error loop, a
-   crash, an exhausted budget, or an unanswered question.
+   crash, or an unanswered question.
 2. **Recover (silent).** Ostrom resumes the same session, then retries, then moves up one tier, with
    at most two attempts. The card shows "recovering".
 3. **Operator.** The stall appears in the operator's status view first. The operator can pause
    the ticket, open the session and unblock it.
 4. **Public.** Ostrom posts one stuck reply, labels the issue `ostrom:stuck` and sets the card to
-   **Stuck**. There are no further pings until someone replies.
+   **Stuck**. An allowlisted author can clear the stall with a comment or PR review. Their reply
+   reopens the ticket only if the Watchdog paused it for that stall. The operator can also clear it
+   with `ostrom resume`.
 
 The stuck reply follows a fixed template. The Worker fills it in, and code checks that every field
 is present before it is sent:
@@ -154,8 +156,12 @@ estimated cost, and model escalations. Ostrom chooses each ticket's model and ea
 within the operator's limits ([model-selection.md](model-selection.md)).
 
 - At 80% of any limit, the status card and dashboard show a warning.
-- At a limit, the Worker **pauses**. It is not killed: it pushes its work in progress, and the stuck
-  ladder starts with the cause "budget reached". The operator can `ostrom extend` it or stop it.
+- At a limit, the ticket **pauses** with `budget reached: <limit>` on the status card. Ostrom gives
+  the same Worker a cleanup turn to push its work in progress. Budget pauses do not enter the stuck
+  ladder. Wall-clock time runs from ticket opening, including the wait for review.
+- `ostrom extend` reopens a budget pause only when the extension clears the remaining exhausted
+  limits. It preserves other pauses. The idle limit applies only while a turn is running. After
+  idle cleanup, the operator can use `ostrom resume` to continue.
 - Subscription plans have no per-call price, so Ostrom always enforces tokens and time, and treats
   cost as an estimate.
 

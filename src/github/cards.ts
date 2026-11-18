@@ -2,7 +2,7 @@
 // not yet persisted by the native runners, so their latest todo is deliberately omitted for now.
 
 import { budgetWarning } from "../budget/budgets.ts";
-import type { Store } from "../store/store.ts";
+import { STALL_PAUSE_CAUSE, type Store } from "../store/store.ts";
 import { renderStatusCard, type StatusCardState } from "./status-card.ts";
 
 export function queueStatusCard(store: Store, ticketId: number, now = new Date()): void {
@@ -15,9 +15,9 @@ export function queueStatusCard(store: Store, ticketId: number, now = new Date()
   const policy = candidate === null ? null : JSON.parse(candidate.policy) as { strategy: string };
   const state: StatusCardState =
     ticket.state === "ended" ? (assignment.outcome === "failed" ? "failed" : assignment.endReason === null ? "done" : "stopped") :
-      openStall !== undefined && openStall.publicAt !== null ? "stuck" :
-        openStall !== undefined ? "recovering" :
-          ticket.state === "paused" ? "paused" :
+      ticket.state === "paused" && ticket.pauseCause !== STALL_PAUSE_CAUSE ? "paused" :
+        openStall !== undefined && openStall.publicAt !== null ? "stuck" :
+          openStall !== undefined ? "recovering" :
             assignment.outcome === "failed" ? "stuck" :
               candidate !== null ? (policy?.strategy === "human" ? "waiting_for_human_merge" : "waiting_to_merge") : "working";
   const budget = store.ticketBudget(ticketId);

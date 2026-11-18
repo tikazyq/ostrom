@@ -112,7 +112,7 @@ test("a human comment during a silent recovery reaches the Worker and leaves the
     sourceId: store.ensureSource("github", REPO).id, sourceEventId: "human-early", threadId, kind: "issue_comment", actor: "alice",
     url: `https://github.com/${REPO}/issues/7#issuecomment-early`, occurredAt: new Date("2026-11-09T12:01:00.000Z"), body: "try red",
   });
-  const pass = routeFollowUps(store, workers);
+  const pass = routeFollowUps(store, workers, ["alice"]);
   await workers.drain();
   assert.deepEqual(pass.failed, []);
   assert.equal(pass.queued.length, 1);
@@ -143,7 +143,7 @@ test("a human follow-up resets the Worker recovery count", async () => {
     sourceId: store.ensureSource("github", REPO).id, sourceEventId: "human", threadId, kind: "issue_comment", actor: "alice",
     url: `https://github.com/${REPO}/issues/7#issuecomment-human`, occurredAt: new Date("2026-11-09T12:01:00.000Z"), body: "try red",
   });
-  routeFollowUps(store, workers);
+  routeFollowUps(store, workers, ["alice"]);
   await workers.drain();
   assert.equal(store.getAssignment(assignmentId).stallRecoveryAttempts, 0);
 });

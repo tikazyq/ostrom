@@ -586,6 +586,35 @@ export const migrations: readonly string[] = [
   CREATE INDEX turn_by_ticket ON turn(ticket_id, id);
   CREATE UNIQUE INDEX turn_running ON turn(assignment_id) WHERE status = 'running';
   `,
+
+  // 31: Retire legacy budget stalls and preserve the pause they caused.
+  `
+  WITH latest_public AS (
+    SELECT assignment.ticket_id, MAX(stall.id) AS stall_id
+    FROM stall JOIN assignment ON assignment.id = stall.assignment_id
+    WHERE stall.public_at IS NOT NULL AND stall.cleared_at IS NULL
+    GROUP BY assignment.ticket_id
+  )
+  UPDATE ticket SET pause_cause = stall.cause
+  FROM latest_public JOIN stall ON stall.id = latest_public.stall_id
+  WHERE ticket.id = latest_public.ticket_id AND ticket.state = 'paused'
+    AND ticket.pause_cause = 'stuck turn reported by the Watchdog'
+    AND stall.cause IN ('budget reached: time', 'budget reached: idle');
+
+  UPDATE queued_turn SET state = 'cancelled', finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+  WHERE state = 'queued' AND EXISTS (
+    SELECT 1 FROM stall WHERE stall.assignment_id = queued_turn.assignment_id AND stall.cleared_at IS NULL
+      AND stall.cause IN ('budget reached: time', 'budget reached: idle')
+      AND (queued_turn.delivery_key = 'stuck-public-' || stall.id
+        OR queued_turn.delivery_key IN ('stuck-recovery-' || stall.id || '-1', 'stuck-recovery-' || stall.id || '-2'))
+  );
+
+  UPDATE assignment SET stall_recovery_attempts = 0 WHERE id IN (
+    SELECT assignment_id FROM stall WHERE cleared_at IS NULL AND cause IN ('budget reached: time', 'budget reached: idle')
+  );
+  UPDATE stall SET cleared_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+  WHERE cleared_at IS NULL AND cause IN ('budget reached: time', 'budget reached: idle');
+  `,
 ];
 
 /** Applies every migration newer than the database's version. Returns the resulting version. */
