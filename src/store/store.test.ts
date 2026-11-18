@@ -129,6 +129,67 @@ test("a database newer than the code is refused", () => {
   assert.throws(() => migrate(db), /newer than this code/);
 });
 
+test("intake keeps the first exclusion per source and orders it with trigger decisions", () => {
+  const { store, source, issue, trigger, advance } = fixture();
+  const receipt = { sourceId: source.id, sourceEventId: "I_8:opened", url: "https://example.test/issues/8", reason: "missing_mention" } as const;
+  store.recordIntakeExclusion(receipt);
+  advance(1000);
+  const ignored = trigger();
+  store.recordIntakeExclusion({ ...receipt, url: "https://example.test/changed", reason: "unauthorized_author" });
+  advance(1000);
+  const pending = trigger();
+  advance(1000);
+  store.recordDecision({ threadId: issue, triggerIds: [ignored], verdict: "ignore", reason: "out of scope" });
+  const undecided = store.getTrigger(pending);
+  const decided = store.getTrigger(ignored);
+  assert.deepEqual(store.operatorIntake(), [
+    { url: undecided.url, observedAt: undecided.receivedAt, disposition: "awaiting_decision", reason: null },
+    { url: decided.url, observedAt: decided.receivedAt, disposition: "ignore", reason: "out of scope" },
+    { url: receipt.url, observedAt: "2026-11-09T12:00:00.000Z", disposition: "excluded", reason: "missing_mention" },
+  ]);
+  assert.deepEqual(store.operatorIntake(2).map(({ url }) => url), [undecided.url, decided.url]);
+  const otherSource = store.ensureSource("github", "other/repo");
+  store.recordIntakeExclusion({ ...receipt, sourceId: otherSource.id, url: "https://example.test/other/issues/8" });
+  assert.equal(store.operatorIntake(1)[0]!.url, "https://example.test/other/issues/8");
+});
+
+test("operator ticket failure history keeps the newest 20 stored failures across assignments", () => {
+  const { store, accept, advance } = fixture();
+  const ticketId = accept();
+  assert.equal(store.operatorTicket(ticketId).latestFailure, null);
+  const failures = Array.from({ length: 21 }, (_, index) => {
+    advance(1000);
+    const id = store.createAssignment(ticketId);
+    store.abandonAssignment(id, `dispatch failure ${index}`);
+    return id;
+  });
+  const worker = store.createAssignment(ticketId);
+  store.startNativeAssignment(worker, "session");
+  advance(1000);
+  store.recordTurnError(worker, "resume failed");
+  store.recordOutcome(worker, "failed");
+  advance(1000);
+  store.endAssignment(worker);
+  // An operator stop has an end reason but is not a failure.
+  const stopped = store.createAssignment(ticketId);
+  store.startNativeAssignment(stopped, "stopped-session");
+  store.endAssignment(stopped, "stopped by command");
+  store.endTicket(ticketId);
+  advance(60 * 60_000);
+
+  const detail = store.operatorTicket(ticketId);
+  assert.equal(detail.budgetUsage.time, 0, "wall time is fixed when the ticket ends");
+  assert.deepEqual(detail.latestFailure, {
+    assignmentId: worker, kind: "worker", at: "2026-11-09T12:00:22.000Z", reason: "resume failed",
+  });
+  assert.equal(detail.failures.length, 20);
+  assert.deepEqual(detail.failures.map((failure) => failure.assignmentId), [worker, ...failures.slice(-19).reverse()]);
+  assert.deepEqual(detail.failures[1], {
+    assignmentId: failures.at(-1), kind: "dispatch", at: "2026-11-09T12:00:21.000Z", reason: "dispatch failure 20",
+  });
+  assert.deepEqual(store.operatorTickets()[0]!.failures, detail.failures);
+});
+
 test("ensureSource and ensureThread return the same record on repeat", () => {
   const { store, source, issue } = fixture();
   assert.deepEqual(store.ensureSource("github", "onsager-ai/ostrom"), source);

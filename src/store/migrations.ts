@@ -548,6 +548,19 @@ export const migrations: readonly string[] = [
   ALTER TABLE queued_turn_v28 RENAME TO queued_turn;
   CREATE INDEX queued_turn_unfinished ON queued_turn (assignment_id, state) WHERE state IN ('queued', 'running');
   `,
+
+  // 29: Excluded issue openings are operator-visible without becoming triggers or storing bodies.
+  `
+  CREATE TABLE intake_receipt (
+    source_id       INTEGER NOT NULL REFERENCES source (id),
+    source_event_id TEXT NOT NULL,
+    url             TEXT NOT NULL,
+    observed_at     TEXT NOT NULL,
+    reason          TEXT NOT NULL CHECK (reason IN ('missing_mention', 'unauthorized_author')),
+    PRIMARY KEY (source_id, source_event_id)
+  ) STRICT, WITHOUT ROWID;
+  CREATE INDEX decision_trigger_by_trigger ON decision_trigger (trigger_id, decision_id);
+  `,
 ];
 
 /** Applies every migration newer than the database's version. Returns the resulting version. */

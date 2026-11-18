@@ -81,8 +81,9 @@ export interface WatchdogOptions {
   store: Store;
   semon: ProcessRunner;
   idleMinutes: number;
-  /** Clock used for budget evaluation; injectable for deterministic checks. */
+  /** Clock used for budget evaluation and read health. */
   now?: () => Date;
+  onSemonRead?: (attemptedAt: Date, error: string | null) => void;
 }
 
 export interface Checked {
@@ -107,12 +108,14 @@ export async function watchdog(options: WatchdogOptions): Promise<WatchdogPass> 
   const { store, idleMinutes, now = () => new Date() } = options;
   const pass: WatchdogPass = { checked: [], failed: [] };
   let semon: SemonStall[] | null;
+  const attemptedAt = now();
   try {
     semon = await readSemonStalls(options.semon, idleMinutes);
   } catch (error) {
     semon = null;
     pass.failed.push({ what: "semon stalls", error: message(error) });
   }
+  options.onSemonRead?.(attemptedAt, pass.failed[0]?.error ?? null);
   for (const assignment of store.runningAssignments()) {
     const found = assignment.branch === null ? undefined : semon?.find((stall) => stall.branch === assignment.branch);
     const matched = found !== undefined && semonCounts(found, assignment.turnStartedAt, idleMinutes, now()) ? found : undefined;

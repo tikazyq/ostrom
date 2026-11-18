@@ -2,7 +2,7 @@
 // See docs/direction.md, "Data model". Only the operations milestone 1 needs live here.
 
 import { DatabaseSync, type SQLInputValue } from "node:sqlite";
-import type { BudgetDefaults } from "../budget/budgets.ts";
+import { budgetUsage, budgetWarning, type BudgetDefaults, type BudgetLimit } from "../budget/budgets.ts";
 import { migrate } from "./migrations.ts";
 
 export type SourceKind = "github";
@@ -148,11 +148,33 @@ export interface TicketBudget {
   turnStartedAt: string | null;
 }
 
+export type IntakeExclusion = "missing_mention" | "unauthorized_author";
+
+export interface OperatorIntake {
+  url: string;
+  observedAt: string;
+  disposition: "excluded" | "awaiting_decision" | Verdict;
+  reason: string | null;
+}
+
+export interface OperatorFailure {
+  assignmentId: number;
+  kind: "dispatch" | "worker";
+  at: string;
+  reason: string | null;
+}
+
 /** The compact records displayed by the local operator API. */
 export interface OperatorTicket extends Ticket {
   thread: Thread;
   assignment: Assignment | null;
   budget: TicketBudget;
+  budgetUsage: Record<BudgetLimit, number>;
+  budgetWarning: BudgetLimit | null;
+  prUrls: string[];
+  mergeCandidate: Pick<MergeCandidate, "prNumber" | "policy" | "blockingReason" | "quietDeadline"> | null;
+  latestFailure: OperatorFailure | null;
+  failures: OperatorFailure[];
 }
 
 export interface OperatorTicketDetail extends OperatorTicket {
@@ -470,6 +492,43 @@ export class Store {
     ).map(toTrigger);
   }
 
+  /** Keeps the first exclusion. An edit to an already admitted event does not create a receipt. */
+  recordIntakeExclusion(input: { sourceId: number; sourceEventId: string; url: string; reason: IntakeExclusion }): void {
+    this.#run(
+      `INSERT INTO intake_receipt (source_id, source_event_id, url, observed_at, reason)
+       SELECT ?, ?, ?, ?, ? WHERE NOT EXISTS (
+         SELECT 1 FROM "trigger" WHERE source_id = ? AND source_event_id = ?
+       ) ON CONFLICT (source_id, source_event_id) DO NOTHING`,
+      input.sourceId, input.sourceEventId, input.url, this.#stamp(), input.reason, input.sourceId, input.sourceEventId,
+    );
+  }
+
+  /** The latest observations, with the latest Router decision (if any) on each trigger. */
+  operatorIntake(limit = 50): OperatorIntake[] {
+    return this.#all(
+      `WITH recent AS (
+         SELECT url, observed_at, reason AS exclusion, source_id, source_event_id, NULL AS trigger_id FROM intake_receipt
+         UNION ALL
+         SELECT url, received_at, NULL, source_id, source_event_id, id FROM "trigger"
+         ORDER BY observed_at DESC, source_id DESC, source_event_id DESC, trigger_id
+         LIMIT ?
+       )
+       SELECT recent.url, recent.observed_at,
+         CASE WHEN exclusion IS NOT NULL THEN 'excluded' ELSE COALESCE(d.verdict, 'awaiting_decision') END AS disposition,
+         COALESCE(exclusion, d.reason) AS reason
+       FROM recent LEFT JOIN decision AS d ON d.id = (
+         SELECT decision_id FROM decision_trigger WHERE trigger_id = recent.trigger_id ORDER BY decision_id DESC LIMIT 1
+       )
+       ORDER BY observed_at DESC, source_id DESC, source_event_id DESC, trigger_id`,
+      limit,
+    ).map((row) => ({
+      url: row["url"] as string,
+      observedAt: row["observed_at"] as string,
+      disposition: row["disposition"] as OperatorIntake["disposition"],
+      reason: row["reason"] as string | null,
+    }));
+  }
+
   // --- decisions and tickets -----------------------------------------------------------------
 
   /**
@@ -545,13 +604,15 @@ export class Store {
 
   /** Tickets in operator-list order, with the fields needed by CLI and dashboard clients. */
   operatorTickets(): OperatorTicket[] {
-    return this.#all("SELECT id FROM ticket ORDER BY id DESC").map((row) => this.#operatorTicket(row["id"] as number));
+    const now = this.#now();
+    return this.#all("SELECT id FROM ticket ORDER BY id DESC")
+      .map((row) => this.#operatorTicket(this.ticketContext(row["id"] as number), now));
   }
 
   /** One ticket and its durable operator-visible timeline. */
   operatorTicket(ticketId: number): OperatorTicketDetail {
-    const summary = this.#operatorTicket(ticketId);
     const context = this.ticketContext(ticketId);
+    const summary = this.#operatorTicket(context, this.#now());
     const triggers = this.#all(
       `SELECT "trigger".* FROM "trigger" JOIN subscription ON subscription.thread_id = "trigger".thread_id
        WHERE subscription.ticket_id = ? ORDER BY "trigger".occurred_at, "trigger".id`,
@@ -589,10 +650,46 @@ export class Store {
     return { tickets: { open: counts.get("open") ?? 0, paused: counts.get("paused") ?? 0, ended: counts.get("ended") ?? 0 }, runningWorkers, stuckTickets, tokensToday: today };
   }
 
-  #operatorTicket(ticketId: number): OperatorTicket {
-    const ticket = this.getTicket(ticketId);
-    const context = this.ticketContext(ticketId);
-    return { ...ticket, thread: context.thread, assignment: this.latestAssignment(ticketId), budget: this.ticketBudget(ticketId) };
+  #operatorTicket({ ticket, thread }: TicketContext, now: Date): OperatorTicket {
+    const assignment = this.latestAssignment(ticket.id);
+    const budget = this.ticketBudget(ticket.id);
+    const budgetAt = ticket.endedAt === null ? now : new Date(ticket.endedAt);
+    const prUrls = this.#all(
+      `SELECT thread.url FROM subscription JOIN thread ON thread.id = subscription.thread_id
+       WHERE subscription.ticket_id = ? AND thread.kind = 'pull_request' ORDER BY thread.number`,
+      ticket.id,
+    ).map((row) => row["url"] as string);
+    const candidate = assignment === null ? null : this.mergeCandidateForAssignment(assignment.id);
+    const failures = this.#all(
+      `SELECT id, started_at,
+         CASE WHEN started_at IS NULL THEN ended_at ELSE outcome_at END AS at,
+         CASE WHEN started_at IS NULL THEN end_reason ELSE last_error END AS reason
+       FROM assignment
+       WHERE ticket_id = ? AND (outcome = 'failed' OR (started_at IS NULL AND state = 'ended'))
+       ORDER BY at DESC, id DESC LIMIT 20`,
+      ticket.id,
+    ).map((row): OperatorFailure => ({
+      assignmentId: row["id"] as number,
+      kind: row["started_at"] === null ? "dispatch" : "worker",
+      at: row["at"] as string,
+      reason: row["reason"] as string | null,
+    }));
+    return {
+      ...ticket, thread, assignment, budget, prUrls, failures,
+      latestFailure: failures[0] ?? null,
+      mergeCandidate: candidate === null ? null : {
+        prNumber: candidate.prNumber, policy: candidate.policy,
+        blockingReason: candidate.blockingReason, quietDeadline: candidate.quietDeadline,
+      },
+      budgetUsage: {
+        time: budgetUsage(budget, "time", budgetAt),
+        idle: budgetUsage(budget, "idle", budgetAt),
+        turns: budgetUsage(budget, "turns", budgetAt),
+        tokens: budgetUsage(budget, "tokens", budgetAt),
+        escalations: budgetUsage(budget, "escalations", budgetAt),
+      },
+      budgetWarning: budgetWarning(budget, budgetAt),
+    };
   }
 
   /** The ticket with the thread, decision reason and trigger URLs that opened it. */

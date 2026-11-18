@@ -5,7 +5,7 @@ import { chmod, mkdir, readFile, rm } from "node:fs/promises";
 import { availableParallelism } from "node:os";
 import { createServer, type Server } from "node:http";
 import { dirname, join } from "node:path";
-import type { Store } from "../store/store.ts";
+import type { OperatorStatus, Store } from "../store/store.ts";
 
 export interface LocalApi {
   start(): Promise<void>;
@@ -20,10 +20,28 @@ export interface ApiControl {
   preview(): Promise<string>;
 }
 
+export interface WatchdogHealth {
+  lastAttemptAt: string | null;
+  ok: boolean | null;
+  lastSuccessAt: string | null;
+  error: string | null;
+}
+
+export interface OperatorDaemonStatus extends OperatorStatus {
+  watchdog: WatchdogHealth;
+  tickIntervalSeconds: number | null;
+  machine: {
+    slots: { total: number; used: number; label: "CPU parallelism" };
+    temperature: number | null;
+  };
+}
+
 export interface LocalApiOptions {
   socketPath?: string;
   control: ApiControl;
   temperature?: () => Promise<number | null>;
+  watchdogHealth?: () => WatchdogHealth;
+  tickIntervalSeconds?: number;
 }
 
 export function defaultSocketPath(env: Record<string, string | undefined> = process.env): string {
@@ -40,10 +58,23 @@ export function localApi(store: Store, options: LocalApiOptions): LocalApi {
     const url = new URL(request.url ?? "/", "http://localhost");
     try {
       if (request.method === "GET" && url.pathname === "/v1/status") {
-        return reply(response, 200, { ...store.operatorStatus(), machine: {
-          slots: { total: availableParallelism(), used: store.runningAssignments().length },
-          temperature: await (options.temperature ?? latestTemperature)(),
-        } });
+        const temperature = await (options.temperature ?? latestTemperature)();
+        const status = store.operatorStatus();
+        const body: OperatorDaemonStatus = {
+          ...status,
+          watchdog: options.watchdogHealth?.() ?? { lastAttemptAt: null, ok: null, lastSuccessAt: null, error: null },
+          tickIntervalSeconds: options.tickIntervalSeconds ?? null,
+          machine: { slots: { total: availableParallelism(), used: status.runningWorkers.length, label: "CPU parallelism" }, temperature },
+        };
+        return reply(response, 200, body);
+      }
+      if (request.method === "GET" && url.pathname === "/v1/intake") {
+        const value = url.searchParams.get("limit") ?? "50";
+        const limit = Number(value);
+        if (!/^[1-9]\d*$/.test(value) || !Number.isSafeInteger(limit)) {
+          return reply(response, 400, { error: "limit must be a positive whole number" });
+        }
+        return reply(response, 200, store.operatorIntake(limit));
       }
       if (request.method === "GET" && url.pathname === "/v1/tickets") return reply(response, 200, store.operatorTickets());
       const ticket = /^\/v1\/tickets\/([1-9]\d*)$/.exec(url.pathname);

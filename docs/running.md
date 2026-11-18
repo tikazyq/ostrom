@@ -25,6 +25,18 @@ The operator uses `ostrom status`, `tickets`, `show`, `pause`, `resume`, `stop`,
 read-only commands can inspect `OSTROM_DB` directly while the daemon is down;
 mutating controls require the daemon.
 
+`GET /v1/intake?limit=50` on the Unix socket returns a JSON array, newest observation first.
+`limit` defaults to 50 and accepts a positive whole number. Each row has `url`, `observedAt`
+(UTC), `disposition`, and `reason`. For triggers the disposition is the latest Router verdict
+(`accept`, `ignore`, or `stop`), or `awaiting_decision` with a null reason if there is no recorded
+Router decision. Follow-ups and commands can be handled without a Router decision.
+
+An `excluded` row records a recent issue opening seen by the poller with `missing_mention`
+or `unauthorized_author`. Repeated polls preserve the first receipt, and the receipt contains
+no issue body. If an edit later makes an excluded issue eligible, its trigger can appear alongside
+that earlier receipt. Intake covers stored triggers and these two issue exclusions. The daemon
+starts recording exclusions when it first polls with this feature enabled.
+
 Developer-only one-shot passes remain available as `ostromd dev <pass>`:
 `poll`, `send`, `dispatch <ticket>`, `observe`, `commands`, `route`, `watchdog`,
 `merge`, `route-candidates`, and `tick`. They are retained for their existing tests and

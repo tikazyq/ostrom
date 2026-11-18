@@ -1,12 +1,14 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { get } from "node:http";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { test } from "node:test";
+import { defaultSocketPath, type OperatorDaemonStatus } from "../api/server.ts";
 import { FakeGitHub } from "../github/fake-github.ts";
-import { Store } from "../store/store.ts";
+import { Store, type OperatorIntake } from "../store/store.ts";
 import { FakeRunner } from "../worker/fake-runner.ts";
 import { loadConfig, loadRouterConfig, loadWatchdogConfig, loadWorkerConfig } from "./config.ts";
 import { main, TICK, type MainDeps } from "./main.ts";
@@ -394,6 +396,75 @@ test("tick and run check every variable before any pass", async () => {
     assert.match(run.err[0]!, /OSTROM_ROUTER_HARNESS/);
   }
 });
+
+test(
+  "run exposes intake and Watchdog read health, resetting health on restart",
+  withDb(async (dbPath) => {
+    const env = { ...tickEnv(dbPath), XDG_RUNTIME_DIR: dirname(dbPath) };
+    const socketPath = defaultSocketPath(env);
+    const read = <T>(path: string): Promise<T> => new Promise((resolve, reject) => {
+      const request = get({ socketPath, path }, (response) => {
+        response.setEncoding("utf8");
+        let text = "";
+        response.on("data", (chunk: string) => { text += chunk; });
+        response.on("end", () => {
+          try {
+            assert.equal(response.statusCode, 200);
+            resolve(JSON.parse(text) as T);
+          } catch (error) { reject(error); }
+        });
+        response.on("error", reject);
+      });
+      request.on("error", reject);
+    });
+    const status = () => read<OperatorDaemonStatus>("/v1/status");
+    const github = new FakeGitHub(() => new Date());
+    github.issue(7, false, { body: "A request without a mention" });
+    const stop = new AbortController();
+    const snapshots: OperatorDaemonStatus[] = [];
+    let reads = 0;
+    const validSemonRead = semonAnswer(20, []);
+    const run = deps(env, github.gh, async () => {
+      reads++;
+      if (reads === 2) return { code: 1, stdout: "", stderr: "index unavailable\nadditional details" };
+      return validSemonRead();
+    });
+    run.deps.stop = stop.signal;
+    run.deps.sleep = async () => {
+      snapshots.push(await status());
+      if (snapshots.length === 3) stop.abort();
+    };
+    assert.equal(await main(["run", "--interval", "30"], run.deps), 0);
+    const [healthy, failed, recovered] = snapshots.map((snapshot) => snapshot.watchdog);
+    assert.equal(healthy!.ok, true);
+    assert.match(healthy!.lastAttemptAt!, /^\d{4}-\d\d-\d\dT/);
+    assert.match(healthy!.lastSuccessAt!, /^\d{4}-\d\d-\d\dT/);
+    assert.equal(failed!.ok, false);
+    assert.equal(failed!.lastSuccessAt, healthy!.lastSuccessAt);
+    assert.equal(failed!.error, "semon query stalls exited 1: index unavailable");
+    assert.equal(recovered!.ok, true);
+    assert.equal(recovered!.error, null);
+    assert.equal(snapshots[0]!.tickIntervalSeconds, 30);
+    assert.equal(snapshots[0]!.machine.slots.label, "CPU parallelism");
+
+    const stopAgain = new AbortController();
+    let atRestart: OperatorDaemonStatus | undefined;
+    let intake: OperatorIntake[] | undefined;
+    const restarted = deps(env, github.gh, async () => {
+      atRestart = await status();
+      intake = await read<OperatorIntake[]>("/v1/intake?limit=2");
+      stopAgain.abort();
+      return validSemonRead();
+    });
+    restarted.deps.stop = stopAgain.signal;
+    assert.equal(await main(["run", "--interval", "15"], restarted.deps), 0);
+    assert.deepEqual(atRestart?.watchdog, { lastAttemptAt: null, ok: null, lastSuccessAt: null, error: null });
+    assert.equal(atRestart?.tickIntervalSeconds, 15);
+    assert.deepEqual(intake?.map(({ url, disposition, reason }) => [url, disposition, reason]), [
+      [`https://github.com/${github.repo}/issues/7`, "excluded", "missing_mention"],
+    ]);
+  }),
+);
 
 test("run needs --interval with whole seconds", async () => {
   for (const argv of [["run"], ["run", "60"], ["run", "--interval"], ["run", "--interval", "0"], ["run", "--interval", "1.5"], ["tick", "x"], ["watchdog", "1"]]) {

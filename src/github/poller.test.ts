@@ -98,10 +98,14 @@ test("a newly opened issue that asks Ostrom becomes one allowlisted trigger", as
   assert.equal(count("trigger"), 1);
   assert.deepEqual((await poll()).candidates, []);
   assert.equal(count("trigger"), 1);
+  github.edit(github.issues.get(7)!, "removed the mention", at(11));
+  setNow(11);
+  await poll();
+  assert.equal(count("intake_receipt"), 0, "the opening already became a trigger");
 });
 
-test("only an allowlisted opened issue that asks Ostrom becomes a trigger", async () => {
-  const { github, poll, count, setNow } = await fixture();
+test("excluded issue openings have one body-free receipt across overlap polls", async () => {
+  const { db, github, poll, count, setNow } = await fixture();
   github.issue(7, false, { login: "alice", body: "please fix this", at: at(1) });
   github.issue(8, false, { login: "mallory", body: "@ostrom please fix this", at: at(2) });
   github.issue(9, false, { login: "alice", body: `@ostrom please fix this\n\n${replyMarker("ack-1")}`, at: at(3) });
@@ -112,6 +116,21 @@ test("only an allowlisted opened issue that asks Ostrom becomes a trigger", asyn
   assert.equal(result.droppedOwn, 1);
   assert.equal(result.droppedNotAllowed, 1);
   assert.equal(count("trigger"), 0);
+  assert.equal(count("thread"), 0);
+  const receipts = () => db.prepare("SELECT * FROM intake_receipt ORDER BY source_event_id").all().map((row) => ({ ...row }));
+  const initial = receipts();
+  assert.deepEqual(initial, [
+    { source_id: 1, source_event_id: "I_7:opened", url: `https://github.com/${github.repo}/issues/7`, observed_at: at(10).toISOString(), reason: "missing_mention" },
+    { source_id: 1, source_event_id: "I_8:opened", url: `https://github.com/${github.repo}/issues/8`, observed_at: at(10).toISOString(), reason: "unauthorized_author" },
+  ]);
+  setNow(11);
+  await poll();
+  assert.deepEqual(receipts(), initial);
+
+  github.edit(github.issues.get(7)!, "@ostrom please fix this", at(12));
+  setNow(12);
+  assert.deepEqual((await poll()).candidates.map(({ kind }) => kind), ["issue_opened"]);
+  assert.deepEqual(receipts(), initial, "admission does not erase the earlier exclusion");
 });
 
 test("an open issue update after its ticket ended does not become a reopen", async () => {

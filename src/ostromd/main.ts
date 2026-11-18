@@ -2,7 +2,7 @@
 // ostromd: the daemon that runs intake, filtering, fan-out, the outbox and the Watchdog.
 // See docs/direction.md. The operator starts only `run`; individual passes remain under `dev`.
 
-import { defaultSocketPath, localApi } from "../api/server.ts";
+import { defaultSocketPath, localApi, type WatchdogHealth } from "../api/server.ts";
 import { operatorControls, routeCommands } from "../commands/commands.ts";
 import { renderMergeEligibilityPreview } from "../github/preview.ts";
 import { mergePass } from "../github/merge-pass.ts";
@@ -60,6 +60,7 @@ export interface MainDeps {
   env: Record<string, string | undefined>;
   gh: GhRunner;
   semon: ProcessRunner;
+  onSemonRead?: (attemptedAt: Date, error: string | null) => void;
   stdout: (line: string) => void;
   stderr: (line: string) => void;
   /** Waits between ticks of `run`; resolves early when `stop` aborts. */
@@ -154,8 +155,19 @@ async function run(intervalSeconds: number, deps: MainDeps): Promise<number> {
   let code = 0;
   const owned = openWorkers(deps);
   const controls = operatorControls(owned.store, owned.workers, deps.gh, config.repo);
+  let watchdogHealth: WatchdogHealth = { lastAttemptAt: null, ok: null, lastSuccessAt: null, error: null };
+  const onSemonRead: NonNullable<MainDeps["onSemonRead"]> = (attemptedAt, error) => {
+    watchdogHealth = {
+      lastAttemptAt: attemptedAt.toISOString(),
+      ok: error === null,
+      lastSuccessAt: error === null ? new Date().toISOString() : watchdogHealth.lastSuccessAt,
+      error: error === null ? null : error.split(/\r?\n/, 1)[0]!.slice(0, 300),
+    };
+  };
   const api = localApi(owned.store, {
     socketPath: defaultSocketPath(deps.env),
+    watchdogHealth: () => watchdogHealth,
+    tickIntervalSeconds: intervalSeconds,
     control: {
       ...controls,
       extend: async (ticketId, increases) => { owned.store.extendTicketBudget(ticketId, increases); },
@@ -168,7 +180,7 @@ async function run(intervalSeconds: number, deps: MainDeps): Promise<number> {
   try {
     await api.start();
     while (!deps.stop.aborted) {
-      code = await tick({ ...deps, workers: owned.workers, store: owned.store });
+      code = await tick({ ...deps, workers: owned.workers, store: owned.store, onSemonRead });
       if (deps.stop.aborted) break;
       await deps.sleep(intervalSeconds * 1000, deps.stop);
     }
@@ -318,7 +330,9 @@ export async function main(argv: readonly string[], deps: MainDeps = defaults): 
     }
     if (command === "watchdog") {
       const { idleMinutes } = loadWatchdogConfig(deps.env);
-      const pass = await watchdog({ store, semon: deps.semon, idleMinutes });
+      const pass = await watchdog({ store, semon: deps.semon, idleMinutes,
+        ...(deps.onSemonRead === undefined ? {} : { onSemonRead: deps.onSemonRead }),
+      });
       const ladder = await advanceStuckLadder(store, workers());
       for (const checked of pass.checked) deps.stdout(JSON.stringify(checked));
       for (const failure of pass.failed) deps.stderr(`ostromd watchdog: ${failure.what} failed: ${failure.error}`);
