@@ -186,9 +186,9 @@ test("a merged PR leaves the attempt to the Router's outcome; a PR closed unmerg
 });
 
 test("redirect and control receipts are written only after their turns are stored", async (t) => {
-  for (const [body, command] of [["please revise", "redirect"], ["@ostrom pause", "pause"], ["@ostrom stop", "stop"]]) {
+  for (const [body, command] of [["please revise", "redirect"], ["@ostrom pause", "pause"], ["@ostrom stop", "stop"]] as const) {
     const { store, github, runner, workers, ticketId, comment } = fixture();
-    const triggerId = comment("pending", "alice", body!);
+    const triggerId = comment("pending", "alice", body);
     const enqueue = t.mock.method(store, "enqueueWorkerTurn", () => { throw new Error("queue write failed"); });
 
     const pass = await routeCommands(store, workers, github.gh, REPO);
@@ -196,7 +196,7 @@ test("redirect and control receipts are written only after their turns are store
     assert.deepEqual(store.pendingCommands().map((item) => item.trigger.id), [triggerId]);
     assert.equal(store.getTicket(ticketId).state, "open");
     assert.equal(store.stopRequestedAt(ticketId), null);
-    assert.deepEqual(runner.sessions, []);
+    assert.equal(runner.sessions.length, 0);
 
     enqueue.mock.restore();
     assert.deepEqual((await routeCommands(store, workers, github.gh, REPO)).handled.map((item) => item.command), [command]);
