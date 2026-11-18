@@ -52,6 +52,10 @@ test("dispatch makes the worktree, starts the session with the brief and stores 
     ["running", "codex", "gpt-6-luna", "sess-1", worktree, dispatched.branch, "host", 1],
   );
   assert.notEqual(a.turnStartedAt, null, "the first turn is still running");
+  assert.deepEqual(store.operatorTicket(ticketId).turns, [{
+    id: 1, assignmentId: a.id, ticketId, kind: "dispatch", status: "running", startedAt: a.turnStartedAt, endedAt: null,
+    harness: "codex", requestedModel: "gpt-6-luna", requestedEffort: null, observedModel: null, observedEffort: null, freshTokens: null, result: null,
+  }]);
   const session = runner.sessions[0]!;
   assert.equal(session.options.cwd, worktree);
   assert.equal(session.options.model, "gpt-6-luna");
@@ -85,12 +89,13 @@ test("cancelling an in-flight turn lets its queued replacement run without a can
   const session = runner.sessions[0]!;
   assert.equal(workers.cancel(1), true);
   session.auto = true;
-  workers.deliver(1, "replacement", "continue", () => {});
+  workers.deliver(1, "redirect-1-1", "continue", () => {});
   await workers.drain();
   assert.deepEqual(session.prompts.slice(-1), [workerTurnPrompt("continue")]);
   assert.equal(store.getAssignment(1).turnStartedAt, null);
   assert.equal(store.getAssignment(1).outcome, null);
   assert.equal(session.maxRunning, 1);
+  assert.deepEqual(store.workerTurns(ticketId).map(({ kind, status }) => [kind, status]), [["dispatch", "cancelled"], ["redirect", "completed"]]);
 });
 
 test("a reached ticket budget pauses after the current turn and asks the Worker to push WIP", async () => {
@@ -102,6 +107,7 @@ test("a reached ticket budget pauses after the current turn and asks the Worker 
   assert.equal(store.getTicket(ticketId).pauseCause, "budget reached: turns");
   assert.match(runner.sessions[0]!.prompts[1]!, /Push your work in progress/);
   assert.equal(store.getAssignment(1).turns, 2);
+  assert.deepEqual(store.workerTurns(ticketId).map(({ kind }) => kind), ["dispatch", "budget_pause"]);
 });
 
 test("a turn cancelled at its turn limit still pauses the ticket for budget", async () => {
@@ -136,6 +142,7 @@ test("a session that does not start ends the assignment with the reason and reth
   const a = store.getAssignment(1);
   assert.deepEqual([a.state, a.endReason, a.sessionId], ["ended", "no login", null]);
   assert.equal(store.abandonedAssignments().length, 1);
+  assert.deepEqual(store.workerTurns(ticketId).map(({ status, result }) => [status, result]), [["failed", "no login"]]);
 });
 
 test("a worktree that cannot be made ends the assignment with the reason", async () => {
@@ -288,6 +295,9 @@ test("a stop cuts off the running turn, starts no queued one, and leaves the tur
   await restarted.drain();
   assert.deepEqual(runner.sessions.at(-1)!.prompts, [workerTurnPrompt(INTERRUPTED_PROMPT), workerTurnPrompt("next")]);
   assert.equal(store.getAssignment(1).turnStartedAt, null);
+  assert.deepEqual(store.workerTurns(ticketId).map(({ kind, status }) => [kind, status]), [
+    ["dispatch", "interrupted"], ["recovery", "completed"], ["follow_up", "completed"],
+  ]);
 });
 
 function rollout(model: string | null, thread = "sess-1") {
@@ -296,7 +306,7 @@ function rollout(model: string | null, thread = "sess-1") {
     mkdirSync(join(dir, "2026", "11", "09"), { recursive: true });
     writeFileSync(
       join(dir, "2026", "11", "09", `rollout-2026-11-09T01-02-03-${thread}.jsonl`),
-      JSON.stringify({ type: "turn_context", payload: { model } }) + "\n",
+      JSON.stringify({ timestamp: "2026-11-09T12:00:01.000Z", type: "turn_context", payload: { model, effort: "high" } }) + "\n",
     );
   }
   return dir;
@@ -305,10 +315,14 @@ function rollout(model: string | null, thread = "sess-1") {
 test("Codex: the recorded model matches, so the assignment carries on", async () => {
   const dir = rollout("gpt-6-luna");
   try {
-    const { store, ticketId, workers } = fixture({ codexSessions: dir });
+    const { store, runner, ticketId, workers } = fixture({ codexSessions: dir, config: { ...config, effort: "low" } });
     await workers.dispatch(ticketId);
     await workers.drain();
     assert.equal(store.getAssignment(1).state, "running");
+    assert.deepEqual(runner.sessions[0]?.efforts, ["low"]);
+    const turn = store.workerTurns(ticketId)[0]!;
+    assert.deepEqual([turn.status, turn.requestedModel, turn.requestedEffort, turn.observedModel, turn.observedEffort, turn.freshTokens],
+      ["completed", "gpt-6-luna", "low", "gpt-6-luna", "high", 12]);
   } finally {
     rmSync(dir, { recursive: true });
   }
@@ -319,11 +333,14 @@ test("Codex: a different model or an unreadable record ends the assignment with 
     const dir = rollout(model);
     try {
       const { store, ticketId, workers } = fixture({ codexSessions: dir });
+      store.setTicketBudget(ticketId, { timeMinutes: 480, idleMinutes: 30, turns: 1, tokens: 1_000_000, escalations: 0 });
       await workers.dispatch(ticketId);
       await workers.drain();
       const a = store.getAssignment(1);
       assert.equal(a.state, "ended");
       assert.match(a.endReason!, reason);
+      const turn = store.workerTurns(ticketId)[0]!;
+      assert.deepEqual([turn.status, turn.observedModel, turn.result], ["failed", model, a.endReason]);
       assert.equal(store.abandonedAssignments().length, 1, "the Router owes a reply");
     } finally {
       rmSync(dir, { recursive: true });
@@ -332,8 +349,13 @@ test("Codex: a different model or an unreadable record ends the assignment with 
 });
 
 test("Claude turns are not checked against a rollout", async () => {
-  const { store, ticketId, workers } = fixture({ codexSessions: "/does/not/exist" }, "claude");
+  const { store, runner, ticketId, workers } = fixture({ codexSessions: "/does/not/exist" }, "claude");
+  runner.hold = true;
   await workers.dispatch(ticketId);
+  runner.sessions[0]!.model = "gateway-haiku";
+  runner.sessions[0]!.release();
   await workers.drain();
   assert.equal(store.getAssignment(1).state, "running");
+  const turn = store.workerTurns(ticketId)[0]!;
+  assert.deepEqual([turn.requestedModel, turn.observedModel, turn.observedEffort, turn.status], [config.model, "gateway-haiku", null, "completed"]);
 });

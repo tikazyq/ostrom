@@ -7,8 +7,9 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { promisify } from "node:util";
 import { test } from "node:test";
-import type { SDKResultSuccess, SDKSystemMessage } from "@anthropic-ai/claude-agent-sdk";
-import type { AgentMessageItem, ItemCompletedEvent, ThreadStartedEvent, TurnCompletedEvent } from "@openai/codex-sdk";
+import type { SDKMessage, SDKResultSuccess, SDKSystemMessage } from "@anthropic-ai/claude-agent-sdk";
+import type { AgentMessageItem, Codex, ItemCompletedEvent, ThreadStartedEvent, TurnCompletedEvent } from "@openai/codex-sdk";
+import { claudeRunner, codexRunner } from "./runner.ts";
 
 // The fixture projections are the fields the runner reads. Referencing SDK types
 // here makes removal or type changes in those fields a compile-time failure.
@@ -61,4 +62,35 @@ test("recorded Codex events retain the fields consumed by the runner", () => {
   assert.equal(completed.type, "turn.completed");
   assert.equal(typeof completed.usage.input_tokens, "number"); assert.equal(typeof completed.usage.cached_input_tokens, "number");
   assert.equal(typeof completed.usage.output_tokens, "number");
+});
+
+test("Claude passes effort on each query and resumes the same session", async () => {
+  const events = fixture("claude") as SDKMessage[];
+  const calls: unknown[] = [];
+  const session = claudeRunner({}, async function* ({ options }) {
+    calls.push({ effort: options?.effort, resume: options?.resume });
+    yield* events;
+  }).start({ cwd: "/tmp", model: "haiku" });
+  const first = await session.send("first", undefined, { effort: "low" });
+  await assert.rejects(session.send("unsupported", undefined, { effort: "minimal" }), /Claude does not support reasoning effort minimal/);
+  const next = await session.send("next", undefined, { effort: "xhigh" });
+  assert.ok(first.sessionId);
+  assert.equal(next.sessionId, first.sessionId);
+  assert.deepEqual(calls, [{ effort: "low", resume: undefined }, { effort: "xhigh", resume: first.sessionId }]);
+});
+
+test("Codex passes effort as a thread option and resumes the same thread", async () => {
+  const events = fixture("codex") as [ThreadStartedEvent, CodexMessage, TurnCompletedEvent];
+  const nativeId = events[0].thread_id;
+  type Options = Parameters<Codex["startThread"]>[0];
+  const calls: unknown[] = [];
+  const thread = { runStreamed: async () => ({ events: (async function* () { yield* events; })() }) };
+  const client = {
+    startThread(options: Options) { calls.push({ effort: options?.modelReasoningEffort }); return thread; },
+    resumeThread(id: string, options: Options) { calls.push({ id, effort: options?.modelReasoningEffort }); return thread; },
+  } as unknown as Pick<Codex, "startThread" | "resumeThread">;
+  const session = codexRunner({}, () => client).start({ cwd: "/tmp", model: "gpt-6-luna" });
+  assert.equal((await session.send("first", undefined, { effort: "low" })).sessionId, nativeId);
+  assert.equal((await session.send("next", undefined, { effort: "high" })).sessionId, nativeId);
+  assert.deepEqual(calls, [{ effort: "low" }, { id: nativeId, effort: "high" }]);
 });

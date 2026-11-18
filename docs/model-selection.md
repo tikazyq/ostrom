@@ -1,7 +1,9 @@
 # Model selection
 
-Status: accepted, 2026-11-17. This is a design; none of it exists yet. The operator asked for
-selection that is smarter than a fixed tier table, optimised for the operator's experience. On
+Status: accepted, 2026-11-17. Step 1 adds per-turn SDK effort and Worker turn records in
+`ostrom show <ticket>`. Runtime selection still uses the configured model and the harness default
+for effort; the later steps add selection and overrides. The operator asked for selection that is
+smarter than a fixed tier table, optimised for the operator's experience. On
 2026-11-17 they chose: **the lowest cost that still merges** as the default objective, **escalation
 within one harness** at first, allowed models **selected by an admin from those the harnesses
 report**, and the rule-3 amendment below.
@@ -128,9 +130,10 @@ model waits for the operator. Moving across harnesses is deferred until a real t
   CLI. An override is recorded and holds until changed; escalation never lowers it.
 - `ostrom models` lists the allowed models and their outcome history. `ostrom replay` shows each
   selection decision with its input.
-- Every turn's real model is confirmed from the native session record, which closes
-  [open question 2](direction.md#open-questions). A mismatch is a turn failure, not a silent run on
-  another model.
+- Codex model and effort come from the current turn's rollout context. An unverified or mismatched
+  model fails the turn and ends the assignment. Claude's reported model is recorded but not
+  compared, because a requested alias and the gateway's model name can legitimately differ.
+  Ostrom does not infer observed effort from the requested effort.
 
 ## Project rule 3
 

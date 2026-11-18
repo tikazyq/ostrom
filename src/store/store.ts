@@ -116,6 +116,29 @@ export interface Ticket {
 
 export type QueuedTurnKind = "follow_up" | "review" | "control" | "budget_pause" | "stuck" | "recovery";
 export type QueuedTurnState = "queued" | "running" | "finished" | "cancelled";
+export type WorkerTurnKind = QueuedTurnKind | "dispatch" | "redirect";
+export type WorkerTurnStatus = "running" | "completed" | "cancelled" | "failed" | "interrupted";
+
+export interface WorkerTurn {
+  id: number;
+  assignmentId: number;
+  ticketId: number;
+  startedAt: string;
+  endedAt: string | null;
+  harness: "claude" | "codex";
+  requestedModel: string;
+  requestedEffort: string | null;
+  observedModel: string | null;
+  observedEffort: string | null;
+  kind: WorkerTurnKind;
+  status: WorkerTurnStatus;
+  freshTokens: number | null;
+  result: string | null;
+}
+
+type WorkerTurnResult = Pick<WorkerTurn, "observedModel" | "observedEffort" | "freshTokens" | "result"> & {
+  status: Exclude<WorkerTurnStatus, "running" | "interrupted">;
+};
 
 /** A durable Worker prompt. Source pointers identify domain data, not a transcript. */
 export interface QueuedTurn {
@@ -183,6 +206,7 @@ export interface OperatorTicketDetail extends OperatorTicket {
   triggers: Trigger[];
   decisions: { id: number; verdict: Verdict; reason: string; decidedAt: string }[];
   assignments: Assignment[];
+  turns: WorkerTurn[];
   outbox: Reply[];
 }
 
@@ -638,7 +662,7 @@ export class Store {
        WHERE subscription.ticket_id = ? ORDER BY outbox.enqueued_at, outbox.id`,
       ticketId,
     ).map(toReply);
-    return { ...summary, context, triggers, decisions, assignments, outbox };
+    return { ...summary, context, triggers, decisions, assignments, turns: this.workerTurns(ticketId), outbox };
   }
 
   /** The daemon-wide counter view. Time zone is SQLite's UTC day, matching stored timestamps. */
@@ -916,6 +940,47 @@ export class Store {
       usage?.outputTokens ?? 0,
       assignmentId,
     );
+  }
+
+  startWorkerTurn(assignmentId: number, kind: WorkerTurnKind, effort: string | null): { id: number; startedAt: string } {
+    const startedAt = this.#stamp();
+    const row = this.#get(
+      `INSERT INTO turn (assignment_id, ticket_id, started_at, harness, requested_model, requested_effort, kind, status)
+       SELECT id, ticket_id, ?, harness, model, ?, ?, 'running' FROM assignment WHERE id = ? RETURNING id`,
+      startedAt, effort, kind, assignmentId,
+    );
+    return { id: row!["id"] as number, startedAt };
+  }
+
+  finishWorkerTurn(id: number, result: WorkerTurnResult): void {
+    this.#run(
+      `UPDATE turn SET ended_at = ?, status = ?, observed_model = ?, observed_effort = ?, fresh_tokens = ?, result = ?
+       WHERE id = ?`,
+      this.#stamp(), result.status, result.observedModel, result.observedEffort, result.freshTokens, result.result, id,
+    );
+  }
+
+  interruptWorkerTurns(): void {
+    this.#run("UPDATE turn SET ended_at = ?, status = 'interrupted' WHERE status = 'running'", this.#stamp());
+  }
+
+  workerTurns(ticketId: number): WorkerTurn[] {
+    return this.#all("SELECT * FROM turn WHERE ticket_id = ? ORDER BY id", ticketId).map((row) => ({
+      id: row["id"] as number,
+      assignmentId: row["assignment_id"] as number,
+      ticketId: row["ticket_id"] as number,
+      startedAt: row["started_at"] as string,
+      endedAt: row["ended_at"] as string | null,
+      harness: row["harness"] as WorkerTurn["harness"],
+      requestedModel: row["requested_model"] as string,
+      requestedEffort: row["requested_effort"] as string | null,
+      observedModel: row["observed_model"] as string | null,
+      observedEffort: row["observed_effort"] as string | null,
+      kind: row["kind"] as WorkerTurnKind,
+      status: row["status"] as WorkerTurnStatus,
+      freshTokens: row["fresh_tokens"] as number | null,
+      result: row["result"] as string | null,
+    }));
   }
 
   /** Records whether this failure repeats the immediately preceding failure. */

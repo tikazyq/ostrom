@@ -11,10 +11,10 @@ import { ghGet, type GhRunner } from "../github/gh.ts";
 import { renderReviewReply } from "../github/review-reply.ts";
 import { parseStuckReply, renderStuckReply } from "../watchdog/stuck.ts";
 import type { WorkerConfig } from "../ostromd/config.ts";
-import { rolloutModel } from "../session/rollout.ts";
+import { rolloutTurn } from "../session/rollout.ts";
 import type { Runner, Session, TurnResult } from "../session/runner.ts";
 import { createWorktree } from "../session/worktree.ts";
-import type { Assignment, AssignmentOutcome, QueuedTurnKind, Store } from "../store/store.ts";
+import type { Assignment, AssignmentOutcome, QueuedTurnKind, Store, WorkerTurnKind } from "../store/store.ts";
 import { workerBrief } from "./dispatch.ts";
 
 export interface Dispatched {
@@ -67,6 +67,8 @@ function queuedTurnKind(key: string): QueuedTurnKind {
   if (/^(operator-|pause-|resume-|stop-|close-issue-)/.test(key)) return "control";
   return "follow_up";
 }
+
+type ObservedTurn = { result: TurnResult; modelProblem: string | null };
 
 export class Workers {
   readonly #deps: WorkersDeps;
@@ -183,6 +185,7 @@ export class Workers {
   recover(): { resumed: number[]; interrupted: number[]; abandoned: number[] } {
     const { store } = this.#deps;
     const pass = { resumed: [] as number[], interrupted: [] as number[], abandoned: [] as number[] };
+    store.interruptWorkerTurns();
     for (const pending of store.pendingAssignments()) {
       store.abandonAssignment(pending.id, "ostromd stopped before the session started");
       pass.abandoned.push(pending.id);
@@ -345,13 +348,60 @@ export class Workers {
     return next;
   }
 
+  async #send(id: number, session: Session, kind: WorkerTurnKind, prompt: string, signal: AbortSignal): Promise<ObservedTurn> {
+    const { store, config, codexSessions } = this.#deps;
+    const { harness, model } = store.getAssignment(id);
+    const turn = store.startWorkerTurn(id, kind, config.effort ?? null);
+    let observedModel: string | null = null;
+    let observedEffort: string | null = null;
+    let modelProblem: string | null = null;
+    let failure: string | null = null;
+    let result: TurnResult | undefined;
+    try {
+      result = await session.send(prompt, signal, {
+        ...(config.effort === undefined ? {} : { effort: config.effort }),
+        onModel: (model) => { observedModel = model; },
+      });
+      observedModel = result.model ?? observedModel;
+    } catch (error) {
+      failure = error instanceof Error ? error.message : String(error);
+      throw error;
+    } finally {
+      if (!this.#stopping) {
+        if (harness === "codex" && codexSessions !== undefined) {
+          try {
+            const sessionId = result?.sessionId ?? store.getAssignment(id).sessionId;
+            if (sessionId === null) throw new Error("no session ID");
+            const observed = rolloutTurn(codexSessions, sessionId, turn.startedAt);
+            observedModel = observed.model;
+            observedEffort = observed.effort;
+            if (observedModel === null) throw new Error("rollout records no turn model");
+            if (observedModel !== model) modelProblem = `model mismatch: asked for ${model}, ran ${observedModel}`;
+          } catch (error) {
+            modelProblem = `model unverified: ${error instanceof Error ? error.message : String(error)}`;
+          }
+        }
+        const status = result?.status ?? (signal.aborted ? "cancelled" : "failed");
+        const verificationFailure = status === "completed" ? modelProblem : null;
+        store.finishWorkerTurn(turn.id, {
+          status: verificationFailure === null ? status : "failed",
+          observedModel,
+          observedEffort,
+          freshTokens: result?.usage == null ? null : result.usage.inputTokens + result.usage.outputTokens,
+          result: verificationFailure ?? (status === "failed" ? failure : null),
+        });
+      }
+    }
+    return { result: result!, modelProblem };
+  }
+
   async #firstTurn(id: number, session: Session, prompt: string): Promise<void> {
     const { store } = this.#deps;
     const controller = new AbortController();
     this.#inFlight.set(id, controller);
-    let result: TurnResult;
+    let turn: ObservedTurn;
     try {
-      result = await session.send(prompt, controller.signal);
+      turn = await this.#send(id, session, "dispatch", prompt, controller.signal);
     } catch (error) {
       if (this.#stopping) return;
       if (controller.signal.aborted) {
@@ -367,7 +417,7 @@ export class Workers {
       if (this.#inFlight.get(id) === controller) this.#inFlight.delete(id);
     }
     if (this.#stopping) return;
-    this.#finished(id, result);
+    this.#finished(id, turn);
   }
 
   async #turn(
@@ -390,14 +440,15 @@ export class Workers {
     const nextTurn = assignment.turns + 1;
     const turnId = `${assignment.sessionId}:${nextTurn}`;
     if (store.beginQueuedTurn(id, key, turnId) === null) return;
-    const turn = store.beginTurn(id);
-    if (turn !== nextTurn) throw new Error(`assignment ${id}: queued turn number changed`);
+    const turnNumber = store.beginTurn(id);
+    if (turnNumber !== nextTurn) throw new Error(`assignment ${id}: queued turn number changed`);
     onStart?.(turnId);
+    const kind = queued.kind === "follow_up" && key.startsWith("redirect-") ? "redirect" : queued.kind;
     const controller = new AbortController();
     this.#inFlight.set(id, controller);
-    let result: TurnResult;
+    let turn: ObservedTurn;
     try {
-      result = await session.send(workerTurnPrompt(queued.prompt), controller.signal);
+      turn = await this.#send(id, session, kind, workerTurnPrompt(queued.prompt), controller.signal);
     } catch (error) {
       if (this.#stopping) return;
       store.finishQueuedTurn(id, key);
@@ -413,7 +464,8 @@ export class Workers {
     }
     if (this.#stopping) return;
     store.finishQueuedTurn(id, key);
-    this.#finished(id, result);
+    this.#finished(id, turn);
+    const { result } = turn;
     const current = store.getAssignment(id);
     if (result.status === "completed" && current.state === "running" && current.outcome !== "failed") await onComplete?.(result);
     this.#callbacksByKey.delete(this.#callbackKey(id, key));
@@ -428,12 +480,17 @@ export class Workers {
     queueStatusCard(this.#deps.store, this.#deps.store.getAssignment(id).ticketId);
   }
 
-  #finished(id: number, result: TurnResult): void {
+  #finished(id: number, { result, modelProblem }: ObservedTurn): void {
     const { store } = this.#deps;
     // A late result still counts its usage, but cannot clear a failure or act for an ended assignment.
     store.endTurn(id, result.usage);
     const assignment = store.getAssignment(id);
     if (assignment.state !== "running" || assignment.outcome === "failed") return;
+    if (result.status === "completed" && modelProblem !== null) {
+      this.#deps.log?.(`assignment ${id}: ended: ${modelProblem}`);
+      store.endAssignment(id, modelProblem);
+      return;
+    }
     store.clearTurnError(id);
     // A cancelled turn still counts toward the turn and token limits.
     const reached = turnBudgetReached(store.ticketBudget(assignment.ticketId), new Date());
@@ -454,14 +511,6 @@ export class Workers {
       queueStatusCard(store, assignment.ticketId);
       return;
     }
-    if (assignment.harness === "codex" && this.#deps.codexSessions !== undefined) {
-      const reason = this.#modelProblem(assignment, this.#deps.codexSessions);
-      if (reason !== null) {
-        this.#deps.log?.(`assignment ${id}: ended: ${reason}`);
-        store.endAssignment(id, reason);
-        return;
-      }
-    }
     // Ostrom only aborts a turn to replace it. That cancellation is bookkeeping, not a terminal
     // Worker outcome: the next queued turn must still run on this assignment.
     this.#mark(id, null);
@@ -471,16 +520,6 @@ export class Workers {
   /** Records an outcome unless the Router ended the assignment while the turn ran. */
   #mark(id: number, outcome: AssignmentOutcome | null): void {
     if (this.#deps.store.getAssignment(id).state === "running") this.#deps.store.recordOutcome(id, outcome);
-  }
-
-  #modelProblem(assignment: Assignment, root: string): string | null {
-    let model: string;
-    try {
-      model = rolloutModel(root, assignment.sessionId!);
-    } catch (error) {
-      return `model unverified: ${error instanceof Error ? error.message : String(error)}`;
-    }
-    return model === assignment.model ? null : `model mismatch: asked for ${assignment.model}, ran ${model}`;
   }
 }
 

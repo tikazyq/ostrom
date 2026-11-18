@@ -7,12 +7,9 @@ const TAIL_BYTES = 2 * 1024 * 1024;
 
 export const codexSessionsDir = (): string => join(homedir(), ".codex", "sessions");
 
-/**
- * The model Codex recorded for the latest turn of a thread, read from its rollout file
- * (`<root>/YYYY/MM/DD/rollout-<time>-<threadId>.jsonl`). Throws when the record is missing or
- * names no model: an unreadable record is unverified, never assumed correct.
- */
-export function rolloutModel(root: string, threadId: string): string {
+/** Reads the latest native turn context, never taking model or effort from another record. */
+export function rolloutTurn(root: string, threadId: string, startedAt: string): { model: string | null; effort: string | null } {
+  const since = Date.parse(startedAt);
   const path = findRollout(root, threadId);
   const fd = openSync(path, "r");
   let text: string;
@@ -22,13 +19,24 @@ export function rolloutModel(root: string, threadId: string): string {
     const buffer = Buffer.alloc(length);
     readSync(fd, buffer, 0, length, size - length);
     text = buffer.toString("utf8");
+    if (size > length) {
+      const newline = text.indexOf("\n");
+      text = newline === -1 ? "" : text.slice(newline + 1);
+    }
   } finally {
     closeSync(fd);
   }
-  let model: string | undefined;
-  for (const match of text.matchAll(/"type":"turn_context","payload":\{[^]*?"model":"([^"]+)"/g)) model = match[1];
-  if (model === undefined) throw new Error(`rollout ${path} records no turn model`);
-  return model;
+  const lines = text.split("\n");
+  for (let index = lines.length - 1; index >= 0; index--) {
+    const line = lines[index]!;
+    if (!line.includes('"turn_context"')) continue;
+    const record = JSON.parse(line) as { type?: unknown; timestamp?: unknown; payload?: { model?: unknown; effort?: unknown } };
+    if (record.type !== "turn_context") continue;
+    if (typeof record.timestamp !== "string" || !(Date.parse(record.timestamp) >= since)) break;
+    const { model, effort } = record.payload ?? {};
+    return { model: typeof model === "string" && model !== "" ? model : null, effort: typeof effort === "string" && effort !== "" ? effort : null };
+  }
+  throw new Error(`rollout ${path} records no context for the current turn`);
 }
 
 function findRollout(root: string, threadId: string): string {

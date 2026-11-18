@@ -561,6 +561,28 @@ export const migrations: readonly string[] = [
   ) STRICT, WITHOUT ROWID;
   CREATE INDEX intake_receipt_recent ON intake_receipt (observed_at DESC);
   `,
+
+  // 30: Worker turn outcomes and model evidence, without prompts or transcripts.
+  `
+  CREATE TABLE turn (
+    id               INTEGER PRIMARY KEY,
+    assignment_id    INTEGER NOT NULL REFERENCES assignment (id),
+    ticket_id        INTEGER NOT NULL REFERENCES ticket (id),
+    started_at       TEXT NOT NULL,
+    ended_at         TEXT,
+    harness          TEXT NOT NULL CHECK (harness IN ('claude', 'codex')),
+    requested_model  TEXT NOT NULL,
+    requested_effort TEXT,
+    observed_model   TEXT,
+    observed_effort  TEXT,
+    kind             TEXT NOT NULL CHECK (kind IN ('dispatch', 'redirect', 'follow_up', 'review', 'control', 'budget_pause', 'stuck', 'recovery')),
+    status           TEXT NOT NULL CHECK (status IN ('running', 'completed', 'cancelled', 'failed', 'interrupted')),
+    fresh_tokens     INTEGER,
+    result           TEXT,
+    CHECK ((status = 'running') = (ended_at IS NULL))
+  ) STRICT;
+  CREATE INDEX turn_by_ticket ON turn (ticket_id, id);
+  `,
 ];
 
 /** Applies every migration newer than the database's version. Returns the resulting version. */

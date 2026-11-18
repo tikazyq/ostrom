@@ -416,13 +416,14 @@ test("merge-enabled migration refreshes previously tracked, delivered opened rep
   assert.notEqual(store.readyReplySentAt(assignment), null);
   store.close();
   const upgrade = new DatabaseSync(path);
-  upgrade.exec("DROP INDEX intake_receipt_recent; DROP TABLE intake_receipt;");
+  upgrade.exec("DROP TABLE turn; DROP INDEX intake_receipt_recent; DROP TABLE intake_receipt;");
   upgrade.prepare("DELETE FROM schema_version WHERE version >= 27").run();
   upgrade.close();
   store = Store.open(path, { now: () => now });
   try {
     assert.equal(store.readyReplyId(assignment), null);
     assert.equal(store.hasReply(opened), true);
+    assert.deepEqual(store.workerTurns(ticket), []);
     const pr = store.ensureThread({ sourceId: source.id, kind: "pull_request", number: 2, url: "https://github.com/o/r/pull/2" });
     store.subscribe(ticket, pr);
     const f = fixture();

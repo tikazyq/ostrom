@@ -11,8 +11,16 @@ export interface TurnResult {
   modelUsage?: Record<string, unknown>;
 }
 
+type CodexThreadOptions = NonNullable<Parameters<Codex["startThread"]>[0]>;
+export type ReasoningEffort = NonNullable<CodexThreadOptions["modelReasoningEffort"]>;
+
+export interface TurnOptions {
+  effort?: ReasoningEffort;
+  onModel?: (model: string) => void;
+}
+
 export interface Session {
-  send(prompt: string, signal?: AbortSignal): Promise<TurnResult>;
+  send(prompt: string, signal?: AbortSignal, turn?: TurnOptions): Promise<TurnResult>;
 }
 
 export interface SessionOptions {
@@ -59,8 +67,11 @@ export function claudeRunner(env: Record<string, string | undefined>, run: Claud
     requireOptions(options);
     let id = options.sessionId ?? null;
     let busy = false;
-    return { async send(prompt, signal) {
+    return { async send(prompt, signal, { effort, onModel } = {}) {
       if (busy) throw new Error("session already has a running turn");
+      if (effort !== undefined && effort !== "low" && effort !== "medium" && effort !== "high" && effort !== "xhigh" && effort !== "max") {
+        throw new Error(`Claude does not support reasoning effort ${effort}`);
+      }
       busy = true;
       const abortController = new AbortController();
       const abort = () => abortController.abort();
@@ -71,6 +82,7 @@ export function claudeRunner(env: Record<string, string | undefined>, run: Claud
         if (signal?.aborted) return { sessionId: id, text: "", status: "cancelled", usage: null, model };
         for await (const message of run({ prompt, options: {
           cwd: options.cwd, model: options.model, env, abortController,
+          ...(effort === undefined ? {} : { effort }),
           ...(options.sandbox === "read-only"
             ? { permissionMode: "plan" as const, disallowedTools: ["Bash", "Edit", "Write"] }
             : { permissionMode: "bypassPermissions" as const, allowDangerouslySkipPermissions: true }),
@@ -80,6 +92,7 @@ export function claudeRunner(env: Record<string, string | undefined>, run: Claud
             if (id === null) options.onSessionId?.(message.session_id);
             id = message.session_id;
             model = message.model;
+            onModel?.(model);
           }
           if (message.type === "result") {
             id = message.session_id;
@@ -121,14 +134,15 @@ export function codexRunner(config: CodexOptions, makeClient: CodexClientFactory
       // A read-only session (the Router) runs in a scratch directory that is not a Git repository.
       ...(options.sandbox === "read-only" ? { skipGitRepoCheck: true } : {}),
     };
-    const thread: CodexThread = id === null ? codex.startThread(threadOptions) : codex.resumeThread(id, threadOptions);
-    return { async send(prompt, signal) {
+    return { async send(prompt, signal, { effort } = {}) {
       if (busy) throw new Error("session already has a running turn");
       busy = true;
       let text = "";
       let lastNotice: string | null = null;
       try {
         if (signal?.aborted) return { sessionId: id, text, status: "cancelled", usage: null, model: null };
+        const turnOptions: CodexThreadOptions = { ...threadOptions, ...(effort === undefined ? {} : { modelReasoningEffort: effort }) };
+        const thread: CodexThread = id === null ? codex.startThread(turnOptions) : codex.resumeThread(id, turnOptions);
         const { events } = await thread.runStreamed(prompt, signal ? { signal } : {});
         for await (const event of events) {
           if (event.type === "thread.started") {

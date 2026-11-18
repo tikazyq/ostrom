@@ -9,6 +9,7 @@ import { hostname } from "node:os";
 
 import { loadAppConfig } from "../github/app.ts";
 import { loadMergePolicy, type MergePolicy } from "../github/merge-policy.ts";
+import type { ReasoningEffort } from "../session/runner.ts";
 
 export { loadBudgetDefaults, type BudgetDefaults } from "../budget/budgets.ts";
 
@@ -53,6 +54,7 @@ export interface WorkerConfig {
   worktrees: string;
   harness: "claude" | "codex";
   model: string;
+  effort?: ReasoningEffort;
   machine: string;
   /** House rules added to every brief, read from OSTROM_WORKER_RULES_FILE. */
   rules?: string;
