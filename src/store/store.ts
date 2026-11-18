@@ -1110,7 +1110,7 @@ export class Store {
     return { duplicate: Number(changes) === 0 };
   }
 
-  /** Every follow-up owed to an open ticket's Worker, including the first human reply to a ticket paused at public Stuck. */
+  /** Follow-ups for open tickets and replies that may clear a public stall, even on ended tickets. */
   pendingDeliveries(): PendingDelivery[] {
     return this.#all(
       `SELECT t.*, ticket.id AS p_ticket_id, worker.id AS p_assignment_id

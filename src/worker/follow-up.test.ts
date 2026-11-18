@@ -299,17 +299,23 @@ test("a trigger fans out to every open subscribed ticket; ended ones are skipped
   ]);
 });
 
-test("a ticket ended while paused at public Stuck is owed no follow-up", () => {
-  const { store, workers, pr, trigger, ticketId, assignmentId } = fixture();
-  store.recordStall({ assignmentId, semonReason: "no-output", detail: null });
-  const stall = store.unansweredStalls()[0]!;
-  store.publishStall(stall.id);
+test("a comment clears public Stuck on an ended ticket without delivering work", async () => {
+  const { store, runner, workers, pr, trigger, ticketId, assignmentId } = fixture();
+  const stallId = store.recordStall({ assignmentId, semonReason: "no-output", detail: null }).id;
+  store.publishStall(stallId);
+  store.pauseTicket(ticketId, STALL_PAUSE_CAUSE);
   store.endAssignment(assignmentId);
   store.endTicket(ticketId);
-  trigger(pr);
+  const commentId = trigger(pr);
 
-  assert.deepEqual(store.pendingDeliveries(), []);
+  assert.deepEqual(store.pendingDeliveries().map(({ trigger, assignmentId }) => [trigger.id, assignmentId]), [[commentId, null]]);
   assert.deepEqual(routeFollowUps(store, workers, ["alice"]), { queued: [], failed: [] });
+  await workers.drain();
+  assert.notEqual(store.getStall(stallId).clearedByHumanAt, null);
+  assert.equal(store.getTicket(ticketId).state, "ended");
+  assert.deepEqual(runner.sessions, []);
+  assert.deepEqual(store.pendingDeliveries(), []);
+  assert.deepEqual(store.undecidedTriggers(), []);
 });
 
 test("an open ticket with no running Worker holds its follow-up and reports it", () => {
