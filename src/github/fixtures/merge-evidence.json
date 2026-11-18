@@ -1,0 +1,63 @@
+{
+  "provenance": "Synthetic trimmed contract examples for the sandbox repository; not recorded API responses. Replace with a permitted sandbox capture before merge execution is enabled.",
+  "repo": "onsager-ai/ostrom-sandbox",
+  "number": 12,
+  "pr": {
+    "number": 12,
+    "state": "open",
+    "draft": false,
+    "mergeable": true,
+    "merged_at": null,
+    "merge_commit_sha": "test-merge-sha",
+    "merged_by": null,
+    "user": { "id": 1, "login": "worker" },
+    "head": { "sha": "head-sha", "ref": "ostrom/ticket-1-1", "repo": { "full_name": "onsager-ai/ostrom-sandbox" } },
+    "base": { "sha": "base-sha", "ref": "main", "repo": { "full_name": "onsager-ai/ostrom-sandbox" } }
+  },
+  "repository": { "full_name": "onsager-ai/ostrom-sandbox", "allow_squash_merge": true },
+  "protection": {
+    "url": "https://api.github.com/repos/onsager-ai/ostrom-sandbox/branches/main/protection",
+    "required_status_checks": { "strict": true, "contexts": ["check"], "checks": [{ "context": "check", "app_id": 15368 }] },
+    "required_pull_request_reviews": {
+      "dismiss_stale_reviews": true,
+      "require_code_owner_reviews": false,
+      "require_last_push_approval": false,
+      "required_approving_review_count": 0
+    }
+  },
+  "deniedProtection": {
+    "message": "Resource not accessible by integration",
+    "documentation_url": "https://docs.github.com/rest/branches/branch-protection#get-branch-protection",
+    "status": "403"
+  },
+  "rules": [],
+  "reviews": [],
+  "graph": {
+    "data": { "repository": { "pullRequest": {
+      "id": "PR_sandbox12",
+      "headRefOid": "head-sha",
+      "baseRefOid": "base-sha",
+      "mergeStateStatus": "CLEAN",
+      "reviewDecision": null,
+      "reviews": { "nodes": [], "pageInfo": { "hasNextPage": false, "endCursor": null } },
+      "reviewThreads": { "nodes": [], "pageInfo": { "hasNextPage": false, "endCursor": null } },
+      "headRef": { "target": {
+        "oid": "head-sha",
+        "statusCheckRollup": {
+          "state": "SUCCESS",
+          "contexts": {
+            "nodes": [{ "__typename": "CheckRun", "id": "CR_1", "databaseId": 101, "name": "check", "status": "COMPLETED", "conclusion": "SUCCESS", "checkSuite": { "id": "CS_1", "app": { "databaseId": 15368, "slug": "github-actions" } } }],
+            "pageInfo": { "hasNextPage": false, "endCursor": "context-1" }
+          }
+        },
+        "checkSuites": {
+          "nodes": [{ "id": "CS_1", "status": "COMPLETED", "conclusion": "SUCCESS", "app": { "databaseId": 15368, "slug": "github-actions" }, "workflowRun": {
+            "databaseId": 201, "event": "pull_request", "runNumber": 10, "runAttempt": 1,
+            "workflow": { "databaseId": 301, "name": "ci" }
+          }, "matchingPullRequests": { "nodes": [{ "number": 12 }], "pageInfo": { "hasNextPage": false, "endCursor": null } } }],
+          "pageInfo": { "hasNextPage": false, "endCursor": "suite-1" }
+        }
+      } }
+    } } }
+  }
+}

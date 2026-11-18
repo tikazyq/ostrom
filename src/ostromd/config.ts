@@ -6,6 +6,8 @@
 
 import { readFileSync } from "node:fs";
 import { hostname } from "node:os";
+import { loadMergePolicy } from "../github/merge-policy.ts";
+export { loadMergePolicy, type MergePolicy } from "../github/merge-policy.ts";
 
 export { loadBudgetDefaults, type BudgetDefaults } from "../budget/budgets.ts";
 
@@ -29,6 +31,7 @@ export function loadConfig(env: Record<string, string | undefined>): Config {
   }
   const dbPath = env["OSTROM_DB"]?.trim() ?? "";
   if (dbPath === "") throw new Error("OSTROM_DB must be the path to the store");
+  loadMergePolicy(env);
   return { repo, allowlist, dbPath };
 }
 

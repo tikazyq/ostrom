@@ -414,6 +414,32 @@ export const migrations: readonly string[] = [
   `
   CREATE INDEX delivery_by_assignment_turn ON delivery (assignment_id, turn_id);
   `,
+
+  // 23: Merge readiness data only. Preview does not populate this record; the later merge pass
+  // will establish ownership and freshly observed activity before starting a quiet window.
+  `
+  CREATE TABLE merge_candidate (
+    id INTEGER PRIMARY KEY,
+    assignment_id INTEGER NOT NULL REFERENCES assignment(id),
+    repository TEXT NOT NULL,
+    pull_request INTEGER NOT NULL CHECK (pull_request > 0),
+    head_repository TEXT NOT NULL,
+    head_ref TEXT NOT NULL,
+    base_ref TEXT NOT NULL,
+    head_sha TEXT NOT NULL,
+    base_sha TEXT NOT NULL,
+    policy_snapshot TEXT NOT NULL,
+    discovered_at TEXT NOT NULL,
+    observed_at TEXT NOT NULL,
+    activity_fingerprint TEXT,
+    activity_at TEXT,
+    ready_reply_id TEXT REFERENCES outbox(id),
+    ready_sent_at TEXT,
+    quiet_deadline TEXT,
+    blocking_reason TEXT,
+    UNIQUE (assignment_id, repository, pull_request)
+  ) STRICT;
+  `,
 ];
 
 /** Applies every migration newer than the database's version. Returns the resulting version. */

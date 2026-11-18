@@ -62,6 +62,7 @@ test("config comes from three required environment variables", () => {
   assert.throws(() => loadConfig({ OSTROM_REPO: "nope", OSTROM_ALLOWLIST: "a", OSTROM_DB: "x" }), /OSTROM_REPO/);
   assert.throws(() => loadConfig({ OSTROM_REPO: "o/r", OSTROM_ALLOWLIST: " , ", OSTROM_DB: "x" }), /OSTROM_ALLOWLIST/);
   assert.throws(() => loadConfig({ OSTROM_REPO: "o/r", OSTROM_ALLOWLIST: "a" }), /OSTROM_DB/);
+  assert.throws(() => loadConfig({ OSTROM_REPO: "o/r", OSTROM_ALLOWLIST: "a", OSTROM_DB: "db", OSTROM_MERGE_STRATEGY: "invalid" }), /OSTROM_MERGE_STRATEGY/);
 });
 
 test("poll with bad config exits non-zero", async () => {
