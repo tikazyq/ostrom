@@ -86,12 +86,53 @@ test("commands are case-insensitive and must start the comment", () => {
 
 test("Journey 1 command table is generated from the command contract", async () => {
   const experience = await readFile(new URL("../../docs/experience.md", import.meta.url), "utf8");
-  const actual = experience.match(/\| Say or do \| Effect \| Who may \| Acknowledged by \|\n(?:\|.*\n?){8}/)?.[0].trimEnd();
+  const actual = experience.match(/\| Say or do \| Effect \| Who may \| Acknowledged by \|\n(?:\|.*\n?){10}/)?.[0].trimEnd();
   assert.equal(actual, renderCommandTable());
 });
 
 test("the status-card controls come from the command contract", () => {
-  assert.equal(controlsLine(), "Controls: `@ostrom pause`, `@ostrom resume`, `@ostrom stop`, or reply to redirect.");
+  assert.equal(controlsLine(), "Controls: `@ostrom pause`, `@ostrom resume`, `@ostrom stop`, `@ostrom use <model>`, `@ostrom effort <level>`, or reply to redirect.");
+});
+
+test("admin overrides validate, acknowledge and never become Worker prompts", async () => {
+  const { store, github, workers, ticketId, comment } = fixture();
+  store.models.discovered("codex", ["gpt-6-luna", "sol"].map((id) => ({ harness: "codex", id, displayName: id, description: "", efforts: ["low", "high"], defaultEffort: "low" })));
+  for (const model of ["gpt-6-luna", "sol"]) store.models.change({ action: "allow", harness: "codex", model });
+  github.permissions.set("admin", "admin");
+  comment("model", "admin", "@ostrom use codex/sol");
+  comment("effort", "admin", "@ostrom effort low");
+  comment("invalid", "admin", "@ostrom effort max");
+  comment("unauthorized", "alice", "@ostrom use sol");
+  const pass = await routeCommands(store, workers, github.gh, REPO);
+  assert.deepEqual(pass.failed, []);
+  assert.deepEqual(pass.handled.map((item) => item.allowed), [true, true, false, false]);
+  assert.equal(store.ticketModel(ticketId)?.model, "sol");
+  assert.equal(store.ticketModel(ticketId)?.effort, "low");
+  assert.equal(store.getAssignment(1).model, "gpt-6-luna");
+  assert.deepEqual(store.unfinishedTurns(1), []);
+  assert.equal(store.dueReplies().filter((reply) => reply.kind === "reaction" && reply.reaction === "+1").length, 2);
+  assert.equal(store.dueReplies().filter((reply) => reply.kind === "reaction" && reply.reaction === "confused").length, 2);
+});
+
+test("a model override on a subscribed PR updates the issue ticket", async () => {
+  const { store, github, workers, ticketId } = fixture();
+  const source = store.ensureSource("github", REPO);
+  const pr = store.ensureThread({ sourceId: source.id, kind: "pull_request", number: 8, url: `https://github.com/${REPO}/pull/8` });
+  store.subscribe(ticketId, pr);
+  store.models.discovered("codex", [{ harness: "codex", id: "sol", displayName: "Sol", description: "", efforts: ["low"], defaultEffort: "low" }]);
+  store.models.change({ action: "allow", harness: "codex", model: "sol" });
+  github.permissions.set("admin", "admin");
+  store.insertTrigger({ sourceId: source.id, sourceEventId: "pr-model", threadId: pr, kind: "issue_comment", actor: "admin",
+    url: `https://github.com/${REPO}/pull/8#issuecomment-88`, occurredAt: new Date(), body: "@ostrom use codex/sol" });
+  const pass = await routeCommands(store, workers, github.gh, REPO);
+  assert.deepEqual(pass.failed, []);
+  assert.equal(store.ticketModel(ticketId)?.model, "sol");
+  assert.equal(store.getAssignment(1).model, "gpt-6-luna");
+});
+
+test("override parser recognizes missing values as invalid commands", () => {
+  assert.deepEqual(parseComment(" @OSTROM USE codex/sol"), { kind: "command", command: "use", value: "codex/sol" });
+  assert.deepEqual(parseComment("@ostrom effort"), { kind: "command", command: "effort", value: "" });
 });
 
 test("an issue author may pause, and a command is never a pending Worker delivery", async () => {

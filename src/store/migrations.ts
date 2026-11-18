@@ -655,6 +655,41 @@ export const migrations: readonly string[] = [
   ALTER TABLE queued_turn_v33 RENAME TO queued_turn;
   CREATE INDEX queued_turn_unfinished ON queued_turn (assignment_id, state) WHERE state IN ('queued', 'running');
   `,
+
+  // 34: Ticket model decisions and persistent overrides; session choices remain on assignments.
+  `
+  CREATE TABLE ticket_model (
+    ticket_id INTEGER PRIMARY KEY REFERENCES ticket(id),
+    harness TEXT NOT NULL CHECK (harness IN ('claude', 'codex')),
+    model TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    approved INTEGER NOT NULL CHECK (approved IN (0, 1)),
+    effort TEXT
+  ) STRICT;
+  CREATE TABLE model_decision (
+    id INTEGER PRIMARY KEY,
+    ticket_id INTEGER NOT NULL REFERENCES ticket(id),
+    kind TEXT NOT NULL,
+    value TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    decided_at TEXT NOT NULL
+  ) STRICT;
+  ALTER TABLE assignment ADD COLUMN model_reason TEXT;
+  ALTER TABLE turn ADD COLUMN model_reason TEXT;
+  ALTER TABLE turn ADD COLUMN effort_reason TEXT;
+  CREATE TABLE command_receipt_v34 (
+    trigger_id INTEGER NOT NULL REFERENCES "trigger"(id),
+    ticket_id INTEGER NOT NULL REFERENCES ticket(id),
+    command TEXT NOT NULL CHECK (command IN ('redirect', 'pause', 'resume', 'stop', 'forbidden', 'close_issue', 'close_pull_request', 'ignore_issue_state', 'use', 'effort')),
+    instruction INTEGER NOT NULL CHECK (instruction IN (0, 1)),
+    handled_at TEXT NOT NULL,
+    PRIMARY KEY (trigger_id, ticket_id)
+  ) STRICT, WITHOUT ROWID;
+  INSERT INTO command_receipt_v34 SELECT * FROM command_receipt;
+  DROP TABLE command_receipt;
+  ALTER TABLE command_receipt_v34 RENAME TO command_receipt;
+  CREATE INDEX command_receipt_by_ticket ON command_receipt(ticket_id, trigger_id);
+  `,
 ];
 
 /** Applies every migration newer than the database's version. Returns the resulting version. */

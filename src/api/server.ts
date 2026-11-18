@@ -7,6 +7,9 @@ import { availableParallelism } from "node:os";
 import { createServer, type Server } from "node:http";
 import { dirname, join } from "node:path";
 import type { Store } from "../store/store.ts";
+import { overrideModel, overrideEffort } from "../router/selection.ts";
+import { queueStatusCard } from "../github/cards.ts";
+import type { WorkerConfig } from "../ostromd/config.ts";
 
 export interface LocalApi {
   start(): Promise<void>;
@@ -28,6 +31,7 @@ export interface LocalApiOptions {
   watchdog?: () => { lastAttemptAt: string | null; lastSuccess: boolean | null; lastSuccessAt: string | null; error: string | null };
   tickIntervalSeconds?: number;
   refreshModels?: () => Promise<unknown>;
+  workerConfig?: Pick<WorkerConfig, "harness" | "model">;
 }
 
 export function defaultSocketPath(env: Record<string, string | undefined> = process.env): string {
@@ -68,6 +72,16 @@ export function localApi(store: Store, options: LocalApiOptions): LocalApi {
       const ticket = /^\/v1\/tickets\/([1-9]\d*)$/.exec(url.pathname);
       if (request.method === "GET" && ticket !== null) return reply(response, 200, store.operatorTicket(Number(ticket[1])));
       if (request.method === "GET" && url.pathname === "/v1/preview") return reply(response, 200, { markdown: await options.control.preview() });
+      const override = /^\/v1\/tickets\/([1-9]\d*)\/(model|effort)$/.exec(url.pathname);
+      if (request.method === "POST" && override !== null) {
+        const ticketId = Number(override[1]);
+        const body = await bodyJson(request);
+        if (typeof body !== "object" || body === null || !("value" in body) || typeof body.value !== "string") throw new Error("value must be text");
+        if (override[2] === "model") overrideModel(store, ticketId, body.value, "the operator CLI");
+        else overrideEffort(store, options.workerConfig ?? { harness: "codex", model: "gpt-6-luna" }, ticketId, body.value, "the operator CLI");
+        queueStatusCard(store, ticketId);
+        return reply(response, 200, store.operatorTicket(ticketId));
+      }
       const action = /^\/v1\/tickets\/([1-9]\d*)\/(pause|resume|stop|extend)$/.exec(url.pathname);
       if (request.method === "POST" && action !== null) {
         const ticketId = Number(action[1]);

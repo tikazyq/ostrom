@@ -71,6 +71,8 @@ reaction, and the status card shows the result.
 | `@ostrom pause` | The Worker finishes its current step, pushes its work in progress, and sleeps. The session is kept. | Issue author, or repo triage or higher | 👍; card **Paused**; label `ostrom:paused` |
 | `@ostrom resume`, or removing the label | The same session continues where it stopped | Issue author, or repo triage or higher | 👍; card **Working** |
 | `@ostrom stop` | Graceful stop: push work in progress, turn the PR into a draft, post one summary of where it stopped. The ticket ends. | Issue author, or repo triage or higher | 👍 and one closing comment |
+| `@ostrom use <model>` | Set and approve the ticket model; a running session keeps its model until the next session. | Repository admin | 👍; 😕 for an invalid choice |
+| `@ostrom effort <level>` | Keep this effort for subsequent turns until changed. | Repository admin | 👍; 😕 for an invalid choice |
 | Close the issue | Same as stop. The branch is kept; reopening the issue asks the Router again. | Whoever can close it | Card **Stopped: issue closed** |
 | Close the PR | Ends that attempt only; the issue stays open for a new decision | Whoever can close it | Card updated, no new comment |
 | A command from someone without permission | Ignored | | 😕 only; no comment, so no noise and no argument |

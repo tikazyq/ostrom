@@ -1,6 +1,7 @@
 /** Project the stored state into the operator's next useful answer. Order matters. */
 export function ticketPhase(ticket) {
   if (ticket.state === "ended") return { key: "finished", label: "Finished", tone: "neutral", detail: "" };
+  if (ticket.modelSelection && !ticket.modelSelection.approved) return { key: "approval", label: "Waiting for model approval", tone: "amber", detail: `${ticket.modelSelection.harness}/${ticket.modelSelection.model}: ${ticket.modelSelection.reason}` };
   if (ticket.state === "paused") return { key: "paused", label: "Paused", tone: "amber", detail: ticket.pauseCause ?? "Cause unavailable" };
   if (ticket.assignment?.outcome === "failed" || ticket.latestFailure) return {
     key: "failed", label: "Failed", tone: "red",

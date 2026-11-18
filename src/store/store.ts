@@ -83,7 +83,7 @@ export interface ReviewDelivery {
   reviewId: string;
 }
 
-export type CommandReceiptName = "redirect" | "pause" | "resume" | "stop" | "forbidden" | "close_issue" | "close_pull_request" | "ignore_issue_state";
+export type CommandReceiptName = "use" | "effort" | "redirect" | "pause" | "resume" | "stop" | "forbidden" | "close_issue" | "close_pull_request" | "ignore_issue_state";
 
 export interface PendingCommand {
   trigger: Trigger;
@@ -161,6 +161,8 @@ export interface OperatorTicket extends Ticket {
   mergeCandidate: { policy: string; blockingReason: string | null; quietDeadline: string | null } | null;
   latestFailure: { kind: "assignment" | "dispatch"; summary: string; at: string } | null;
   recentFailures: { kind: "assignment" | "dispatch"; summary: string; at: string }[];
+  currentTurn?: WorkerTurn | null;
+  modelSelection?: ReturnType<Store["ticketModel"]>;
 }
 
 export type IntakeReason = "missing @ostrom mention" | "unauthorized author" | "approval without feedback";
@@ -188,6 +190,8 @@ export interface WorkerTurn {
   harness: "claude" | "codex";
   requestedModel: string;
   requestedEffort: string | null;
+  modelReason?: string | null;
+  effortReason?: string | null;
   observedModel: string | null;
   observedEffort: string | null;
   kind: string;
@@ -204,6 +208,7 @@ export interface OperatorTicketDetail extends OperatorTicket {
   decisions: { id: number; verdict: Verdict; reason: string; decidedAt: string }[];
   assignments: Assignment[];
   turns: WorkerTurn[];
+  modelDecisions?: ReturnType<Store["modelDecisions"]>;
   outbox: Reply[];
 }
 
@@ -607,6 +612,40 @@ export class Store {
     });
   }
 
+  ticketModel(ticketId: number): { harness: "claude" | "codex"; model: string; reason: string; approved: boolean; effort: string | null } | null {
+    const row = this.#get("SELECT * FROM ticket_model WHERE ticket_id = ?", ticketId);
+    return row === undefined ? null : { harness: row["harness"] as "claude" | "codex", model: row["model"] as string,
+      reason: row["reason"] as string, approved: row["approved"] === 1, effort: row["effort"] as string | null };
+  }
+
+  chooseTicketModel(ticketId: number, harness: "claude" | "codex", model: string, reason: string, approved: boolean): void {
+    this.getTicket(ticketId);
+    this.#transaction(() => {
+      this.#run(`INSERT INTO ticket_model (ticket_id, harness, model, reason, approved) VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(ticket_id) DO UPDATE SET harness = excluded.harness, model = excluded.model,
+        reason = excluded.reason, approved = excluded.approved`, ticketId, harness, model, reason, Number(approved));
+      this.recordModelDecision(ticketId, "model", `${harness}/${model}`, reason);
+    });
+  }
+
+  overrideEffort(ticketId: number, effort: string, reason: string): void {
+    if (this.ticketModel(ticketId) === null) throw new Error("ticket has no model selection");
+    this.#transaction(() => {
+      this.#run("UPDATE ticket_model SET effort = ? WHERE ticket_id = ?", effort, ticketId);
+      this.recordModelDecision(ticketId, "effort", effort, reason);
+    });
+  }
+
+  recordModelDecision(ticketId: number, kind: string, value: string, reason: string): void {
+    this.#run("INSERT INTO model_decision (ticket_id, kind, value, reason, decided_at) VALUES (?, ?, ?, ?, ?)", ticketId, kind, value, reason, this.#stamp());
+  }
+
+  modelDecisions(ticketId: number): { kind: string; value: string; reason: string; decidedAt: string }[] {
+    return this.#all("SELECT * FROM model_decision WHERE ticket_id = ? ORDER BY id", ticketId).map((row) => ({
+      kind: row["kind"] as string, value: row["value"] as string, reason: row["reason"] as string, decidedAt: row["decided_at"] as string,
+    }));
+  }
+
   /** Open tickets that have never had an assignment: accepted, but no Worker was created yet. */
   undispatchedTickets(): number[] {
     return this.#all(
@@ -661,7 +700,7 @@ export class Store {
        WHERE subscription.ticket_id = ? ORDER BY outbox.enqueued_at, outbox.id`,
       ticketId,
     ).map(toReply);
-    return { ...summary, context, triggers, decisions, assignments, turns: this.ticketTurns(ticketId), outbox };
+    return { ...summary, context, triggers, decisions, assignments, turns: this.ticketTurns(ticketId), modelDecisions: this.modelDecisions(ticketId), outbox };
   }
 
   /** The daemon-wide counter view. Time zone is SQLite's UTC day, matching stored timestamps. */
@@ -702,6 +741,8 @@ export class Store {
     ).map((row) => row["url"] as string);
     return {
       ...ticket, thread: context.thread, assignment, budget,
+      currentTurn: this.ticketTurns(ticketId).filter((turn) => turn.assignmentId === assignment?.id).at(-1) ?? null,
+      modelSelection: this.ticketModel(ticketId),
       budgetUsage: { time: budgetUsage(budget, "time", now), idle: budgetUsage(budget, "idle", now),
         turns: budgetUsage(budget, "turns", now), tokens: budgetUsage(budget, "tokens", now),
         escalations: budgetUsage(budget, "escalations", now) },
@@ -934,14 +975,19 @@ export class Store {
     return this.#all("SELECT * FROM assignment WHERE state = 'pending' ORDER BY id").map(toAssignment);
   }
 
+  setAssignmentModelReason(assignmentId: number, reason: string): void {
+    this.#run("UPDATE assignment SET model_reason = ? WHERE id = ?", reason, assignmentId);
+  }
+
   /** Records a native invocation, including a first turn that fails before returning a session ID. */
-  startWorkerTurn(assignmentId: number, kind: string, effort: string | null = null): number {
+  startWorkerTurn(assignmentId: number, kind: string, effort: string | null = null, effortReason: string | null = null): number {
     const assignment = this.getAssignment(assignmentId);
     if (assignment.harness === null || assignment.model === null) throw new Error("turn needs a configured native assignment");
     const result = this.#run(
-      `INSERT INTO turn (assignment_id, ticket_id, started_at, harness, requested_model, requested_effort, kind, status)
-       VALUES (?, ?, ?, ?, ?, ?, ?, 'running')`,
+      `INSERT INTO turn (assignment_id, ticket_id, started_at, harness, requested_model, requested_effort, kind, status, model_reason, effort_reason)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 'running', ?, ?)`,
       assignmentId, assignment.ticketId, this.#stamp(), assignment.harness, assignment.model, effort, kind,
+      this.#get("SELECT model_reason FROM assignment WHERE id = ?", assignmentId)!["model_reason"] as string | null, effortReason,
     );
     return Number(result.lastInsertRowid);
   }
@@ -962,6 +1008,7 @@ export class Store {
       id: row["id"] as number, assignmentId: row["assignment_id"] as number, ticketId: row["ticket_id"] as number,
       startedAt: row["started_at"] as string, endedAt: row["ended_at"] as string | null,
       harness: row["harness"] as WorkerTurn["harness"], requestedModel: row["requested_model"] as string,
+      modelReason: row["model_reason"] as string | null, effortReason: row["effort_reason"] as string | null,
       requestedEffort: row["requested_effort"] as string | null, observedModel: row["observed_model"] as string | null,
       observedEffort: row["observed_effort"] as string | null, kind: row["kind"] as string,
       inputTokens: row["input_tokens"] as number, cachedInputTokens: row["cached_input_tokens"] as number,

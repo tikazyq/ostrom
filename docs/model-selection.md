@@ -1,7 +1,7 @@
 # Model selection
 
 Status: accepted, 2026-11-17. PR 1 implements effort and turn records; PR 2 implements discovery
-and stored operator selections. Selection consumption remains planned. The operator asked for
+and stored operator selections. PR 3 implements Router choices, dispatch approval waits and persistent overrides. The operator asked for
 selection that is smarter than a fixed tier table, optimised for the operator's experience. On
 2026-11-17 they chose: **the lowest cost that still merges** as the default objective, **escalation
 within one harness** at first, allowed models **selected by an admin from those the harnesses
@@ -97,6 +97,30 @@ one-line reason. Its input:
 
 Code checks the choice: it must be on the list, and an approval model waits for the operator. An
 invalid choice falls back to the cheapest model, and that fallback is recorded as a decision.
+
+**Dispatch approval (step 3).** An approval-flagged choice remains undispatched: no assignment,
+worktree or native session is created. A durable, deduplicated issue comment asks the operator to
+run `ostrom model <ticket> <harness/model>`, or a repository admin to comment
+`@ostrom use <harness/model>`. That explicit override records approval and permits dispatch on the
+next Router pass. Ordinary resume, issue-author permission and merge approval do not approve a
+model. The ticket stays open, with a status card and dashboard notice showing the wait, so a daemon
+restart preserves it. CLI overrides use the local operator socket; GitHub model and effort overrides
+require repository admin permission, matching allowed-model administration.
+
+Choices use `harness/model` IDs; overrides also accept an unambiguous raw model ID. Code skips
+retired models, validates the reason, and records a missing/invalid choice's cheapest fallback in
+`model_decision`. Without allowed models, dispatch records and uses the configured Worker model.
+The assignment captures its model reason, so later overrides cannot rewrite the running session's
+turn history. Ticket detail includes selection decisions and current/pending settings.
+
+Each turn asks the Router through a fresh read-only call with its kind, prompt and recorded turn
+history. A persistent effort override wins. Invalid/failed effort choices fall back to `medium`
+when allowed, otherwise the lowest supported allowed effort, with the fallback reason on the turn.
+If discovery has no entry for a legacy configured model, the Router chooses among the harness's
+baseline low/medium/high settings. An empty discovered/selected effort list uses the harness default.
+Changing the model preserves an effort override; incompatible changes are rejected, and an effort
+override must be valid for both a running model and a pending next-session model. Turn state is
+rechecked after inference before dispatch. Outcome statistics and escalation remain later work.
 
 The model stays fixed for the ticket's session. Changing models mid-session discards the cached
 context, and resuming a session on different settings already caused #715.

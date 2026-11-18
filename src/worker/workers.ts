@@ -16,6 +16,7 @@ import type { Runner, Session, TurnResult } from "../session/runner.ts";
 import { createWorktree } from "../session/worktree.ts";
 import type { Assignment, AssignmentOutcome, QueuedTurnKind, Store } from "../store/store.ts";
 import { workerBrief } from "./dispatch.ts";
+import { allowedModels, chooseEffort, selectModel } from "../router/selection.ts";
 
 export interface Dispatched {
   assignmentId: number;
@@ -26,6 +27,7 @@ export interface Dispatched {
 export interface WorkersDeps {
   store: Store;
   config: WorkerConfig;
+  askEffort?: (message: string) => Promise<string>;
   runners: Record<"claude" | "codex", Runner>;
   /** Where Codex writes rollout records; set to verify the Worker's model after each Codex turn. */
   codexSessions?: string;
@@ -92,7 +94,19 @@ export class Workers {
    * A session that does not start ends the assignment with the error as its reason and rethrows.
    */
   async dispatch(ticketId: number): Promise<Dispatched> {
-    const { store, config } = this.#deps;
+    const { store } = this.#deps;
+    if (store.ticketModel(ticketId) === null) selectModel(store, ticketId, undefined, undefined);
+    let selected = store.ticketModel(ticketId);
+    if (selected === null) {
+      store.chooseTicketModel(ticketId, this.#deps.config.harness, this.#deps.config.model, "Configured Worker model.", true);
+      selected = store.ticketModel(ticketId)!;
+    }
+    const allowed = allowedModels(store);
+    if (allowed.length > 0 && !allowed.some((item) => item.harness === selected.harness && item.model === selected.model)) {
+      throw new Error("ticket model is no longer allowed; set an allowed model override");
+    }
+    if (!selected.approved) throw new Error("ticket model awaits operator approval");
+    const config = { ...this.#deps.config, harness: selected.harness, model: selected.model };
     const context = store.ticketContext(ticketId);
     const id = store.createAssignment(ticketId);
     try {
@@ -100,6 +114,7 @@ export class Workers {
       const path = join(config.worktrees, `ticket-${ticketId}-${id}-${suffix}`);
       const branch = await (this.#deps.addWorktree ?? createWorktree)(config.repo, path, config.base, ticketId, id, suffix);
       store.configureNativeAssignment(id, { harness: config.harness, model: config.model, worktree: path, branch, machine: config.machine });
+      store.setAssignmentModelReason(id, selected.reason);
       let resolve!: (sessionId: string) => void;
       const started = new Promise<string>((r) => (resolve = r));
       const session = this.#deps.runners[config.harness].start({
@@ -352,10 +367,13 @@ export class Workers {
     const { store } = this.#deps;
     const controller = new AbortController();
     this.#inFlight.set(id, controller);
-    store.startWorkerTurn(id, "dispatch");
     let result: TurnResult;
     try {
-      result = await session.send(prompt, controller.signal);
+      const assignment = store.getAssignment(id);
+      const choice = await chooseEffort(store, assignment.ticketId, assignment.harness!, assignment.model!, "dispatch", prompt, this.#deps.askEffort);
+      if (this.#stopping) return;
+      store.startWorkerTurn(id, "dispatch", choice.effort, choice.reason);
+      result = await session.send(prompt, controller.signal, choice.effort);
     } catch (error) {
       if (this.#stopping) return;
       if (controller.signal.aborted) {
@@ -392,20 +410,32 @@ export class Workers {
     // increments the ticket's turn budget.
     if (store.reservationHeld(id)) return;
     if (store.queuedTurn(id, key)?.state !== "queued") return;
+    const kind = key.startsWith("stuck-recovery-") ? "recovery" : key.startsWith("redirect-") ? "redirect" : queued.kind;
+    const choice = await chooseEffort(store, assignment.ticketId, assignment.harness!, assignment.model!, kind, queued.prompt, this.#deps.askEffort);
+    // Inference yields: recheck state, pause and merge reservation before claiming the turn.
+    const rechecked = store.getAssignment(id);
+    if (this.#stopping || rechecked.state !== "running" || rechecked.outcome === "failed" || store.reservationHeld(id)) return;
+    const recheckedTicket = store.getTicket(assignment.ticketId);
+    if (recheckedTicket.state === "ended") return;
+    if (recheckedTicket.state === "paused" && !RUNS_WHILE_PAUSED.some((prefix) => key.startsWith(prefix))) return;
+    if (recheckedTicket.stopRequestedAt !== null && !/^(operator-stop-|stop-|close-issue-)/.test(key)) {
+      store.finishQueuedTurn(id, key);
+      return;
+    }
     const session = this.#session(assignment);
     const nextTurn = assignment.turns + 1;
     const turnId = `${assignment.sessionId}:${nextTurn}`;
     if (store.beginQueuedTurn(id, key, turnId) === null) return;
     const turn = store.beginTurn(id);
     if (turn !== nextTurn) throw new Error(`assignment ${id}: queued turn number changed`);
-    const kind = key.startsWith("stuck-recovery-") ? "recovery" : key.startsWith("redirect-") ? "redirect" : queued.kind;
-    store.startWorkerTurn(id, kind);
+    store.startWorkerTurn(id, kind, choice.effort, choice.reason);
+    queueStatusCard(store, assignment.ticketId);
     onStart?.(turnId);
     const controller = new AbortController();
     this.#inFlight.set(id, controller);
     let result: TurnResult;
     try {
-      result = await session.send(workerTurnPrompt(queued.prompt), controller.signal);
+      result = await session.send(workerTurnPrompt(queued.prompt), controller.signal, choice.effort);
     } catch (error) {
       if (this.#stopping) return;
       store.finishQueuedTurn(id, key);

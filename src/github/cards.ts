@@ -9,7 +9,16 @@ export function queueStatusCard(store: Store, ticketId: number, now = new Date()
   const context = store.ticketContext(ticketId);
   const ticket = context.ticket;
   const assignment = store.latestAssignment(ticketId);
-  if (assignment === null || assignment.harness === null || assignment.model === null) return;
+  if (assignment === null || assignment.harness === null || assignment.model === null) {
+    const selected = store.ticketModel(ticketId);
+    if (selected !== null && !selected.approved) store.enqueueStatusCard(context.thread.id, renderStatusCard({
+      state: "paused", pauseCause: "waiting for operator model approval", harness: selected.harness, model: selected.model,
+      modelReason: selected.reason, lastActivityAt: new Date(ticket.openedAt), now, markerId: `card-thread-${context.thread.id}`,
+    }));
+    return;
+  }
+  const selected = store.ticketModel(ticketId);
+  const turn = store.ticketTurns(ticketId).filter((item) => item.assignmentId === assignment.id).at(-1);
   const openStall = store.unansweredStalls().find((stall) => stall.assignmentId === assignment.id);
   const candidate = store.mergeCandidateForAssignment(assignment.id);
   const policy = candidate === null ? null : JSON.parse(candidate.policy) as { strategy: string };
@@ -36,6 +45,9 @@ export function queueStatusCard(store: Store, ticketId: number, now = new Date()
       ...(candidate === null || ticket.state === "ended" ? {} : { mergeStatus: `policy ${policy!.strategy}; head ${candidate.headSha}; ${candidate.blockingReason === "quiet period has not elapsed" && candidate.quietDeadline !== null ? `earliest merge ${candidate.quietDeadline}` : candidate.blockingReason === null ? "waiting for ready reply" : candidate.blockingReason}` }),
       harness: assignment.harness,
       model: assignment.model,
+      ...(selected !== null && (selected.model !== assignment.model || selected.harness !== assignment.harness)
+        ? { nextModel: `\`${selected.harness}/${selected.model}\` — ${selected.reason}` } : {}),
+      ...(turn === undefined ? {} : { modelReason: turn.modelReason ?? null, effort: turn.requestedEffort, effortReason: turn.effortReason ?? null }),
       lastActivityAt,
       now,
       markerId: `card-thread-${context.thread.id}`,

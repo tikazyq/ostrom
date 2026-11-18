@@ -17,6 +17,10 @@ export interface StatusCard {
   pullRequest?: string;
   harness: "claude" | "codex";
   model: string;
+  modelReason?: string | null;
+  effort?: string | null;
+  effortReason?: string | null;
+  nextModel?: string;
   lastActivityAt: Date;
   now: Date;
   /** Stable outbox id, embedded to recognise and recover the card after a crash. */
@@ -47,7 +51,9 @@ export function renderStatusCard(card: StatusCard): string {
   if (card.mergeStatus !== undefined) lines.push("", `Merge: ${card.mergeStatus}`);
   lines.push(
     "",
-    `Harness: \`${card.harness}\` · Model: \`${card.model}\``,
+    `Harness: \`${card.harness}\` · Model: \`${card.model}\`${card.modelReason ? ` — ${card.modelReason}` : ""}`,
+    ...(card.nextModel ? [`Next session model: ${card.nextModel}`] : []),
+    ...(card.effortReason ? [`Effort: \`${card.effort ?? "default"}\` — ${card.effortReason}`] : []),
     `Last activity: ${utcMinute(card.lastActivityAt)}`,
     controlsLine(),
     "",

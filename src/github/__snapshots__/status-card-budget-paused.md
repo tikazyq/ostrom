@@ -10,8 +10,9 @@ Warning: budget at 80% — tokens
 
 Paused: budget reached: tokens
 
-Harness: `codex` · Model: `gpt-6-luna`
+Harness: `codex` · Model: `gpt-6-luna` — Cheapest capable model for this task.
+Effort: `low` — Small documentation change.
 Last activity: 2026-11-09 12:13 UTC
-Controls: `@ostrom pause`, `@ostrom resume`, `@ostrom stop`, or reply to redirect.
+Controls: `@ostrom pause`, `@ostrom resume`, `@ostrom stop`, `@ostrom use <model>`, `@ostrom effort <level>`, or reply to redirect.
 
 <!-- ostrom:reply id=card-thread-7 -->

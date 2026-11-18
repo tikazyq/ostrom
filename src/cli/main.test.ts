@@ -6,6 +6,7 @@ import { test } from "node:test";
 
 import { Store } from "../store/store.ts";
 import { main } from "./main.ts";
+import { defaultSocketPath, localApi } from "../api/server.ts";
 
 function ticket(path: string): number {
   const store = Store.open(path);
@@ -59,6 +60,26 @@ test("show renders turn model, effort and kind in text and JSON", async () => {
     process.stdout.write = original;
     rmSync(directory, { recursive: true, force: true });
   }
+});
+
+test("model and effort CLI verbs persist overrides through the daemon API", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "ostrom-cli-selection-"));
+  const path = join(directory, "ostrom.db");
+  const id = ticket(path);
+  const store = Store.open(path);
+  const env = { OSTROM_DB: path, XDG_RUNTIME_DIR: directory };
+  const api = localApi(store, { socketPath: defaultSocketPath(env), control: {
+    pause: async () => {}, resume: async () => {}, stop: async () => {}, extend: async () => {}, preview: async () => "",
+  } });
+  try {
+    store.models.discovered("codex", [{ harness: "codex", id: "luna", displayName: "Luna", description: "", efforts: ["low", "high"], defaultEffort: "low" }]);
+    store.models.change({ action: "allow", harness: "codex", model: "luna" });
+    await api.start();
+    assert.equal(await main(["model", String(id), "codex/luna", "--json"], env), 0);
+    assert.equal(await main(["effort", String(id), "low", "--json"], env), 0);
+    assert.equal(store.ticketModel(id)?.effort, "low");
+    assert.equal(await main(["effort", String(id), "max"], env), 1);
+  } finally { await api.close(); store.close(); rmSync(directory, { recursive: true, force: true }); }
 });
 
 test("mutating CLI commands require a running daemon", async () => {

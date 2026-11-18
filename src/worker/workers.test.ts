@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { afterEach, test } from "node:test";
 
 import { Store } from "../store/store.ts";
+import { overrideModel, overrideEffort } from "../router/selection.ts";
 import { FakeRunner } from "./fake-runner.ts";
 import { workerBrief } from "./dispatch.ts";
 import { gitDirs, INTERRUPTED_PROMPT, workerTurnPrompt, Workers, type WorkersDeps } from "./workers.ts";
@@ -68,7 +69,7 @@ test("dispatch makes the worktree, starts the session with the brief and stores 
   const done = store.getAssignment(1);
   assert.deepEqual([done.turnStartedAt, done.inputTokens, done.cachedInputTokens, done.outputTokens, done.outcome], [null, 10, 5, 2, null]);
   const [turn] = store.operatorTicket(ticketId).turns;
-  assert.deepEqual([turn!.kind, turn!.status, turn!.requestedModel, turn!.requestedEffort, turn!.observedModel], ["dispatch", "completed", "gpt-6-luna", null, null]);
+  assert.deepEqual([turn!.kind, turn!.status, turn!.requestedModel, turn!.requestedEffort, turn!.observedModel], ["dispatch", "completed", "gpt-6-luna", "medium", null]);
   assert.deepEqual([turn!.inputTokens, turn!.cachedInputTokens, turn!.outputTokens], [10, 5, 2]);
 });
 
@@ -88,6 +89,59 @@ test("every invoked follow-up records its source kind and failures retain a reas
   const failed = store.ticketTurns(ticketId).at(-1)!;
   assert.equal(failed.status, "failed");
   assert.equal(failed.result, "provider failed");
+});
+
+test("Router effort reaches every turn, while a model override leaves the running session fixed", async () => {
+  let calls = 0;
+  const { store, ticketId, workers, runner } = fixture({ askEffort: async () => {
+    calls++;
+    return JSON.stringify({ effort: calls === 1 ? "low" : "high", reason: calls === 1 ? "Small task." : "Needs careful revision." });
+  } });
+  store.models.discovered("codex", ["gpt-6-luna", "sol"].map((id) => ({ harness: "codex", id, displayName: id, description: "", efforts: ["low", "high"], defaultEffort: "low" })));
+  for (const model of ["gpt-6-luna", "sol"]) store.models.change({ action: "allow", harness: "codex", model });
+  await workers.dispatch(ticketId);
+  await workers.drain();
+  overrideModel(store, ticketId, "sol", "operator");
+  for (const key of ["review-1", "redirect-1", "conflict-1", "recovery-1", "operator-pause-1", "budget-pause-1", "stuck-public-1", "ordinary"]) {
+    workers.deliver(1, key, "continue", () => {});
+  }
+  await workers.drain();
+  assert.equal(calls, 9);
+  assert.deepEqual(runner.sessions[0]!.efforts, ["low", ...Array(8).fill("high")]);
+  assert.ok(store.ticketTurns(ticketId).every((turn) => turn.requestedModel === "gpt-6-luna" && turn.modelReason));
+  assert.equal(store.ticketTurns(ticketId).at(-1)?.effortReason, "Needs careful revision.");
+  assert.equal(store.ticketModel(ticketId)?.model, "sol");
+  overrideEffort(store, config, ticketId, "low", "operator");
+  workers.deliver(1, "override", "continue", () => {});
+  await workers.drain();
+  assert.equal(calls, 9);
+  assert.equal(runner.sessions[0]!.efforts.at(-1), "low");
+  assert.match(store.ticketTurns(ticketId).at(-1)!.effortReason!, /override/);
+});
+
+test("a stop requested while effort is being chosen prevents that ordinary turn", async () => {
+  let stopDuringChoice = false;
+  const s = fixture({ askEffort: async () => {
+    if (stopDuringChoice) s.store.requestStop(s.ticketId);
+    return '{"effort":"low","reason":"Small turn."}';
+  } });
+  await s.workers.dispatch(s.ticketId);
+  await s.workers.drain();
+  stopDuringChoice = true;
+  s.workers.deliver(1, "review-1", "review changes", () => {});
+  await s.workers.drain();
+  assert.equal(s.runner.sessions[0]!.prompts.length, 1);
+  assert.equal(s.store.getAssignment(1).turns, 1);
+  assert.equal(s.store.queuedTurn(1, "review-1")?.state, "cancelled");
+});
+
+test("approval model never creates a worktree or native session before approval", async () => {
+  const { store, ticketId, workers, runner, worktrees } = fixture();
+  store.chooseTicketModel(ticketId, "codex", "gpt-6-luna", "Needs approval.", false);
+  await assert.rejects(workers.dispatch(ticketId), /approval/);
+  assert.equal(store.latestAssignment(ticketId), null);
+  assert.equal(runner.sessions.length, 0);
+  assert.equal(worktrees.length, 0);
 });
 
 test("linked worktrees grant only the Git paths a commit changes", () => {

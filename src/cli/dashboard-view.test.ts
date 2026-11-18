@@ -48,6 +48,11 @@ test("stored merge reasons map to actionable phases, including unknown reasons",
   assert.equal(phaseSummary([]), "No active tickets");
 });
 
+test("an undispatched approval model has an explicit dashboard phase", () => {
+  const phase = ticketPhase(ticket({ pullRequests: [], modelSelection: { harness: "codex", model: "sol", reason: "Large change.", approved: false, effort: null } }));
+  assert.deepEqual(phase, { key: "approval", label: "Waiting for model approval", tone: "amber", detail: "codex/sol: Large change." });
+});
+
 test("headlines use the latest decision and keep the full summary", () => {
   const full = "Document store precedence ".repeat(8);
   const detail = { decisions: [{ id: 2, reason: full, decidedAt: "2026-11-16T01:00:00Z" }, { id: 1, reason: "old", decidedAt: "2026-11-16T00:00:00Z" }], context: { reason: "original" } } as OperatorTicketDetail;

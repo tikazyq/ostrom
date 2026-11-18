@@ -71,6 +71,13 @@ test("the local API serves status, tickets and a ticket over a 0600 Unix socket"
   try {
     await api.start();
     assert.equal(statSync(socketPath).mode & 0o777, 0o600);
+    store.models.discovered("codex", [{ harness: "codex", id: "gpt-6-luna", displayName: "Luna", description: "", efforts: ["low", "high"], defaultEffort: "low" }]);
+    store.models.change({ action: "allow", harness: "codex", model: "gpt-6-luna" });
+    assert.equal((await call(socketPath, "POST", `/v1/tickets/${ticketId}/model`, { value: "codex/gpt-6-luna" })).status, 200);
+    assert.equal((await call(socketPath, "POST", `/v1/tickets/${ticketId}/effort`, { value: "low" })).status, 200);
+    assert.equal((await call(socketPath, "POST", `/v1/tickets/${ticketId}/effort`, { value: "max" })).status, 400);
+    assert.equal((await call(socketPath, "POST", `/v1/tickets/${ticketId}/model`, { value: "unknown" })).status, 400);
+    assert.equal(store.ticketModel(ticketId)?.effort, "low");
 
     const status = await get(socketPath, "/v1/status");
     assert.equal(status.status, 200);
@@ -115,7 +122,7 @@ test("the local API serves status, tickets and a ticket over a 0600 Unix socket"
     const shown = detail.body as { context: { reason: string }; triggers: { body: string }[]; outbox: { id: string }[] };
     assert.equal(shown.context.reason, "requested fix");
     assert.equal(shown.triggers[0]!.body, "please fix it");
-    assert.equal(shown.outbox[0]!.id, "reply-1");
+    assert.ok(shown.outbox.some((reply) => reply.id === "reply-1"));
 
     const paused = await call(socketPath, "POST", `/v1/tickets/${ticketId}/pause`);
     assert.equal(paused.status, 200);

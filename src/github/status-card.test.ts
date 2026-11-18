@@ -8,6 +8,9 @@ const base: Omit<StatusCard, "state"> = {
   pullRequest: "https://github.com/onsager-ai/ostrom/pull/42",
   harness: "codex",
   model: "gpt-6-luna",
+  modelReason: "Cheapest capable model for this task.",
+  effort: "low",
+  effortReason: "Small documentation change.",
   lastActivityAt: new Date("2026-11-09T12:13:00Z"),
   now: new Date("2026-11-09T12:18:59Z"),
   markerId: "card-thread-7",
@@ -18,6 +21,12 @@ for (const state of ["working", "recovering", "paused", "stuck", "waiting_to_mer
     assert.equal(renderStatusCard({ ...base, state }), await snapshot(state));
   });
 }
+
+test("status card distinguishes the current model from a next-session override", () => {
+  const rendered = renderStatusCard({ ...base, state: "working", nextModel: "`codex/sol` — Model override by operator." });
+  assert.match(rendered, /Model: `gpt-6-luna`/);
+  assert.match(rendered, /Next session model: `codex\/sol`/);
+});
 
 test("status card shows stale approvals instead of approval satisfaction", () => {
   const rendered = renderStatusCard({ ...base, state: "waiting_to_merge", mergeStatus: "policy approvals; head 53975b6; Approved on 0e65021; the head is now 53975b6. Approve again to merge." });

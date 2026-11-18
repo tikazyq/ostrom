@@ -23,6 +23,7 @@ import type { Runner } from "../session/runner.ts";
 import { stallReplyId, type StallAction, type Store, type Trigger, type Verdict } from "../store/store.ts";
 import { pullRequestsForBranch, type BranchPullRequest } from "../worker/dispatch.ts";
 import type { Workers } from "../worker/workers.ts";
+import { allowedModels, selectModel } from "./selection.ts";
 
 /** How much of a comment body the batch carries inline; the rest is behind its URL. */
 export const EXCERPT_CHARS = 600;
@@ -97,6 +98,8 @@ export interface RouterDecision {
   verdict: Verdict;
   reason: string;
   reply: string | null;
+  model?: unknown;
+  modelReason?: unknown;
 }
 
 export interface RouterStallAnswer {
@@ -172,7 +175,7 @@ export async function routeCandidates(options: RouteOptions): Promise<RoutePassR
   };
   if (batch.threads.length === 0 && batch.outcomes.length === 0) return result;
 
-  const asked = await askRouter(options, routerMessage(batch));
+  const asked = await askRouter(options, routerMessage(batch, store));
   result.router = { sessionId: asked.sessionId };
   const answer = parseRouterAnswer(asked.reply, batch);
 
@@ -184,6 +187,7 @@ export async function routeCandidates(options: RouteOptions): Promise<RoutePassR
       reason: decision.reason,
       ...(decision.reply === null ? {} : { reply: decision.reply }),
     }, options.budget ?? DEFAULT_BUDGET);
+    if (recorded.ticketId !== null) selectModel(store, recorded.ticketId, decision.model, decision.modelReason);
     result.decisions.push({ ...recorded, thread: decision.thread, triggers: decision.triggers, verdict: decision.verdict });
   }
   const outcomes = new Map(batch.outcomes.map((outcome) => [outcome.key, outcome]));
@@ -205,6 +209,15 @@ export async function routeCandidates(options: RouteOptions): Promise<RoutePassR
 async function dispatchPending(options: RouteOptions, result: RoutePassResult): Promise<void> {
   for (const ticketId of options.store.undispatchedTickets()) {
     try {
+      if (options.store.ticketModel(ticketId) === null) selectModel(options.store, ticketId, undefined, undefined);
+      const selected = options.store.ticketModel(ticketId);
+      if (selected !== null && !selected.approved) {
+        const threadId = options.store.ticketContext(ticketId).thread.id;
+        options.store.enqueueReply({ id: `model-approval-${ticketId}-${selected.harness}-${selected.model}`, threadId,
+          body: `This ticket is waiting for operator approval to use \`${selected.harness}/${selected.model}\`: ${selected.reason}\n\nThe operator can run \`ostrom model ${ticketId} ${selected.harness}/${selected.model}\`, or a repository admin can comment \`@ostrom use ${selected.harness}/${selected.model}\`.`, blocking: true });
+        queueStatusCard(options.store, ticketId);
+        continue;
+      }
       const dispatched = await options.workers.dispatch(ticketId);
       result.dispatched.push({ ticketId, ...dispatched });
     } catch (error) {
@@ -378,8 +391,8 @@ function flaggedStalls(store: Store): StallItem[] {
  * Starts one fresh, read-only Router session for this batch. The batch contains the whole contract,
  * so the Router has no state to resume and no need to write in the checkout.
  */
-async function askRouter(
-  options: RouteOptions,
+export async function askRouter(
+  options: Pick<RouteOptions, "router" | "runners">,
   text: string,
 ): Promise<{ sessionId: string; reply: string }> {
   const cwd = await mkdtemp(join(tmpdir(), "ostrom-router-"));
@@ -410,8 +423,9 @@ const OUTCOME_MEANING: Record<OutcomeEvent, string> = {
 };
 
 /** The whole message for one Router turn: the contract, then the batch as JSON. */
-export function routerMessage(batch: Batch): string {
+export function routerMessage(batch: Batch, store?: Store): string {
   const payload = {
+    ...(store === undefined ? {} : { objective: store.models.view().objective, allowedModels: allowedModels(store) }),
     threads: batch.threads,
     outcomes: batch.outcomes.map((outcome) => ({
       key: outcome.key,
@@ -462,6 +476,8 @@ export function routerMessage(batch: Batch): string {
     '"reason":"...","reply":"..."|null}],"outcomes":[{"key":"<key>","reply":"..."}],',
     '"stalls":[{"key":"<key>","action":"wait"|"stop","reply":"..."|null}]}',
     "",
+    "For each accept also return model (harness/model from allowedModels) and modelReason (one line).",
+    "Choose the lowest cost capable model, considering objective, model notes and approval requirements. With no allowed models omit the choice.",
     "The batch:",
     JSON.stringify(payload, null, 2),
   ].join("\n");
@@ -492,7 +508,7 @@ export function parseRouterAnswer(reply: string, batch: Batch): RouterAnswer {
   const decided = new Set<number>();
   const decisions = list(root["decisions"], "$.decisions").map((item, index): RouterDecision => {
     const path = `$.decisions[${index}]`;
-    const decision = object(item, path, ["thread", "triggers", "verdict", "reason", "reply"], ["thread", "triggers", "verdict", "reason"]);
+    const decision = object(item, path, ["thread", "triggers", "verdict", "reason", "reply", "model", "modelReason"], ["thread", "triggers", "verdict", "reason"]);
     const thread = integer(decision["thread"], `${path}.thread`);
     const triggers = list(decision["triggers"], `${path}.triggers`).map((id, i) => integer(id, `${path}.triggers[${i}]`));
     if (triggers.length === 0) throw new RouterOutputError(`${path}.triggers is empty`);
@@ -510,7 +526,9 @@ export function parseRouterAnswer(reply: string, batch: Batch): RouterAnswer {
     const reason = text(decision["reason"], `${path}.reason`);
     const replyText = decision["reply"] === undefined || decision["reply"] === null ? null : text(decision["reply"], `${path}.reply`);
     if (verdict === "accept" && replyText === null) throw new RouterOutputError(`${path}: an accept needs a reply`);
-    return { thread, triggers, verdict, reason, reply: replyText };
+    return { thread, triggers, verdict, reason, reply: replyText,
+      ...(decision["model"] === undefined ? {} : { model: decision["model"] }),
+      ...(decision["modelReason"] === undefined ? {} : { modelReason: decision["modelReason"] }) };
   });
   const undecided = [...threadOf.keys()].filter((trigger) => !decided.has(trigger));
   if (undecided.length > 0) throw new RouterOutputError(`triggers ${undecided.join(", ")} are not decided`);

@@ -5,6 +5,8 @@ import { pullRequestsForBranch } from "../worker/dispatch.ts";
 import { clearStallForHumanReply, followUpMessage } from "../worker/follow-up.ts";
 import type { Workers } from "../worker/workers.ts";
 import { parseComment } from "./parser.ts";
+import { overrideModel, overrideEffort } from "../router/selection.ts";
+import type { WorkerConfig } from "../ostromd/config.ts";
 
 export interface CommandPass {
   handled: { triggerId: number; ticketId: number; command: string; allowed: boolean }[];
@@ -73,6 +75,7 @@ export async function routeCommands(
   gh: GhRunner,
   repo: string,
   allowlist: readonly string[] = [],
+  config: Pick<WorkerConfig, "harness" | "model"> = { harness: "codex", model: "gpt-6-luna" },
 ): Promise<CommandPass> {
   const pass: CommandPass = { handled: [], failed: [] };
   const permissions = new Map<string, Promise<boolean>>();
@@ -88,7 +91,7 @@ export async function routeCommands(
         pass.handled.push({ triggerId: pending.trigger.id, ticketId: pending.ticketId, command, allowed: true });
         continue;
       }
-      const allowed = command === "redirect" || command === "close_issue" || command === "close_pull_request" || await mayControl(
+      const allowed = command === "use" || command === "effort" ? await isAdmin(gh, repo, pending.trigger.actor) : command === "redirect" || command === "close_issue" || command === "close_pull_request" || await mayControl(
         store, gh, repo, pending.trigger, pending.ticketId, permissions, authors,
       );
       if (!allowed) {
@@ -97,7 +100,21 @@ export async function routeCommands(
         pass.handled.push({ triggerId: pending.trigger.id, ticketId: pending.ticketId, command, allowed });
         continue;
       }
-      if (command === "close_pull_request") {
+      if (command === "use" || command === "effort") {
+        if (parsed.kind !== "command" || !("value" in parsed)) throw new Error("override value required");
+        try {
+          if (command === "use") overrideModel(store, pending.ticketId, parsed.value, `@${pending.trigger.actor} on GitHub`);
+          else overrideEffort(store, config, pending.ticketId, parsed.value, `@${pending.trigger.actor} on GitHub`);
+        } catch {
+          store.recordCommandReceipt(pending.trigger.id, pending.ticketId, command, false);
+          enqueueReaction(store, pending.trigger, "confused");
+          pass.handled.push({ triggerId: pending.trigger.id, ticketId: pending.ticketId, command, allowed: false });
+          continue;
+        }
+        store.recordCommandReceipt(pending.trigger.id, pending.ticketId, command, true);
+        enqueueReaction(store, pending.trigger, "+1");
+        queueStatusCard(store, pending.ticketId);
+      } else if (command === "close_pull_request") {
         const assignment = store.latestAssignment(pending.ticketId);
         if (assignment?.state !== "running") throw new Error(`ticket ${pending.ticketId} has no running Worker`);
         // GitHub reports a merged PR as closed. A merge is the work done, which the Router's outcome
@@ -201,6 +218,13 @@ export async function routeCommands(
     }
   }
   return pass;
+}
+
+async function isAdmin(gh: GhRunner, repo: string, user: string): Promise<boolean> {
+  try {
+    const value = await ghGet(gh, `repos/${repo}/collaborators/${encodeURIComponent(user)}/permission`) as { permission?: string; role_name?: string };
+    return value.permission === "admin" || value.role_name === "admin";
+  } catch { return false; }
 }
 
 async function mayControl(

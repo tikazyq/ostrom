@@ -16,7 +16,7 @@ export interface BudgetMeter {
   warning: boolean;
   text: string;
 }
-export function ticketPhase(ticket: Pick<OperatorTicket, "state" | "pauseCause" | "assignment" | "latestFailure" | "budget" | "pullRequests" | "mergeCandidate">): TicketPhase;
+export function ticketPhase(ticket: Pick<OperatorTicket, "state" | "pauseCause" | "assignment" | "latestFailure" | "budget" | "pullRequests" | "mergeCandidate" | "modelSelection">): TicketPhase;
 export function phaseSummary(tickets: OperatorTicket[]): string;
 export function ticketSummary(detail?: Pick<OperatorTicketDetail, "decisions" | "context">): { full: string; short: string };
 export function budgetMeters(ticket: Pick<OperatorTicket, "budgetUsage" | "budget">): BudgetMeter[];

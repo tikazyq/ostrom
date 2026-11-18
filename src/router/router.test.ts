@@ -145,6 +145,45 @@ test("an accept records a ticket, dispatches a Worker and queues the Router's ac
   assert.equal(s.routerSessions().length, 1);
 });
 
+test("accept selects an allowed model; approval waits durably and an explicit override releases dispatch", async () => {
+  const s = setup();
+  const store = s.store();
+  store.models.discovered("codex", [{ harness: "codex", id: "sol", displayName: "Sol", description: "", efforts: ["low", "high"], defaultEffort: "low" }]);
+  store.models.change({ action: "allow", harness: "codex", model: "sol" });
+  store.models.change({ action: "set", harness: "codex", model: "sol", approval: true });
+  s.answer = (batch) => {
+    const answer = acceptAll(batch);
+    for (const decision of answer.decisions) { decision.model = "codex/sol"; decision.modelReason = "Code needs careful reasoning."; }
+    return answer;
+  };
+  s.comment("fix code");
+  await s.poll();
+  const pass = await routeCandidates(s.options());
+  const ticket = pass.decisions[0]!.ticketId!;
+  assert.deepEqual(pass.failed, []);
+  assert.deepEqual(pass.dispatched, []);
+  assert.equal(store.latestAssignment(ticket), null);
+  assert.ok(store.dueReplies().some((reply) => reply.id.startsWith("model-approval-") && reply.body.includes("ostrom model")));
+  await routeCandidates(s.options());
+  assert.equal(store.dueReplies().filter((reply) => reply.id.startsWith("model-approval-")).length, 1);
+  store.chooseTicketModel(ticket, "codex", "sol", "Operator approved.", true);
+  const released = await routeCandidates(s.options());
+  assert.equal(released.dispatched.length, 1);
+  assert.equal(store.latestAssignment(ticket)?.model, "sol");
+});
+
+test("missing Router choice falls back to cheapest allowed model with a recorded reason", async () => {
+  const s = setup();
+  s.store().models.discovered("codex", [{ harness: "codex", id: "cheap", displayName: "Cheap", description: "", efforts: ["low"], defaultEffort: "low" }]);
+  s.store().models.change({ action: "allow", harness: "codex", model: "cheap" });
+  s.comment("fix typo");
+  await s.poll();
+  const pass = await routeCandidates(s.options());
+  const ticket = pass.decisions[0]!.ticketId!;
+  assert.equal(s.store().latestAssignment(ticket)?.model, "cheap");
+  assert.match(s.store().modelDecisions(ticket)[0]!.reason, /cheapest/);
+});
+
 test("an ignore is recorded with no ticket, no Worker and no reply", async () => {
   const s = setup();
   s.comment("thanks!");

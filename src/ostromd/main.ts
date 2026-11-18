@@ -13,7 +13,7 @@ import { execGh, githubRunner, type GhRunner } from "../github/gh.ts";
 import { sendDueReplies } from "../github/outbox.ts";
 import { processRunner, type ProcessRunner } from "../process.ts";
 import { pollOnce } from "../github/poller.ts";
-import { routeCandidates } from "../router/router.ts";
+import { askRouter, routeCandidates } from "../router/router.ts";
 import { sessionConfig } from "../session/config.ts";
 import { modelDiscovery, type Discover } from "../session/model-discovery.ts";
 import { codexSessionsDir } from "../session/rollout.ts";
@@ -168,6 +168,7 @@ async function run(intervalSeconds: number, deps: MainDeps): Promise<number> {
   const discovery = modelDiscovery(owned.store, deps.env, (message) => deps.stderr(`ostromd: ${message}`), deps.discoverModels);
   const api = localApi(owned.store, {
     refreshModels: () => discovery.refresh(),
+    workerConfig: loadWorkerConfig(deps.env),
     socketPath: defaultSocketPath(deps.env),
     watchdog: () => ({ ...watchdogHealth }),
     tickIntervalSeconds: intervalSeconds,
@@ -206,6 +207,7 @@ function makeWorkers(deps: MainDeps, store: Store): Workers {
     store,
     config: loadWorkerConfig(deps.env),
     runners: deps.runners ?? realRunners(deps.env),
+    askEffort: async (text) => (await askRouter({ router: loadRouterConfig(deps.env), runners: deps.runners ?? realRunners(deps.env) }, text)).reply,
     codexSessions: deps.codexSessions ?? codexSessionsDir(),
     ...(deps.addWorktree === undefined ? {} : { addWorktree: deps.addWorktree }),
     gh: deps.gh,
@@ -319,7 +321,7 @@ export async function main(argv: readonly string[], deps: MainDeps = defaults): 
       return pass.failed.length === 0 ? 0 : 1;
     }
     if (command === "commands") {
-      const pass = await routeCommands(store, workers(), deps.gh, config.repo, config.allowlist);
+      const pass = await routeCommands(store, workers(), deps.gh, config.repo, config.allowlist, loadWorkerConfig(deps.env));
       for (const handled of pass.handled) deps.stdout(JSON.stringify(handled));
       for (const failure of pass.failed) {
         deps.stderr(`ostromd commands: trigger ${failure.triggerId} for ticket ${failure.ticketId} failed: ${failure.error}`);
@@ -367,7 +369,7 @@ export async function main(argv: readonly string[], deps: MainDeps = defaults): 
         refreshBeforeSend: async () => {
           // The final evidence read follows fresh intake and controls. Any failure suppresses HTTP.
           await pollOnce({ store: openStore, gh: deps.gh, repo: config.repo, allowlist: config.allowlist });
-          const controls = await routeCommands(openStore, workers(), deps.gh, config.repo, config.allowlist);
+          const controls = await routeCommands(openStore, workers(), deps.gh, config.repo, config.allowlist, loadWorkerConfig(deps.env));
           if (controls.failed.length > 0) throw new Error("final controls failed");
         },
       });

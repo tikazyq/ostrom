@@ -246,8 +246,9 @@ test(
     const up = deps(env, async () => "[]");
     assert.equal(await main(["dev", "route"], up.deps), 0);
     assert.deepEqual(up.out.map((line) => JSON.parse(line)), [{ triggerId: followUp, ticketId: 1, assignmentId }]);
-    assert.equal(up.runner.sessions[0]?.id, "sess-9");
-    assert.equal(up.runner.sessions[0]?.prompts.length, 1, "the command waited for the turn");
+    const resumed = up.runner.sessions.find((session) => session.options.sandbox !== "read-only");
+    assert.equal(resumed?.id, "sess-9");
+    assert.equal(resumed?.prompts.length, 1, "the command waited for the turn");
 
     const replay = deps(env, async () => "[]");
     assert.equal(await main(["dev", "route"], replay.deps), 0);

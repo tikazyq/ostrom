@@ -47,6 +47,7 @@ function renderDetails(parent,t,detail){
   heading(body,"Recent triggers");list(body,[...detail.triggers].sort((a,b)=>Date.parse(b.occurredAt)-Date.parse(a.occurredAt)).slice(0,10),(li,x)=>{link(li,`${x.actor} · ${x.kind}`,x.url);li.append(document.createTextNode(" · "),time(x.occurredAt))});
   heading(body,"Outbox");list(body,detail.outbox,(li,x)=>{li.append(document.createTextNode(`${x.kind} · ${x.sentAt?"sent":"due"} `),time(x.sentAt??x.nextAttemptAt,false));if(x.lastError)li.append(document.createTextNode(` · ${x.lastError}`))});
   heading(body,"Decisions");list(body,[...detail.decisions].sort((a,b)=>Date.parse(b.decidedAt)-Date.parse(a.decidedAt)),(li,x)=>{li.append(document.createTextNode(`${x.verdict} · `),time(x.decidedAt,false),document.createTextNode(` · ${x.reason}`))});
+  heading(body,"Model and effort decisions");list(body,detail.modelDecisions??[],(li,x)=>{li.append(document.createTextNode(`${x.kind} · ${x.value} · ${x.reason} · `),time(x.decidedAt,false))});
   heading(body,"CLI controls");body.append(node("code",`ostrom pause ${t.id} · ostrom resume ${t.id} · ostrom stop ${t.id} · ostrom extend ${t.id} --time M`));
   disclosure.append(body);parent.append(disclosure);
 }
@@ -59,6 +60,10 @@ function card(t,detail){
   const meta=node("div",null,"meta"),prs=node("span",null,"pr-links");for(const pr of t.pullRequests)link(prs,`PR #${githubUrl(pr)?.split("/").pop()??"unknown"}`,pr);
   if(t.pullRequests.length)meta.append(prs);
   const activity=node("span","Last completed turn: ");activity.append(time(t.assignment?.lastActivityAt));meta.append(activity,node("span",`${t.assignment?.harness??"Unassigned"}${t.assignment?.model?` · ${t.assignment.model}`:""}`));article.append(meta);
+  const turn=t.currentTurn;
+  if(turn){article.append(node("p",`Model: ${turn.requestedModel} — ${turn.modelReason??"Reason unavailable"}`),node("p",`Effort: ${turn.requestedEffort??"default"} — ${turn.effortReason??"Reason unavailable"}`))}
+  if(t.modelSelection && t.assignment && (t.modelSelection.model!==t.assignment.model || t.modelSelection.harness!==t.assignment.harness))article.append(node("p",`Next session: ${t.modelSelection.harness}/${t.modelSelection.model} — ${t.modelSelection.reason}`));
+  if(t.modelSelection && !t.modelSelection.approved)article.append(node("p",`Waiting for operator model approval: ${t.modelSelection.harness}/${t.modelSelection.model} — ${t.modelSelection.reason}`));
   const budgets=node("div",null,"budgets");
   for(const meter of budgetMeters(t)){const container=node("div",null,meter.warning?"budget-warning":""),label=node("div",null,"meter-head"),value=node("span",`${meter.warning?"! ":""}${meter.text}`,"meter-value");label.append(node("span",meter.label),value);container.title=`${meter.label}: ${meter.used.toLocaleString()} used / ${meter.limit.toLocaleString()} limit${meter.warning?" — at least 80% used":""}`;const bar=node("progress");bar.max=100;bar.value=Math.max(0,Math.min(100,meter.percent??0));bar.setAttribute("aria-label",`${meter.label}: ${meter.text}`);container.append(label,bar);budgets.append(container)}
   article.append(budgets);renderDetails(article,t,detail);return article;

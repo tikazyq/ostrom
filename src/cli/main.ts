@@ -23,6 +23,8 @@ commands:
   pause <ticket>
   resume <ticket>
   stop <ticket>
+  model <ticket> <model>
+  effort <ticket> <level>
   extend <ticket> --time M [--turns N] [--tokens N]
   preview
   dashboard
@@ -31,6 +33,7 @@ commands:
 Read-only commands fall back to OSTROM_DB when ostromd is not running.`;
 
 type Command =
+  | { name: "model" | "effort"; ticketId: number; value: string; json: boolean }
   | { name: "status" | "tickets" | "preview"; json: boolean }
   | { name: "show" | "pause" | "resume" | "stop"; ticketId: number; json: boolean }
   | { name: "extend"; ticketId: number; increases: { timeMinutes?: number; turns?: number; tokens?: number }; json: boolean };
@@ -87,6 +90,9 @@ function parse(argv: readonly string[]): Command | null {
   if (args.length === 2 && (args[0] === "show" || args[0] === "pause" || args[0] === "resume" || args[0] === "stop") && /^[1-9]\d*$/.test(args[1]!)) {
     return { name: args[0], ticketId: Number(args[1]), json };
   }
+  if (args.length === 3 && (args[0] === "model" || args[0] === "effort") && /^[1-9]\d*$/.test(args[1]!) && args[2]) {
+    return { name: args[0], ticketId: Number(args[1]), value: args[2], json };
+  }
   if (args[0] !== "extend" || !/^[1-9]\d*$/.test(args[1] ?? "")) return null;
   const increases: { timeMinutes?: number; turns?: number; tokens?: number } = {};
   for (let index = 2; index < args.length; index += 2) {
@@ -107,6 +113,7 @@ async function api(command: Command, env: Record<string, string | undefined>): P
   if (command.name === "tickets") return call(socketPath, "GET", "/v1/tickets");
   if (command.name === "show") return call(socketPath, "GET", `/v1/tickets/${command.ticketId}`);
   if (command.name === "preview") return call(socketPath, "GET", "/v1/preview");
+  if (command.name === "model" || command.name === "effort") return call(socketPath, "POST", `/v1/tickets/${command.ticketId}/${command.name}`, { value: command.value });
   if (command.name === "extend") return call(socketPath, "POST", `/v1/tickets/${command.ticketId}/extend`, command.increases);
   if (command.name === "pause" || command.name === "resume" || command.name === "stop") {
     return call(socketPath, "POST", `/v1/tickets/${command.ticketId}/${command.name}`);
@@ -171,7 +178,7 @@ function output(command: Command, value: unknown): void {
   }
   if (command.name === "status") return status(value as OperatorStatus);
   if (command.name === "tickets") return tickets(value as OperatorTicket[]);
-  if (command.name === "show" || command.name === "pause" || command.name === "resume" || command.name === "stop" || command.name === "extend") return show(value as OperatorTicketDetail);
+  if (command.name === "show" || command.name === "pause" || command.name === "resume" || command.name === "stop" || command.name === "extend" || command.name === "model" || command.name === "effort") return show(value as OperatorTicketDetail);
   process.stdout.write((value as { markdown: string }).markdown);
 }
 
@@ -193,6 +200,8 @@ function show(ticket: OperatorTicketDetail): void {
   process.stdout.write(`budget  turns ${ticket.budget.turns}/${ticket.budget.turnLimit}  tokens ${ticket.budget.inputTokens + ticket.budget.outputTokens}/${ticket.budget.tokenLimit}\n`);
   if (ticket.assignment?.sessionId !== null && ticket.assignment?.sessionId !== undefined) process.stdout.write(`session ${ticket.assignment.sessionId}\nsemon query read_transcript ${ticket.assignment.sessionId}\n`);
   for (const decision of ticket.decisions) process.stdout.write(`decision ${decision.id}  ${decision.verdict}  ${decision.reason}\n`);
+  for (const decision of ticket.modelDecisions ?? []) process.stdout.write(`selection ${decision.kind}  ${decision.value}  ${decision.reason}\n`);
+  if (ticket.currentTurn) process.stdout.write(`current model ${ticket.currentTurn.requestedModel}: ${ticket.currentTurn.modelReason ?? "reason unavailable"}; effort ${ticket.currentTurn.requestedEffort ?? "default"}: ${ticket.currentTurn.effortReason ?? "reason unavailable"}\n`);
   for (const trigger of ticket.triggers) process.stdout.write(`trigger ${trigger.id}  ${trigger.kind}  ${trigger.url}\n`);
   for (const assignment of ticket.assignments) process.stdout.write(`assignment ${assignment.id}  ${assignment.state}  ${assignment.outcome ?? "-"}\n`);
   for (const turn of ticket.turns) process.stdout.write(`turn ${turn.id}  ${turn.kind}  ${turn.status}  model ${turn.observedModel ?? "unverified"} (requested ${turn.requestedModel})  effort ${turn.observedEffort ?? "unverified"} (requested ${turn.requestedEffort ?? "default"})\n`);
