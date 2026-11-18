@@ -2,6 +2,8 @@
 export function ticketPhase(ticket) {
   if (ticket.state === "ended") return { key: "finished", label: "Finished", tone: "neutral", detail: "" };
   if (ticket.state === "paused") return { key: "paused", label: "Paused", tone: "amber", detail: ticket.pauseCause ?? "Cause unavailable" };
+  if (ticket.modelApproval) return { key: "approval", label: "Waiting for model approval", tone: "amber",
+    detail: `Approve ${ticket.modelApproval} with ostrom model ${ticket.id} ${ticket.modelApproval}.` };
   if (ticket.assignment?.outcome === "failed" || ticket.latestFailure) return {
     key: "failed", label: "Failed", tone: "red",
     detail: ticket.latestFailure?.summary ?? ticket.assignment?.lastError ?? ticket.assignment?.endReason ?? "Failure details unavailable",

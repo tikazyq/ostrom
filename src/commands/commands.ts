@@ -4,6 +4,7 @@ import type { Store, Trigger } from "../store/store.ts";
 import { pullRequestsForBranch } from "../worker/dispatch.ts";
 import { clearStallForHumanReply, followUpMessage } from "../worker/follow-up.ts";
 import type { Workers } from "../worker/workers.ts";
+import { InvalidTicketOverride } from "../router/selection.ts";
 import { parseComment } from "./parser.ts";
 
 export interface CommandPass {
@@ -16,6 +17,7 @@ export function operatorControls(store: Store, workers: Workers, gh: GhRunner, r
   pause(ticketId: number): Promise<void>;
   resume(ticketId: number): Promise<void>;
   stop(ticketId: number): Promise<void>;
+  override(ticketId: number, kind: "model" | "effort", value: unknown): void;
 } {
   const running = (ticketId: number) => {
     const assignment = store.latestAssignment(ticketId);
@@ -23,7 +25,12 @@ export function operatorControls(store: Store, workers: Workers, gh: GhRunner, r
     return assignment;
   };
   return {
+    override: (ticketId, kind, value) => workers.override(ticketId, kind, value),
     async pause(ticketId) {
+      if (store.latestAssignment(ticketId) === null) {
+        store.pauseTicket(ticketId, "paused by the operator");
+        return;
+      }
       const assignment = running(ticketId);
       store.pauseTicket(ticketId, "paused by the operator");
       queueStatusCard(store, ticketId);
@@ -35,6 +42,10 @@ export function operatorControls(store: Store, workers: Workers, gh: GhRunner, r
         queueStatusCard(store, ticketId);
         return;
       }
+      if (store.latestAssignment(ticketId) === null) {
+        if (store.getTicket(ticketId).state === "paused") store.resumeTicket(ticketId);
+        return;
+      }
       const assignment = running(ticketId);
       if (store.getTicket(ticketId).state === "paused") store.resumeTicket(ticketId);
       else store.clearTicketStalls(ticketId);
@@ -43,6 +54,10 @@ export function operatorControls(store: Store, workers: Workers, gh: GhRunner, r
       workers.deliver(assignment.id, `operator-resume-${ticketId}`, "This ticket has resumed. Continue your work.", () => {});
     },
     async stop(ticketId) {
+      if (store.latestAssignment(ticketId) === null) {
+        store.endTicket(ticketId);
+        return;
+      }
       const assignment = running(ticketId);
       store.requestStop(ticketId);
       const queued = workers.deliver(
@@ -81,7 +96,7 @@ export async function routeCommands(
     const parsed = parseComment(pending.trigger.body ?? "");
     const command = pending.trigger.kind === "issue_state" ?
       (pending.trigger.body === "closed" ? (store.getThread(pending.trigger.threadId).kind === "issue" ? "close_issue" : "close_pull_request") : "ignore_issue_state") :
-      parsed.kind === "command" ? parsed.command : "redirect";
+      parsed.kind === "redirect" ? "redirect" : parsed.command;
     try {
       if (command === "ignore_issue_state") {
         store.recordCommandReceipt(pending.trigger.id, pending.ticketId, command, false);
@@ -89,7 +104,7 @@ export async function routeCommands(
         continue;
       }
       const allowed = command === "redirect" || command === "close_issue" || command === "close_pull_request" || await mayControl(
-        store, gh, repo, pending.trigger, pending.ticketId, permissions, authors,
+        store, gh, repo, pending.trigger, pending.ticketId, permissions, authors, parsed.kind === "override",
       );
       if (!allowed) {
         store.recordCommandReceipt(pending.trigger.id, pending.ticketId, "forbidden", false);
@@ -97,7 +112,19 @@ export async function routeCommands(
         pass.handled.push({ triggerId: pending.trigger.id, ticketId: pending.ticketId, command, allowed });
         continue;
       }
-      if (command === "close_pull_request") {
+      if (parsed.kind === "override" && (command === "use" || command === "effort")) {
+        try {
+          workers.override(pending.ticketId, command === "use" ? "model" : "effort", parsed.value,
+            { login: pending.trigger.actor, triggerId: pending.trigger.id });
+        } catch (error) {
+          if (!(error instanceof InvalidTicketOverride)) throw error;
+          store.recordCommandReceipt(pending.trigger.id, pending.ticketId, "override", false);
+          enqueueReaction(store, pending.trigger, "confused");
+          pass.handled.push({ triggerId: pending.trigger.id, ticketId: pending.ticketId, command, allowed: false });
+          continue;
+        }
+        enqueueReaction(store, pending.trigger, "+1");
+      } else if (command === "close_pull_request") {
         const assignment = store.latestAssignment(pending.ticketId);
         if (assignment?.state !== "running") throw new Error(`ticket ${pending.ticketId} has no running Worker`);
         // GitHub reports a merged PR as closed. A merge is the work done, which the Router's outcome
@@ -111,6 +138,14 @@ export async function routeCommands(
           store.endAssignment(assignment.id, "pull request closed");
           queueStatusCard(store, pending.ticketId);
         }
+      } else if ((command === "close_issue" || command === "stop" || command === "pause" || command === "resume") &&
+          store.latestAssignment(pending.ticketId) === null) {
+        const ticket = store.getTicket(pending.ticketId);
+        if (command === "pause" && ticket.state === "open") store.pauseTicket(ticket.id, `paused by @${pending.trigger.actor} on GitHub`);
+        if (command === "resume" && ticket.state === "paused") store.resumeTicket(ticket.id);
+        if (command === "stop" || command === "close_issue") store.endTicket(ticket.id);
+        store.recordCommandReceipt(pending.trigger.id, ticket.id, command, true);
+        if (command !== "close_issue") enqueueReaction(store, pending.trigger, "+1");
       } else if (command === "close_issue") {
         const assignment = store.latestAssignment(pending.ticketId);
         if (assignment?.state !== "running") throw new Error(`ticket ${pending.ticketId} has no running Worker`);
@@ -131,6 +166,7 @@ export async function routeCommands(
         store.recordCommandReceipt(pending.trigger.id, pending.ticketId, "close_issue", true);
         if (queued) workers.cancel(assignment.id);
       } else if (command === "redirect") {
+        if (store.latestAssignment(pending.ticketId) === null) continue;
         if (allowlist.some((actor) => actor.toLowerCase() === pending.trigger.actor.toLowerCase())) {
           clearStallForHumanReply(store, pending.ticketId);
         }
@@ -208,11 +244,12 @@ async function mayControl(
   gh: GhRunner,
   repo: string,
   trigger: Trigger,
-  _ticketId: number,
+  ticketId: number,
   permissions: Map<string, Promise<boolean>>,
   authors: Map<number, Promise<string>>,
+  override: boolean,
 ): Promise<boolean> {
-  const thread = store.getThread(trigger.threadId);
+  const thread = override ? store.ticketContext(ticketId).thread : store.getThread(trigger.threadId);
   const author = authors.get(thread.id) ?? issueAuthor(gh, repo, thread.number);
   authors.set(thread.id, author);
   return trigger.actor.toLowerCase() === (await author).toLowerCase() || collaborator(gh, repo, trigger.actor, permissions);

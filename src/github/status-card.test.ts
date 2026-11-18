@@ -46,3 +46,8 @@ async function snapshot(state: StatusCardState): Promise<string> {
 async function budgetSnapshot(): Promise<string> {
   return readFile(new URL("./__snapshots__/status-card-budget-paused.md", import.meta.url), "utf8");
 }
+
+test("status card snapshot: model and effort reasons", async () => {
+  assert.equal(renderStatusCard({ ...base, state: "working", modelReason: "Fits a small docs change.", effort: "low", effortReason: "A typo fix needs little reasoning." }),
+    await readFile(new URL("./__snapshots__/status-card-turn-selection.md", import.meta.url), "utf8"));
+});

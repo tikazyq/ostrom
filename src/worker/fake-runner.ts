@@ -1,10 +1,11 @@
 // A fake session runner for tests: sessions hand out ids, record the prompts they are sent, and
 // hold each turn open until the test releases it, so queueing and interruption can be exercised.
 
-import type { Runner, Session, SessionOptions, TurnResult } from "../session/runner.ts";
+import type { Effort, Runner, Session, SessionOptions, TurnResult } from "../session/runner.ts";
 
 export class FakeSession implements Session {
   readonly prompts: string[] = [];
+  readonly efforts: (Effort | null | undefined)[] = [];
   /** Turns that have started and not finished; the test calls `release` to finish the oldest. */
   readonly #open: { resolve: (r: TurnResult) => void; reject: (e: Error) => void; cancel: () => void }[] = [];
   /** When true a turn finishes at once instead of waiting for `release`. */
@@ -24,8 +25,9 @@ export class FakeSession implements Session {
     this.resumed = resumed;
   }
 
-  async send(prompt: string, signal?: AbortSignal): Promise<TurnResult> {
+  async send(prompt: string, signal?: AbortSignal, effort?: Effort | null): Promise<TurnResult> {
     this.prompts.push(prompt);
+    this.efforts.push(effort);
     this.running++;
     this.maxRunning = Math.max(this.maxRunning, this.running);
     try {
@@ -91,11 +93,11 @@ export class FakeRunner implements Runner {
     }
     const send = session.send.bind(session);
     let announced = false;
-    session.send = async (prompt, signal) => {
+    session.send = async (prompt, signal, effort) => {
       if (!announced) options.onSessionId?.(session.id);
       announced = true;
       if (this.failAfterId !== undefined) throw this.failAfterId;
-      return send(prompt, signal);
+      return send(prompt, signal, effort);
     };
     return session;
   }

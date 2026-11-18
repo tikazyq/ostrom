@@ -24,7 +24,7 @@ test("models CLI exercises API mutations, JSON export/import, refresh refusal an
   let offline = false;
   const api = localApi(store, {
     socketPath: join(root, "ostrom", "ostromd.sock"),
-    control: { pause: async () => {}, resume: async () => {}, stop: async () => {}, extend: async () => {}, preview: async () => "" },
+    control: { override: () => {}, pause: async () => {}, resume: async () => {}, stop: async () => {}, extend: async () => {}, preview: async () => "" },
     refreshModels: async () => {
       if (offline) store.models.failed("codex", "offline");
       else store.models.discovered("codex", [{ harness: "codex", id: "sol", displayName: "Sol", description: "Model", efforts: ["low", "high"], defaultEffort: "high" }]);

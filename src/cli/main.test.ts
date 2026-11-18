@@ -4,6 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 
+import { defaultSocketPath, localApi } from "../api/server.ts";
+import { overrideSelection } from "../router/selection.ts";
 import { Store } from "../store/store.ts";
 import { main } from "./main.ts";
 
@@ -76,4 +78,28 @@ test("mutating CLI commands require a running daemon", async () => {
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }
+});
+
+test("ticket model and effort CLI commands validate and store overrides through the daemon API", async () => {
+  const root = mkdtempSync(join(tmpdir(), "ostrom-overrides-cli-"));
+  const env = { XDG_RUNTIME_DIR: root, OSTROM_DB: join(root, "store.db") };
+  const id = ticket(env.OSTROM_DB);
+  const store = Store.open(env.OSTROM_DB);
+  const config = { repo: "/r", base: "main", worktrees: "/w", harness: "codex" as const, model: "luna", machine: "host" };
+  const api = localApi(store, {
+    socketPath: defaultSocketPath(env),
+    control: { override: (ticketId, kind, value) => overrideSelection(store, config, ticketId, kind, value),
+      pause: async () => {}, resume: async () => {}, stop: async () => {}, extend: async () => {}, preview: async () => "" },
+  });
+  try {
+    store.models.discovered("codex", [{ harness: "codex", id: "sol", displayName: "Sol", description: "", efforts: ["high"], defaultEffort: "high" }]);
+    store.models.change({ action: "allow", harness: "codex", model: "sol" });
+    await api.start();
+    assert.equal(await main(["model", String(id), "codex/sol", "--json"], env), 0);
+    assert.equal(await main(["effort", String(id), "high", "--json"], env), 0);
+    assert.equal(await main(["effort", String(id), "max", "--json"], env), 1);
+    assert.equal(await main(["model", String(id), "missing"], env), 1);
+    assert.deepEqual(store.ticketSelections(id).map(({ kind, value, operator }) => [kind, value, operator]),
+      [["model_override", "codex/sol", true], ["effort_override", "high", true]]);
+  } finally { await api.close(); store.close(); rmSync(root, { recursive: true, force: true }); }
 });

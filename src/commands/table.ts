@@ -1,4 +1,4 @@
-export type CommandName = "redirect" | "pause" | "resume" | "stop" | "close_issue" | "close_pull_request" | "forbidden";
+export type CommandName = "redirect" | "pause" | "resume" | "stop" | "close_issue" | "close_pull_request" | "forbidden" | "use" | "effort";
 
 export interface CommandDefinition {
   name: CommandName;
@@ -37,6 +37,20 @@ export const COMMANDS: readonly CommandDefinition[] = [
     effect: "Graceful stop: push work in progress, turn the PR into a draft, post one summary of where it stopped. The ticket ends.",
     whoMay: "Issue author, or repo triage or higher",
     acknowledgement: "👍 and one closing comment",
+  },
+  {
+    name: "use",
+    sayOrDo: "`@ostrom use <model>`",
+    effect: "Selects an allowed model for the next session. Approval-flagged models require the CLI.",
+    whoMay: "Issue author, or repo triage or higher",
+    acknowledgement: "👍 or 😕",
+  },
+  {
+    name: "effort",
+    sayOrDo: "`@ostrom effort <level>`",
+    effect: "Sets an allowed effort for future turns.",
+    whoMay: "Issue author, or repo triage or higher",
+    acknowledgement: "👍 or 😕",
   },
   {
     name: "close_issue",
@@ -80,5 +94,5 @@ function cell(value: string): string {
 }
 
 export function controlsLine(): string {
-  return "Controls: `@ostrom pause`, `@ostrom resume`, `@ostrom stop`, or reply to redirect.";
+  return "Controls: `@ostrom pause`, `@ostrom resume`, `@ostrom stop`, `@ostrom use <model>`, `@ostrom effort <level>`, or reply to redirect.";
 }

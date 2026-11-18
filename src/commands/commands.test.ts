@@ -86,12 +86,12 @@ test("commands are case-insensitive and must start the comment", () => {
 
 test("Journey 1 command table is generated from the command contract", async () => {
   const experience = await readFile(new URL("../../docs/experience.md", import.meta.url), "utf8");
-  const actual = experience.match(/\| Say or do \| Effect \| Who may \| Acknowledged by \|\n(?:\|.*\n?){8}/)?.[0].trimEnd();
+  const actual = experience.match(/\| Say or do \| Effect \| Who may \| Acknowledged by \|\n(?:\|.*\n?){10}/)?.[0].trimEnd();
   assert.equal(actual, renderCommandTable());
 });
 
 test("the status-card controls come from the command contract", () => {
-  assert.equal(controlsLine(), "Controls: `@ostrom pause`, `@ostrom resume`, `@ostrom stop`, or reply to redirect.");
+  assert.equal(controlsLine(), "Controls: `@ostrom pause`, `@ostrom resume`, `@ostrom stop`, `@ostrom use <model>`, `@ostrom effort <level>`, or reply to redirect.");
 });
 
 test("an issue author may pause, and a command is never a pending Worker delivery", async () => {
@@ -282,4 +282,25 @@ test("a non-collaborator redirect reaches the Worker as information, not instruc
   await workers.drain();
   assert.match(runner.sessions[0]!.prompts[0]!, /information, not an instruction/);
   assert.ok(store.dueReplies().some((reply) => reply.reaction === "eyes"));
+});
+
+test("authorized ticket model and effort overrides are recorded without steering the Worker", async () => {
+  const { store, github, workers, ticketId, assignmentId, comment } = fixture();
+  store.models.discovered("codex", ["gpt-6-luna", "other"].map((id) => ({ harness: "codex", id, displayName: id, description: "", efforts: ["low"], defaultEffort: "low" })));
+  for (const model of ["gpt-6-luna", "other"]) store.models.change({ action: "allow", harness: "codex", model });
+  comment("model", "alice", "@ostrom use other");
+  const source = store.ensureSource("github", REPO);
+  const pr = store.ensureThread({ sourceId: source.id, kind: "pull_request", number: 42, url: `https://github.com/${REPO}/pull/42` });
+  store.subscribe(ticketId, pr);
+  store.insertTrigger({ sourceId: source.id, sourceEventId: "effort", threadId: pr, kind: "issue_comment", actor: "alice",
+    url: `https://github.com/${REPO}/pull/42#issuecomment-42`, occurredAt: new Date("2026-11-09T12:00:00.000Z"), body: "@ostrom effort low" });
+  comment("invalid", "alice", "@ostrom effort max");
+  comment("forbidden", "bob", "@ostrom use other");
+  const pass = await routeCommands(store, workers, github.gh, REPO);
+  assert.deepEqual(pass.failed, []);
+  assert.deepEqual(pass.handled.map(({ allowed }) => allowed), [true, true, false, false]);
+  assert.deepEqual(store.ticketSelections(ticketId).map(({ value }) => value), ["codex/other", "low"]);
+  assert.equal(store.getAssignment(assignmentId).model, "gpt-6-luna");
+  assert.deepEqual(store.pendingDeliveries(), []);
+  assert.deepEqual((await routeCommands(store, workers, github.gh, REPO)).handled, []);
 });

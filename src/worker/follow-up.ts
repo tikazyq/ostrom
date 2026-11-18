@@ -42,6 +42,8 @@ export function routeFollowUps(store: Store, workers: Workers, allowlist: readon
     }
     if (store.getTicket(ticketId).state === "ended") continue;
     if (assignmentId === null) {
+      // Accepted work can be waiting for model approval before it has an assignment.
+      if (store.latestAssignment(ticketId) === null) continue;
       pass.failed.push({ triggerId: trigger.id, ticketId, error: `ticket ${ticketId} has no running Worker` });
       continue;
     }

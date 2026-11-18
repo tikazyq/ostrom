@@ -19,6 +19,7 @@ export interface ApiControl {
   stop(ticketId: number): Promise<void>;
   extend(ticketId: number, increases: { timeMinutes?: number; turns?: number; tokens?: number }): Promise<void>;
   preview(): Promise<string>;
+  override(ticketId: number, kind: "model" | "effort", value: unknown): void;
 }
 
 export interface LocalApiOptions {
@@ -68,14 +69,14 @@ export function localApi(store: Store, options: LocalApiOptions): LocalApi {
       const ticket = /^\/v1\/tickets\/([1-9]\d*)$/.exec(url.pathname);
       if (request.method === "GET" && ticket !== null) return reply(response, 200, store.operatorTicket(Number(ticket[1])));
       if (request.method === "GET" && url.pathname === "/v1/preview") return reply(response, 200, { markdown: await options.control.preview() });
-      const action = /^\/v1\/tickets\/([1-9]\d*)\/(pause|resume|stop|extend)$/.exec(url.pathname);
+      const action = /^\/v1\/tickets\/([1-9]\d*)\/(pause|resume|stop|extend|model|effort)$/.exec(url.pathname);
       if (request.method === "POST" && action !== null) {
         const ticketId = Number(action[1]);
         if (action[2] === "pause") await options.control.pause(ticketId);
         else if (action[2] === "resume") await options.control.resume(ticketId);
         else if (action[2] === "stop") await options.control.stop(ticketId);
         else if (action[2] === "extend") await options.control.extend(ticketId, await json(request));
-        else return reply(response, 404, { error: "not found" });
+        else if (action[2] === "model" || action[2] === "effort") options.control.override(ticketId, action[2], await bodyJson(request));
         return reply(response, 200, store.operatorTicket(ticketId));
       }
       return reply(response, request.method === "GET" || request.method === "POST" ? 404 : 405, { error: "not found" });

@@ -17,6 +17,9 @@ export interface StatusCard {
   pullRequest?: string;
   harness: "claude" | "codex";
   model: string;
+  modelReason?: string;
+  effort?: string | null;
+  effortReason?: string;
   lastActivityAt: Date;
   now: Date;
   /** Stable outbox id, embedded to recognise and recover the card after a crash. */
@@ -47,7 +50,8 @@ export function renderStatusCard(card: StatusCard): string {
   if (card.mergeStatus !== undefined) lines.push("", `Merge: ${card.mergeStatus}`);
   lines.push(
     "",
-    `Harness: \`${card.harness}\` · Model: \`${card.model}\``,
+    `Harness: \`${card.harness}\` · Model: \`${card.model}\`${card.modelReason === undefined ? "" : ` — ${reasonText(card.modelReason)}`}`,
+    ...(card.effort === undefined ? [] : [`Effort: \`${card.effort ?? "default"}\`${card.effortReason === undefined ? "" : ` — ${reasonText(card.effortReason)}`}`]),
     `Last activity: ${utcMinute(card.lastActivityAt)}`,
     controlsLine(),
     "",
@@ -59,4 +63,8 @@ export function renderStatusCard(card: StatusCard): string {
 // An absolute time, because the card is edited only on events: "N min ago" would go stale.
 function utcMinute(at: Date): string {
   return `${at.toISOString().slice(0, 16).replace("T", " ")} UTC`;
+}
+
+function reasonText(reason: string): string {
+  return reason.replace(/[\\`*_~<>\[\]]/g, "\\$&").replaceAll("@", "&#64;");
 }

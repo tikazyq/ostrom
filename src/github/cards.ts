@@ -10,6 +10,7 @@ export function queueStatusCard(store: Store, ticketId: number, now = new Date()
   const ticket = context.ticket;
   const assignment = store.latestAssignment(ticketId);
   if (assignment === null || assignment.harness === null || assignment.model === null) return;
+  const turn = store.latestWorkerTurn(assignment.id);
   const openStall = store.unansweredStalls().find((stall) => stall.assignmentId === assignment.id);
   const candidate = store.mergeCandidateForAssignment(assignment.id);
   const policy = candidate === null ? null : JSON.parse(candidate.policy) as { strategy: string };
@@ -35,7 +36,10 @@ export function queueStatusCard(store: Store, ticketId: number, now = new Date()
       ...(ticket.pauseCause === null ? {} : { pauseCause: ticket.pauseCause }),
       ...(candidate === null || ticket.state === "ended" ? {} : { mergeStatus: `policy ${policy!.strategy}; head ${candidate.headSha}; ${candidate.blockingReason === "quiet period has not elapsed" && candidate.quietDeadline !== null ? `earliest merge ${candidate.quietDeadline}` : candidate.blockingReason === null ? "waiting for ready reply" : candidate.blockingReason}` }),
       harness: assignment.harness,
-      model: assignment.model,
+      model: turn?.requestedModel ?? assignment.model,
+      ...(assignment.modelReason === null ? {} : { modelReason: assignment.modelReason }),
+      ...(turn === null ? {} : { effort: turn.requestedEffort }),
+      ...(turn?.effortReason == null ? {} : { effortReason: turn.effortReason }),
       lastActivityAt,
       now,
       markerId: `card-thread-${context.thread.id}`,

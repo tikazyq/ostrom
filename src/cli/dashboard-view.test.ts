@@ -104,3 +104,9 @@ test("refresh does not overlap, retains stale data and recovers", async () => {
   const first = refresh(); await refresh(); assert.equal(calls, 1); resolve("snapshot"); await first; await refresh(); await refresh();
   assert.deepEqual(successes, ["snapshot", "recovered"]); assert.equal((failures[0] as unknown[])[0], "snapshot");
 });
+
+test("an undispatched ticket shows the model approval command", () => {
+  const view = ticketPhase(ticket({ id: 4, modelApproval: "codex/sol" }));
+  assert.equal(view.label, "Waiting for model approval");
+  assert.match(view.detail, /ostrom model 4 codex\/sol/);
+});

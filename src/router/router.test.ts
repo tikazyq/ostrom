@@ -48,11 +48,13 @@ function setup(dbPath = ":memory:") {
   github.issue(8);
   const runner = new FakeRunner();
   let answer: (batch: Batch) => RouterAnswer | string = acceptAll;
+  let effortAnswer = '{"effort":"high","reason":"The turn needs careful validation."}';
   const start = runner.start.bind(runner);
   runner.start = (options) => {
     const session = start(options);
     if (options.sandbox === "read-only") {
       session.reply = (prompt) => {
+        if (prompt.startsWith("Choose reasoning effort")) return effortAnswer;
         const next = answer(batchOf(prompt));
         return typeof next === "string" ? next : JSON.stringify(next);
       };
@@ -62,7 +64,7 @@ function setup(dbPath = ":memory:") {
   let store = Store.open(dbPath, { now });
   const addWorktree = async (_repo: string, _path: string, _base: string, ticket: number, assignment: number) =>
     `ostrom/ticket-${ticket}-${assignment}`;
-  const workers = () => new Workers({ store, config: workerConfig, runners: { claude: runner, codex: runner }, addWorktree });
+  const workers = () => new Workers({ store, config: workerConfig, router, runners: { claude: runner, codex: runner }, addWorktree });
   const options = (): RouteOptions => ({
     store,
     gh: github.gh,
@@ -82,6 +84,7 @@ function setup(dbPath = ":memory:") {
     github,
     runner,
     routerSessions: () => runner.sessions.filter((session) => session.options.sandbox === "read-only"),
+    set effortAnswer(value: string) { effortAnswer = value; },
     get answer() { return answer; },
     set answer(value: (batch: Batch) => RouterAnswer | string) { answer = value; },
     workers,
@@ -488,4 +491,80 @@ test("a flagged stall does not make the Router run", async () => {
   assert.equal(next.router, null);
   assert.deepEqual(next.stalls, []);
   assert.equal(s.store().getAssignment(assignment.assignmentId).state, "running");
+});
+
+function catalog(store: Store) {
+  store.models.discovered("codex", [{ harness: "codex", id: "cheap", displayName: "Cheap", description: "", efforts: ["low", "high"], defaultEffort: "low" }]);
+  store.models.discovered("claude", [{ harness: "claude", id: "premium", displayName: "Premium", description: "", efforts: ["low", "high"], defaultEffort: null }]);
+  store.models.change({ action: "allow", harness: "codex", model: "cheap" });
+  store.models.change({ action: "allow", harness: "claude", model: "premium" });
+  store.models.change({ action: "set", harness: "claude", model: "premium", approval: true, cost: 2 });
+}
+
+test("Router model choice waits for operator approval and stays fixed while effort changes", async () => {
+  const s = setup();
+  const store = s.store();
+  try {
+    catalog(store);
+    s.answer = (batch) => {
+      assert.deepEqual(batch.modelPolicy?.models.map(({ harness, model, approval }) => [harness, model, approval]),
+        [["codex", "cheap", false], ["claude", "premium", true]]);
+      const reply = acceptAll(batch);
+      return JSON.stringify({ ...reply, decisions: reply.decisions.map((decision) => ({ ...decision, model: "claude/premium", modelReason: "Fits the work." })) });
+    };
+    s.comment("fix the README");
+    await s.poll();
+    const options = s.options();
+    const waiting = await routeCandidates(options);
+    const ticketId = waiting.decisions[0]!.ticketId!;
+    assert.deepEqual(waiting.dispatched, []);
+    assert.equal(store.latestAssignment(ticketId), null);
+    assert.equal(store.operatorTicket(ticketId).modelApproval, "claude/premium");
+    assert.deepEqual((await routeCandidates(options)).failed, []);
+    assert.equal(store.dueReplies().filter(({ id }) => id.startsWith("model-approval-")).length, 1);
+    assert.throws(() => options.workers.override(ticketId, "model", "claude/premium", { login: "alice", triggerId: 1 }), /local CLI/);
+
+    options.workers.override(ticketId, "model", "claude/premium");
+    const started = await routeCandidates(options);
+    await options.workers.drain();
+    const id = started.dispatched[0]!.assignmentId;
+    const worker = s.runner.sessions.find((session) => session.options.sandbox !== "read-only")!;
+    assert.equal(worker.options.model, "premium");
+    assert.equal(store.getAssignment(id).harness, "claude");
+    assert.throws(() => options.workers.override(ticketId, "effort", "max"), /not allowed/);
+    options.workers.override(ticketId, "model", "codex/cheap");
+    options.workers.override(ticketId, "effort", "low");
+    options.workers.deliver(id, "conflict-with-base", "Resolve the base conflict", () => {});
+    await options.workers.drain();
+    assert.deepEqual(worker.efforts, ["high", "low"]);
+    assert.deepEqual(store.ticketTurns(ticketId).map(({ kind, requestedModel, requestedEffort, effortReason }) =>
+      [kind, requestedModel, requestedEffort, effortReason]), [
+      ["dispatch", "premium", "high", "The turn needs careful validation."],
+      ["conflict", "premium", "low", "Overridden by the operator."],
+    ]);
+    assert.equal(store.operatorTicket(ticketId).currentTurn?.requestedEffort, "low");
+    assert.equal(store.ticketSelections(ticketId)[0]?.reason, "Fits the work.");
+    assert.ok(store.dueReplies().some(({ body }) => body.includes("Effort: `low` — Overridden by the operator.")));
+  } finally { store.close(); }
+});
+
+test("missing model and invalid effort choices fall back to allowed values with recorded reasons", async () => {
+  const s = setup();
+  const store = s.store();
+  try {
+    catalog(store);
+    s.effortAnswer = '{"effort":"max","reason":"More thinking."}';
+    s.comment("fix the README");
+    await s.poll();
+    const options = s.options();
+    const pass = await routeCandidates(options);
+    await options.workers.drain();
+    const { ticketId, assignmentId } = pass.dispatched[0]!;
+    const [decision] = store.ticketSelections(ticketId);
+    assert.equal(decision?.kind, "fallback");
+    assert.equal(decision?.value, "codex/cheap");
+    assert.equal(store.getAssignment(assignmentId).model, "cheap");
+    assert.equal(store.ticketTurns(ticketId)[0]?.requestedEffort, "low");
+    assert.match(store.ticketTurns(ticketId)[0]!.effortReason!, /No valid Router effort/);
+  } finally { store.close(); }
 });

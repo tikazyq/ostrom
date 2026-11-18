@@ -59,6 +59,8 @@ function card(t,detail){
   const meta=node("div",null,"meta"),prs=node("span",null,"pr-links");for(const pr of t.pullRequests)link(prs,`PR #${githubUrl(pr)?.split("/").pop()??"unknown"}`,pr);
   if(t.pullRequests.length)meta.append(prs);
   const activity=node("span","Last completed turn: ");activity.append(time(t.assignment?.lastActivityAt));meta.append(activity,node("span",`${t.assignment?.harness??"Unassigned"}${t.assignment?.model?` · ${t.assignment.model}`:""}`));article.append(meta);
+  if(t.assignment?.modelReason)article.append(node("p",`Model: ${t.assignment.modelReason}`,"phase-detail"));
+  if(t.currentTurn)article.append(node("p",`Effort: ${t.currentTurn.requestedEffort??"default"}${t.currentTurn.effortReason?` — ${t.currentTurn.effortReason}`:""}`,"phase-detail"));
   const budgets=node("div",null,"budgets");
   for(const meter of budgetMeters(t)){const container=node("div",null,meter.warning?"budget-warning":""),label=node("div",null,"meter-head"),value=node("span",`${meter.warning?"! ":""}${meter.text}`,"meter-value");label.append(node("span",meter.label),value);container.title=`${meter.label}: ${meter.used.toLocaleString()} used / ${meter.limit.toLocaleString()} limit${meter.warning?" — at least 80% used":""}`;const bar=node("progress");bar.max=100;bar.value=Math.max(0,Math.min(100,meter.percent??0));bar.setAttribute("aria-label",`${meter.label}: ${meter.text}`);container.append(label,bar);budgets.append(container)}
   article.append(budgets);renderDetails(article,t,detail);return article;

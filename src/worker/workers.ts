@@ -10,7 +10,9 @@ import { queueStatusCard } from "../github/cards.ts";
 import { ghGet, type GhRunner } from "../github/gh.ts";
 import { renderReviewReply } from "../github/review-reply.ts";
 import { parseStuckReply, renderStuckReply } from "../watchdog/stuck.ts";
-import type { WorkerConfig } from "../ostromd/config.ts";
+import { askRouter } from "../router/router.ts";
+import { chooseEffort, dispatchChoice, modelKey, overrideSelection } from "../router/selection.ts";
+import type { RouterConfig, WorkerConfig } from "../ostromd/config.ts";
 import { rolloutContext } from "../session/rollout.ts";
 import type { Runner, Session, TurnResult } from "../session/runner.ts";
 import { createWorktree } from "../session/worktree.ts";
@@ -26,6 +28,7 @@ export interface Dispatched {
 export interface WorkersDeps {
   store: Store;
   config: WorkerConfig;
+  router?: RouterConfig;
   runners: Record<"claude" | "codex", Runner>;
   /** Where Codex writes rollout records; set to verify the Worker's model after each Codex turn. */
   codexSessions?: string;
@@ -86,6 +89,23 @@ export class Workers {
     this.#deps = deps;
   }
 
+  override(ticketId: number, kind: "model" | "effort", value: unknown, actor?: { login: string; triggerId: number }): void {
+    overrideSelection(this.#deps.store, this.#deps.config, ticketId, kind, value, actor);
+  }
+
+  canDispatch(ticketId: number): boolean {
+    const { store, config } = this.#deps;
+    const choice = dispatchChoice(store, ticketId, config);
+    if (!choice.needsApproval) return true;
+    const model = modelKey(choice);
+    if (choice.fallback !== undefined && !store.hasReply(`model-approval-${ticketId}-${model}`)) {
+      store.recordTicketSelection(ticketId, choice.fallback);
+    }
+    store.enqueueReply({ id: `model-approval-${ticketId}-${model}`, threadId: store.ticketContext(ticketId).thread.id,
+      body: `Waiting for operator approval to use \`${model}\`. Approve with \`ostrom model ${ticketId} ${model}\`.`, blocking: true });
+    return false;
+  }
+
   /**
    * Creates the ticket's worktree and assignment, starts the session with the Worker brief and
    * returns once its ID is known and stored; the turn goes on in the background (see `drain`).
@@ -93,18 +113,21 @@ export class Workers {
    */
   async dispatch(ticketId: number): Promise<Dispatched> {
     const { store, config } = this.#deps;
+    const choice = dispatchChoice(store, ticketId, config);
+    if (choice.needsApproval) throw new Error(`ticket ${ticketId} is waiting for model approval`);
+    if (choice.fallback !== undefined) store.recordTicketSelection(ticketId, choice.fallback);
     const context = store.ticketContext(ticketId);
     const id = store.createAssignment(ticketId);
     try {
       const suffix = randomUUID();
       const path = join(config.worktrees, `ticket-${ticketId}-${id}-${suffix}`);
       const branch = await (this.#deps.addWorktree ?? createWorktree)(config.repo, path, config.base, ticketId, id, suffix);
-      store.configureNativeAssignment(id, { harness: config.harness, model: config.model, worktree: path, branch, machine: config.machine });
+      store.configureNativeAssignment(id, { harness: choice.harness, model: choice.model, modelReason: choice.reason, worktree: path, branch, machine: config.machine });
       let resolve!: (sessionId: string) => void;
       const started = new Promise<string>((r) => (resolve = r));
-      const session = this.#deps.runners[config.harness].start({
+      const session = this.#deps.runners[choice.harness].start({
         cwd: path,
-        model: config.model,
+        model: choice.model,
         writableDirs: gitDirs(config.repo, path),
         onSessionId: (sessionId) => {
           store.startNativeAssignment(id, sessionId);
@@ -114,7 +137,7 @@ export class Workers {
           resolve(sessionId);
         },
       });
-      const turn = this.#enqueue(id, () => this.#firstTurn(id, session, workerBrief(context, branch, config.base, config.rules)));
+      const turn = this.#enqueue(id, () => this.#firstTurn(id, session, workerBrief(context, branch, config.base, config.rules), context.reason));
       await Promise.race([started, turn]);
       const assignment = store.getAssignment(id);
       if (assignment.state === "ended") throw new Error(assignment.endReason ?? "the session did not start");
@@ -348,14 +371,26 @@ export class Workers {
     return next;
   }
 
-  async #firstTurn(id: number, session: Session, prompt: string): Promise<void> {
+  #chooseEffort(assignment: Assignment, kind: string, prompt: string) {
+    const { router, runners, store } = this.#deps;
+    return chooseEffort(store, assignment.ticketId, { harness: assignment.harness!, model: assignment.model! }, kind, prompt,
+      router === undefined ? undefined : async (text) => (await askRouter({ router, runners }, text, AbortSignal.timeout(30_000))).reply);
+  }
+
+  async #firstTurn(id: number, session: Session, prompt: string, request: string): Promise<void> {
     const { store } = this.#deps;
+    const assignment = store.getAssignment(id);
+    const choice = await this.#chooseEffort(assignment, "dispatch", request);
+    if (this.#stopping) {
+      store.abandonAssignment(id, "ostromd stopped before the session started");
+      return;
+    }
     const controller = new AbortController();
     this.#inFlight.set(id, controller);
-    store.startWorkerTurn(id, "dispatch");
+    store.startWorkerTurn(id, "dispatch", choice.effort, choice.reason);
     let result: TurnResult;
     try {
-      result = await session.send(prompt, controller.signal);
+      result = await session.send(prompt, controller.signal, choice.effort);
     } catch (error) {
       if (this.#stopping) return;
       if (controller.signal.aborted) {
@@ -383,29 +418,37 @@ export class Workers {
     onComplete?: (result: TurnResult) => void | Promise<void>,
   ): Promise<void> {
     const { store } = this.#deps;
-    const assignment = store.getAssignment(id);
     const queued = store.queuedTurn(id, key);
-    if (queued === null || queued.state !== "queued" || this.#stopping || assignment.state !== "running" || assignment.outcome === "failed") return;
-    const ticket = store.getTicket(assignment.ticketId);
-    if (ticket.state === "paused" && !RUNS_WHILE_PAUSED.some((prefix) => key.startsWith(prefix))) return;
-    // No await separates this check from starting the native turn, so a held reservation never
-    // increments the ticket's turn budget.
-    if (store.reservationHeld(id)) return;
-    if (store.queuedTurn(id, key)?.state !== "queued") return;
+    const eligible = (assignment: Assignment) => {
+      const ticket = store.getTicket(assignment.ticketId);
+      return !this.#stopping && assignment.state === "running" && assignment.outcome !== "failed" &&
+        ticket.state !== "ended" &&
+        (ticket.stopRequestedAt === null || /^(operator-stop-|stop-|close-issue-)/.test(key)) &&
+        (ticket.state !== "paused" || RUNS_WHILE_PAUSED.some((prefix) => key.startsWith(prefix))) &&
+        !store.reservationHeld(id) && store.queuedTurn(id, key)?.state === "queued";
+    };
+    const before = store.getAssignment(id);
+    if (queued === null || !eligible(before)) return;
+    const kind = key.startsWith("stuck-recovery-") ? "recovery" : key.startsWith("redirect-") ? "redirect" : queued.kind;
+    const prompt = workerTurnPrompt(queued.prompt);
+    const choice = await this.#chooseEffort(before, kind, prompt);
+    // An effort judgement can yield while a pause, stop, or merge changes the ticket.
+    const assignment = store.getAssignment(id);
+    if (!eligible(assignment)) return;
     const session = this.#session(assignment);
     const nextTurn = assignment.turns + 1;
     const turnId = `${assignment.sessionId}:${nextTurn}`;
     if (store.beginQueuedTurn(id, key, turnId) === null) return;
     const turn = store.beginTurn(id);
     if (turn !== nextTurn) throw new Error(`assignment ${id}: queued turn number changed`);
-    const kind = key.startsWith("stuck-recovery-") ? "recovery" : key.startsWith("redirect-") ? "redirect" : queued.kind;
-    store.startWorkerTurn(id, kind);
+    store.startWorkerTurn(id, kind, choice.effort, choice.reason);
+    queueStatusCard(store, assignment.ticketId);
     onStart?.(turnId);
     const controller = new AbortController();
     this.#inFlight.set(id, controller);
     let result: TurnResult;
     try {
-      result = await session.send(workerTurnPrompt(queued.prompt), controller.signal);
+      result = await session.send(prompt, controller.signal, choice.effort);
     } catch (error) {
       if (this.#stopping) return;
       store.finishQueuedTurn(id, key);

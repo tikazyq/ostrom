@@ -1,7 +1,7 @@
 # Model selection
 
 Status: accepted, 2026-11-17. PR 1 implements effort and turn records; PR 2 implements discovery
-and stored operator selections. Selection consumption remains planned. The operator asked for
+and stored operator selections. Step 3 uses those selections for dispatch and turns. The operator asked for
 selection that is smarter than a fixed tier table, optimised for the operator's experience. On
 2026-11-17 they chose: **the lowest cost that still merges** as the default objective, **escalation
 within one harness** at first, allowed models **selected by an admin from those the harnesses
@@ -95,8 +95,16 @@ one-line reason. Its input:
 - the allowed models, with their cost and approval flag;
 - a small table of past outcomes for this repository (below).
 
-Code checks the choice: it must be on the list, and an approval model waits for the operator. An
-invalid choice falls back to the cheapest model, and that fallback is recorded as a decision.
+Code checks the choice: it must be on the list, and an approval-flagged model waits for the operator.
+An invalid or missing choice falls back to the cheapest currently offered allowed model (ties by
+`harness/model`), and that fallback is recorded as a ticket selection decision.
+
+If dispatch would use an approval-flagged model, including a fallback, the ticket waits without
+creating a worktree or starting a Worker. Ostrom posts one notice on the issue naming the model and
+the command `ostrom model <ticket> <harness/model>`. That local CLI command records explicit approval
+for that model on this ticket. The operator can also choose a different allowed model or stop the
+ticket. GitHub commands can select an allowed model that does not require approval. Waiting counts
+toward the ticket's wall-clock budget.
 
 The model stays fixed for the ticket's session. Changing models mid-session discards the cached
 context, and resuming a session on different settings already caused #715.
@@ -105,9 +113,12 @@ context, and resuming a session on different settings already caused #715.
 
 Turns within one ticket differ. A typo from review needs little thought, a merge conflict more, a
 second CI failure more again. Before each turn, the Router chooses an effort from the model's
-allowed list, from the turn's prompt and the ticket's history so far. Code enforces the list and any
-escalation floor (below). The effort goes to the SDK on that resume; it does not start a new
-session.
+allowed list, using the turn's prompt and the recent turn records. A single allowed level is used
+directly. If the choice is invalid or the selector is unavailable, Ostrom uses the harness's
+discovered default if allowed, then `medium` if allowed, then the first allowed effort. When the
+configured model is used with no operator selections, its discovered efforts are eligible. With no
+eligible explicit effort, Ostrom leaves the harness default in place. Each turn records the choice
+and its reason. Effort changes take effect on the next turn of the same session.
 
 ### Learning from outcomes
 
@@ -140,7 +151,13 @@ model waits for the operator. Moving across harnesses is deferred until a real t
   reason.
 - `@ostrom use <model>` and `@ostrom effort <level>` on the issue or PR override for that ticket.
   The same overrides are `ostrom model <ticket> <model>` and `ostrom effort <ticket> <level>` on the
-  CLI. An override is recorded and holds until changed; escalation never lowers it.
+  CLI. Models can be named by `harness/model` or an unambiguous bare ID. GitHub controls are available
+  to the ticket author and collaborators with triage or higher. An override is recorded and holds
+  until changed. A model override leaves the current session intact and applies if another session
+  starts for the ticket. An effort override is validated against the current session's model (or the
+  model selected for dispatch if no session exists) and applies on the next turn. If catalog or
+  selection changes make an override ineligible, Ostrom keeps the record and uses the normal
+  selection rules until the override is eligible again.
 - `ostrom models` lists the allowed models and their outcome history. `ostrom replay` shows each
   selection decision with its input.
 - Codex's real model is checked from the native session record, which closes
